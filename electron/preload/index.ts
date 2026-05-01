@@ -229,6 +229,21 @@ contextBridge.exposeInMainWorld('electronAPI', {
   ocrScan: (dataUrl: string) =>
     ipcRenderer.invoke('ocr:scan', dataUrl),
 
+  // Wallpapers (Unsplash)
+  wallpapersList: (opts: {
+    query?: string
+    page?: number
+    perPage?: number
+    orientation?: 'landscape' | 'portrait' | 'squarish'
+    topic?: string
+  }) => ipcRenderer.invoke('wallpapers:list', opts),
+  wallpapersGet: (id: string) => ipcRenderer.invoke('wallpapers:get', id),
+  wallpapersTrackDownload: (downloadLocation: string) =>
+    ipcRenderer.invoke('wallpapers:trackDownload', downloadLocation),
+  wallpapersIsConfigured: () => ipcRenderer.invoke('wallpapers:isConfigured'),
+  wallpapersSetAsWallpaper: (photo: unknown) =>
+    ipcRenderer.invoke('wallpapers:setAsWallpaper', photo),
+
   // Clipboard
   writeClipboardText: (text: string) => ipcRenderer.invoke('clipboard:writeText', text),
 

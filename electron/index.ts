@@ -1099,6 +1099,54 @@ app.whenReady().then(async () => {
     return scanForSensitiveData(dataUrl)
   })
 
+  // IPC: Wallpapers (Unsplash). Lazy-import keeps the access-key check off the
+  // hot path — Unsplash failures shouldn't bubble through `ipcMain.handle`'s
+  // generic error path, so we surface them as `{ ok: false, error }` shapes
+  // the renderer can render inline.
+  ipcMain.handle('wallpapers:list', async (_e, opts) => {
+    try {
+      const { listWallpapers } = await import('./wallpapers')
+      const result = await listWallpapers(opts ?? {})
+      return { ok: true as const, ...result }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      return { ok: false as const, error: message }
+    }
+  })
+
+  ipcMain.handle('wallpapers:get', async (_e, id: string) => {
+    try {
+      const { getWallpaper } = await import('./wallpapers')
+      const photo = await getWallpaper(id)
+      return { ok: true as const, photo }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      return { ok: false as const, error: message }
+    }
+  })
+
+  ipcMain.handle('wallpapers:trackDownload', async (_e, downloadLocation: string) => {
+    const { trackWallpaperDownload } = await import('./wallpapers')
+    await trackWallpaperDownload(downloadLocation)
+    return { ok: true as const }
+  })
+
+  ipcMain.handle('wallpapers:isConfigured', async () => {
+    const { isUnsplashConfigured } = await import('./wallpapers')
+    return isUnsplashConfigured()
+  })
+
+  ipcMain.handle('wallpapers:setAsWallpaper', async (_e, photo) => {
+    try {
+      const { setDesktopWallpaper } = await import('./wallpapers')
+      const result = await setDesktopWallpaper(photo)
+      return { ok: true as const, filePath: result.filePath }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      return { ok: false as const, error: message }
+    }
+  })
+
   // Favicon served by the local OAuth + picker servers so the browser tab the
   // user lands on during the Google Drive connect flow is recognizably Lumia
   // (alongside the page <title>). Read once, then reused across both servers.

@@ -5,10 +5,11 @@ import logo from '../assets/logo.png'
 type ThemeMode = 'dark' | 'light' | 'system'
 
 const NAV_ITEMS = [
-  { to: '/dashboard', icon: 'space_dashboard', label: 'Dashboard' },
+  { to: '/dashboard',  icon: 'space_dashboard', label: 'Dashboard' },
+  { to: '/wallpapers', icon: 'wallpaper',       label: 'Wallpapers' },
   // Workflow tab hidden temporarily — route still wired, reachable via /#/workflow.
   // { to: '/workflow',  icon: 'rocket_launch',    label: 'Workflow' },
-  { to: '/settings',  icon: 'settings',         label: 'Settings' },
+  { to: '/settings',   icon: 'settings',         label: 'Settings' },
 ]
 
 function resolveTheme(mode: ThemeMode): 'dark' | 'light' {

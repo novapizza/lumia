@@ -164,6 +164,28 @@ declare global {
       // OCR & Auto-Blur
       ocrScan: (dataUrl: string) => Promise<import('@/types').AutoBlurResult>
 
+      // Wallpapers (Unsplash)
+      wallpapersList: (opts: {
+        query?: string
+        page?: number
+        perPage?: number
+        orientation?: 'landscape' | 'portrait' | 'squarish'
+        topic?: string
+      }) => Promise<
+        | { ok: true; photos: import('@/types').UnsplashPhoto[]; total: number; totalPages: number }
+        | { ok: false; error: string }
+      >
+      wallpapersGet: (id: string) => Promise<
+        | { ok: true; photo: import('@/types').UnsplashPhoto }
+        | { ok: false; error: string }
+      >
+      wallpapersTrackDownload: (downloadLocation: string) => Promise<{ ok: true }>
+      wallpapersIsConfigured: () => Promise<boolean>
+      wallpapersSetAsWallpaper: (photo: import('@/types').UnsplashPhoto) => Promise<
+        | { ok: true; filePath: string }
+        | { ok: false; error: string }
+      >
+
       writeClipboardText: (text: string) => Promise<void>
       openExternal: (url: string) => Promise<void>
       openPath: (path: string) => Promise<void>
