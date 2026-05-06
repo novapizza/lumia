@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Navigate } from 'react-router-dom'
 import type { UnsplashPhoto } from '../../types'
 
 interface Category {
@@ -288,27 +289,12 @@ export default function Wallpapers() {
     setPreview(photo)
   }
 
+  // No Unsplash key in this build → bounce off the route. The Sidebar entry
+  // is hidden for the same condition; this guards direct hash-nav (e.g. user
+  // hits /#/wallpapers manually or has it bookmarked from a previous build
+  // that had a key configured).
   if (configured === false) {
-    return (
-      <div className="h-full overflow-y-auto px-10 py-8">
-        <Header />
-        <div className="glass-card mt-8 max-w-2xl rounded-2xl p-8">
-          <div className="flex items-start gap-4">
-            <span className="material-symbols-outlined text-3xl text-amber-300">key_off</span>
-            <div className="space-y-2">
-              <h2 className="text-lg font-bold text-white" style={{ fontFamily: 'Manrope, sans-serif' }}>
-                Unsplash access key missing
-              </h2>
-              <p className="text-sm text-slate-400">
-                Set <code className="rounded bg-white/10 px-1.5 py-0.5 text-xs">MAIN_VITE_UNSPLASH_ACCESS_KEY</code> in
-                your <code className="rounded bg-white/10 px-1.5 py-0.5 text-xs">.env</code> and rebuild — the
-                Wallpapers feature is gated behind a configured Unsplash app.
-              </p>
-            </div>
-          </div>
-        </div>
-      </div>
-    )
+    return <Navigate to="/dashboard" replace />
   }
 
   if (mode === 'loading' || configured === null) {

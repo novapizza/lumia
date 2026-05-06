@@ -4,13 +4,13 @@ import logo from '../assets/logo.png'
 
 type ThemeMode = 'dark' | 'light' | 'system'
 
-const NAV_ITEMS = [
-  { to: '/dashboard',  icon: 'space_dashboard', label: 'Dashboard' },
-  { to: '/wallpapers', icon: 'wallpaper',       label: 'Wallpapers' },
-  // Workflow tab hidden temporarily — route still wired, reachable via /#/workflow.
-  // { to: '/workflow',  icon: 'rocket_launch',    label: 'Workflow' },
-  { to: '/settings',   icon: 'settings',         label: 'Settings' },
-]
+interface NavItem { to: string; icon: string; label: string }
+
+const NAV_DASHBOARD: NavItem = { to: '/dashboard',  icon: 'space_dashboard', label: 'Dashboard' }
+const NAV_WALLPAPERS: NavItem = { to: '/wallpapers', icon: 'wallpaper',       label: 'Wallpapers' }
+// Workflow tab hidden temporarily — route still wired, reachable via /#/workflow.
+// const NAV_WORKFLOW: NavItem = { to: '/workflow',  icon: 'rocket_launch',    label: 'Workflow' }
+const NAV_SETTINGS: NavItem = { to: '/settings',   icon: 'settings',         label: 'Settings' }
 
 function resolveTheme(mode: ThemeMode): 'dark' | 'light' {
   if (mode === 'system') {
@@ -21,6 +21,22 @@ function resolveTheme(mode: ThemeMode): 'dark' | 'light' {
 
 export function Sidebar() {
   const [themeMode, setThemeMode] = useState<ThemeMode>('system')
+  // Wallpapers is gated behind MAIN_VITE_UNSPLASH_ACCESS_KEY at build time —
+  // when the key is absent, the whole feature is dead weight, so hide the
+  // sidebar entry entirely. Initial value true so the entry doesn't flash
+  // hidden→shown for the common case (key present); the only flicker is the
+  // entry briefly appearing on launch for keyless builds, which is acceptable.
+  const [wallpapersEnabled, setWallpapersEnabled] = useState(true)
+
+  useEffect(() => {
+    window.electronAPI?.wallpapersIsConfigured?.().then(setWallpapersEnabled)
+  }, [])
+
+  const navItems: NavItem[] = [
+    NAV_DASHBOARD,
+    ...(wallpapersEnabled ? [NAV_WALLPAPERS] : []),
+    NAV_SETTINGS,
+  ]
 
   const applyTheme = (resolved: 'dark' | 'light') => {
     if (resolved === 'light') {
@@ -87,7 +103,7 @@ export function Sidebar() {
 
       {/* Nav links */}
       <nav className="flex-1 space-y-1">
-        {NAV_ITEMS.map(({ to, icon, label }) => (
+        {navItems.map(({ to, icon, label }) => (
           <NavLink
             key={to}
             to={to}
