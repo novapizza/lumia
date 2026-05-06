@@ -32,18 +32,33 @@ export interface UnsplashPhoto {
   user: UnsplashUser
 }
 
-export interface UnsplashListResult {
-  photos: UnsplashPhoto[]
-  total: number
-  totalPages: number
+export interface RandomWallpaperPick {
+  /** Opaque id, echoed back in the response so the renderer knows which
+   *  category was actually rolled (for chip highlighting). */
+  id: string
+  /** Editorial topic slug — preferred when present because Unsplash topics are
+   *  curated by their editorial team, giving consistently higher quality than
+   *  free-text search. */
+  topic?: string
+  /** Free-text fallback when there's no editorial topic that matches. */
+  query?: string
 }
 
-export interface WallpaperListOptions {
-  query?: string
-  page?: number
-  perPage?: number
+export interface RandomWallpaperOptions {
+  /** User's selected categories. One is picked at random per call — rotating
+   *  across refreshes is what gives variety, not blending per-call. */
+  picks: RandomWallpaperPick[]
+  /** Number of photos to fetch in the single random call. Default 6. */
+  count?: number
+  /** Default 'landscape' — desktop wallpapers are overwhelmingly landscape so
+   *  it's the right baseline. Caller can pass 'portrait'/'squarish' if added
+   *  to the UI later. */
   orientation?: 'landscape' | 'portrait' | 'squarish'
-  topic?: string
+  /** When true (default) we hit Unsplash's `featured=true` pool first — only
+   *  editorially-curated photos. If that pool returns fewer than half the
+   *  requested count (niche topics can come up short), we retry without it
+   *  to fill the grid. */
+  preferFeatured?: boolean
 }
 
 interface RawPhoto {
@@ -130,48 +145,60 @@ function normalizePhoto(raw: RawPhoto): UnsplashPhoto {
 }
 
 /**
- * Lumia clamps Unsplash's `per_page` (capped at 30 by the API) to keep grid
- * loads predictable. Higher pages help large screens; lower ones reduce
- * bandwidth on first paint.
+ * Fetch random wallpapers from ONE randomly-picked category in the user's
+ * favorites list. Variety across refreshes comes from rotating which pick
+ * gets used, not from blending categories within one call.
+ *
+ * Quality strategy:
+ *   - Prefer `topics` (editorial-curated slugs) over free-text `query`.
+ *   - Hit `featured=true` first — Unsplash's editorial-photo pool.
+ *   - `content_filter=high` for safety, `orientation=landscape` for desktops.
+ *   - If `featured=true` returns fewer than half the requested count (niche
+ *     topics can come up short), retry once without it to fill the grid.
+ *
+ * /photos/random returns a single object when called without `count`, but
+ * always an array when `count` is set. We always pass `count`, so the response
+ * is uniformly an array.
  */
-export const WALLPAPER_PER_PAGE_DEFAULT = 24
+export async function getRandomWallpapers(
+  opts: RandomWallpaperOptions
+): Promise<{ photos: UnsplashPhoto[]; pickId: string }> {
+  const picks = (opts.picks ?? []).filter(p => p && (p.topic || p.query))
+  if (picks.length === 0) {
+    throw new UnsplashError(0, 'No categories selected')
+  }
+  const count = Math.max(1, Math.min(30, opts.count ?? 6))
+  const orientation = opts.orientation ?? 'landscape'
+  const preferFeatured = opts.preferFeatured ?? true
+  const pick = picks[Math.floor(Math.random() * picks.length)]
 
-export async function listWallpapers(opts: WallpaperListOptions = {}): Promise<UnsplashListResult> {
-  const perPage = Math.max(1, Math.min(30, opts.perPage ?? WALLPAPER_PER_PAGE_DEFAULT))
-  const page = Math.max(1, opts.page ?? 1)
+  // `topics` (slug) wins over `query` per Unsplash semantics — they're
+  // mutually exclusive on /photos/random. Topics are curated, query is search.
+  const sourceParams: Record<string, string | number | undefined> = pick.topic
+    ? { topics: pick.topic }
+    : { query: pick.query }
 
-  // Search endpoint when a query/topic is supplied; /photos endpoint for the
-  // editorial feed. The two return slightly different shapes, normalised below.
-  if (opts.query && opts.query.trim().length > 0) {
-    const data = await unsplashGet<{ results: RawPhoto[]; total: number; total_pages: number }>(
-      '/search/photos',
-      { query: opts.query.trim(), page, per_page: perPage, orientation: opts.orientation }
-    )
-    return {
-      photos: data.results.map(normalizePhoto),
-      total: data.total,
-      totalPages: data.total_pages,
-    }
+  const baseParams = {
+    ...sourceParams,
+    count,
+    orientation,
+    content_filter: 'high',
   }
 
-  if (opts.topic && opts.topic.trim().length > 0) {
-    const list = await unsplashGet<RawPhoto[]>(
-      `/topics/${encodeURIComponent(opts.topic.trim())}/photos`,
-      { page, per_page: perPage, orientation: opts.orientation }
-    )
-    return { photos: list.map(normalizePhoto), total: list.length, totalPages: page }
+  let data = await unsplashGet<RawPhoto[]>('/photos/random', {
+    ...baseParams,
+    ...(preferFeatured ? { featured: 'true' } : {}),
+  })
+  let arr = Array.isArray(data) ? data : [data]
+
+  // Featured pool can be too thin for niche topics — retry without it so the
+  // grid actually fills up. Only retries when we *opted into* featured.
+  if (preferFeatured && arr.length < Math.ceil(count / 2)) {
+    data = await unsplashGet<RawPhoto[]>('/photos/random', baseParams)
+    arr = Array.isArray(data) ? data : [data]
   }
 
-  const list = await unsplashGet<RawPhoto[]>(
-    '/photos',
-    { page, per_page: perPage, order_by: 'popular' }
-  )
-  return { photos: list.map(normalizePhoto), total: list.length, totalPages: page }
-}
-
-export async function getWallpaper(id: string): Promise<UnsplashPhoto> {
-  const raw = await unsplashGet<RawPhoto>(`/photos/${encodeURIComponent(id)}`)
-  return normalizePhoto(raw)
+  return { photos: arr.map(normalizePhoto), pickId: pick.id }
 }
 
 /**
@@ -290,6 +317,51 @@ async function setWallpaperMac(filePath: string): Promise<void> {
   })
 }
 
+/**
+ * Cap on how many JPGs we keep under userData/wallpapers/. Each file is
+ * ~3–6 MB at full-res, so 20 ≈ 60–120 MB ceiling. Tuned to be invisible in
+ * normal use but bounded enough that a heavy user setting hundreds of
+ * wallpapers doesn't fill their disk.
+ */
+const WALLPAPER_CACHE_KEEP = 20
+
+/**
+ * Best-effort cleanup of older wallpapers under userData/wallpapers/. Sorts
+ * files by mtime descending and unlinks anything past the keep cap. The
+ * currently-applied file is filtered out by path as a second line of defense
+ * so we never yank the file the OS just started displaying — even though
+ * setDesktopWallpaper refreshes its mtime first, which alone should keep it
+ * at the top of the sort.
+ *
+ * Failures are swallowed: a stale prune shouldn't bubble up and fail an
+ * already-successful apply.
+ */
+async function pruneWallpapersDir(keep: number, currentFile: string): Promise<void> {
+  try {
+    const dir = getWallpapersDir()
+    const names = await fs.readdir(dir)
+    if (names.length <= keep) return
+    const stats = await Promise.all(
+      names.map(async name => {
+        const full = join(dir, name)
+        try {
+          const s = await fs.stat(full)
+          return { full, mtime: s.mtimeMs, isFile: s.isFile() }
+        } catch {
+          return null
+        }
+      })
+    )
+    const files = stats
+      .filter((s): s is { full: string; mtime: number; isFile: boolean } => !!s && s.isFile)
+      .sort((a, b) => b.mtime - a.mtime)
+    const toDelete = files.slice(keep).filter(f => f.full !== currentFile)
+    await Promise.all(toDelete.map(f => fs.unlink(f.full).catch(() => undefined)))
+  } catch (err) {
+    console.warn('[wallpapers] prune failed', err)
+  }
+}
+
 export async function setDesktopWallpaper(photo: UnsplashPhoto): Promise<{ filePath: string }> {
   const filePath = await downloadWallpaper(photo)
   if (process.platform === 'win32') {
@@ -298,6 +370,21 @@ export async function setDesktopWallpaper(photo: UnsplashPhoto): Promise<{ fileP
     await setWallpaperMac(filePath)
   } else {
     throw new Error(`Setting wallpaper is not supported on ${process.platform}`)
+  }
+  // Refresh mtime on a cache-hit re-apply so the pruner sees this file as
+  // recently used and keeps it at the top of the LRU. Without this, applying
+  // an older cached wallpaper would leave its mtime pointing back to the
+  // original download timestamp and the pruner could delete the very file
+  // we just told the OS to render.
+  const now = new Date()
+  await fs.utimes(filePath, now, now).catch(() => undefined)
+  void pruneWallpapersDir(WALLPAPER_CACHE_KEEP, filePath)
+  // Per Unsplash API guidelines, ping the download endpoint when the user
+  // actually uses the photo (setting as wallpaper qualifies). Fire-and-
+  // forget — `trackWallpaperDownload` already swallows its own errors so a
+  // tracking failure can't fail the apply that already succeeded.
+  if (photo.links?.downloadLocation) {
+    void trackWallpaperDownload(photo.links.downloadLocation)
   }
   return { filePath }
 }

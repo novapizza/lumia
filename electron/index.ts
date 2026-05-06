@@ -1103,22 +1103,11 @@ app.whenReady().then(async () => {
   // hot path — Unsplash failures shouldn't bubble through `ipcMain.handle`'s
   // generic error path, so we surface them as `{ ok: false, error }` shapes
   // the renderer can render inline.
-  ipcMain.handle('wallpapers:list', async (_e, opts) => {
+  ipcMain.handle('wallpapers:random', async (_e, opts) => {
     try {
-      const { listWallpapers } = await import('./wallpapers')
-      const result = await listWallpapers(opts ?? {})
-      return { ok: true as const, ...result }
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err)
-      return { ok: false as const, error: message }
-    }
-  })
-
-  ipcMain.handle('wallpapers:get', async (_e, id: string) => {
-    try {
-      const { getWallpaper } = await import('./wallpapers')
-      const photo = await getWallpaper(id)
-      return { ok: true as const, photo }
+      const { getRandomWallpapers } = await import('./wallpapers')
+      const { photos, pickId } = await getRandomWallpapers(opts ?? { picks: [] })
+      return { ok: true as const, photos, pickId }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       return { ok: false as const, error: message }

@@ -230,14 +230,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.invoke('ocr:scan', dataUrl),
 
   // Wallpapers (Unsplash)
-  wallpapersList: (opts: {
-    query?: string
-    page?: number
-    perPage?: number
+  wallpapersRandom: (opts: {
+    picks: Array<{ id: string; topic?: string; query?: string }>
+    count?: number
     orientation?: 'landscape' | 'portrait' | 'squarish'
-    topic?: string
-  }) => ipcRenderer.invoke('wallpapers:list', opts),
-  wallpapersGet: (id: string) => ipcRenderer.invoke('wallpapers:get', id),
+    preferFeatured?: boolean
+  }) => ipcRenderer.invoke('wallpapers:random', opts),
   wallpapersTrackDownload: (downloadLocation: string) =>
     ipcRenderer.invoke('wallpapers:trackDownload', downloadLocation),
   wallpapersIsConfigured: () => ipcRenderer.invoke('wallpapers:isConfigured'),

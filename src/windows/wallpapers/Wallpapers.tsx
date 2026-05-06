@@ -1,155 +1,292 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { UnsplashPhoto } from '../../types'
 
-type Orientation = 'landscape' | 'portrait' | 'squarish' | 'any'
-
-// Curated topic slugs from Unsplash — these are stable identifiers Unsplash
-// publishes; if the slug ever 404s the empty state catches it. Keeping the
-// list short and wallpaper-friendly. `featured` is the editorial feed (no
-// topic, no query) and intentionally has no `slug`.
-const TOPICS: { id: string; label: string; slug?: string; query?: string }[] = [
-  { id: 'featured', label: 'Featured' },
-  { id: 'wallpapers', label: 'Wallpapers', slug: 'wallpapers' },
-  { id: 'nature', label: 'Nature', slug: 'nature' },
-  { id: 'textures', label: 'Textures', slug: 'textures-patterns' },
-  { id: 'architecture', label: 'Architecture', slug: 'architecture-interior' },
-  { id: 'minimal', label: 'Minimal', query: 'minimal abstract' },
-  { id: 'space', label: 'Space', query: 'galaxy space' },
-  { id: 'dark', label: 'Dark', query: 'dark moody' },
-]
-
-const ORIENTATIONS: { id: Orientation; label: string; icon: string }[] = [
-  { id: 'any',       label: 'Any',       icon: 'crop_free' },
-  { id: 'landscape', label: 'Landscape', icon: 'crop_landscape' },
-  { id: 'portrait',  label: 'Portrait',  icon: 'crop_portrait' },
-  { id: 'squarish',  label: 'Square',    icon: 'crop_square' },
-]
-
-interface QueryState {
-  topicId: string
-  search: string
-  orientation: Orientation
+interface Category {
+  id: string
+  label: string
+  icon: string
+  /** Editorial topic slug — preferred when set. Curated by Unsplash, gives
+   *  consistently higher quality than free-text search. */
+  topic?: string
+  /** Free-text fallback when no editorial topic matches. */
+  query?: string
+  /** Tailwind gradient pair for the picker card backdrop. Strings are literal
+   *  so the Tailwind v4 scanner picks them up (no dynamic interpolation). */
+  gradient: string
+  /** Marks user-added customs so the picker can render a delete affordance
+   *  and route persistence accordingly. */
+  isCustom?: boolean
 }
 
-const INITIAL_STATE: QueryState = { topicId: 'featured', search: '', orientation: 'any' }
+// Built-in editorial topics (Unsplash slug). Quality is consistently higher
+// than free-text search because Unsplash editors curate these pools.
+const TOPIC_CATEGORIES: Category[] = [
+  { id: 'wallpapers',   label: 'Wallpapers',   icon: 'wallpaper',       topic: 'wallpapers',            gradient: 'from-indigo-500/40 to-purple-800/50' },
+  { id: 'nature',       label: 'Nature',       icon: 'park',            topic: 'nature',                gradient: 'from-emerald-500/40 to-emerald-800/50' },
+  { id: 'architecture', label: 'Architecture', icon: 'apartment',       topic: 'architecture-interior', gradient: 'from-stone-500/40 to-stone-800/50' },
+  { id: 'animals',      label: 'Animals',      icon: 'pets',            topic: 'animals',               gradient: 'from-amber-500/40 to-orange-900/50' },
+  { id: 'textures',     label: 'Textures',     icon: 'texture',         topic: 'textures-patterns',     gradient: 'from-neutral-500/40 to-neutral-800/50' },
+  { id: 'abstract',     label: 'Abstract',     icon: 'palette',         topic: 'experimental',          gradient: 'from-fuchsia-500/40 to-purple-900/50' },
+  { id: '3d-renders',   label: '3D Renders',   icon: 'deployed_code',   topic: '3d-renders',            gradient: 'from-violet-500/40 to-blue-900/50' },
+  { id: 'travel',       label: 'Travel',       icon: 'travel_explore',  topic: 'travel',                gradient: 'from-sky-500/40 to-cyan-800/50' },
+  { id: 'film',         label: 'Film',         icon: 'camera_roll',     topic: 'film',                  gradient: 'from-yellow-700/40 to-orange-900/50' },
+  { id: 'street',       label: 'Street',       icon: 'directions_walk', topic: 'street-photography',    gradient: 'from-slate-600/40 to-slate-900/50' },
+  { id: 'arts',         label: 'Arts',         icon: 'museum',          topic: 'arts-culture',          gradient: 'from-rose-500/40 to-pink-900/50' },
+]
+
+// Free-text query categories — themes Unsplash doesn't have a topic slug for
+// but are massive wallpaper pools in their own right. Lower curation but the
+// keywords are mainstream enough that Unsplash search returns clean results.
+const QUERY_CATEGORIES: Category[] = [
+  { id: 'mountains',    label: 'Mountains',    icon: 'landscape',       query: 'mountains landscape',   gradient: 'from-slate-500/40 to-slate-800/50' },
+  { id: 'ocean',        label: 'Ocean',        icon: 'water',           query: 'ocean sea',             gradient: 'from-cyan-500/40 to-blue-800/50' },
+  { id: 'forest',       label: 'Forest',       icon: 'forest',          query: 'forest woodland',       gradient: 'from-green-600/40 to-emerald-900/50' },
+  { id: 'sunset',       label: 'Sunset',       icon: 'wb_twilight',     query: 'sunset golden hour',    gradient: 'from-orange-500/40 to-rose-800/50' },
+  { id: 'space',        label: 'Space',        icon: 'rocket_launch',   query: 'galaxy space stars',    gradient: 'from-violet-600/40 to-indigo-900/50' },
+  { id: 'aurora',       label: 'Aurora',       icon: 'auto_awesome',    query: 'aurora borealis',       gradient: 'from-teal-400/40 to-purple-800/50' },
+  { id: 'minimal',      label: 'Minimal',      icon: 'rectangle',       query: 'minimal abstract',      gradient: 'from-zinc-400/40 to-zinc-700/50' },
+  { id: 'dark',         label: 'Dark',         icon: 'dark_mode',       query: 'dark moody',            gradient: 'from-slate-800/50 to-black/60' },
+  { id: 'city',         label: 'City',         icon: 'location_city',   query: 'city skyline night',    gradient: 'from-sky-500/40 to-indigo-900/50' },
+  { id: 'flowers',      label: 'Flowers',      icon: 'local_florist',   query: 'flowers',               gradient: 'from-pink-400/40 to-rose-800/50' },
+  { id: 'cars',         label: 'Cars',         icon: 'directions_car',  query: 'cars automotive',       gradient: 'from-red-500/40 to-rose-900/50' },
+]
+
+const BUILTIN_CATEGORIES: Category[] = [...TOPIC_CATEGORIES, ...QUERY_CATEGORIES]
+
+/** Default visual treatment for a user-added custom category — neutral
+ *  gradient so it doesn't fight built-ins for attention, but still legible. */
+const CUSTOM_GRADIENT = 'from-slate-600/40 to-slate-900/50'
+const CUSTOM_ICON = 'tag'
+
+interface CustomEntry { id: string; label: string; query: string }
+
+function customsToCategories(customs: CustomEntry[]): Category[] {
+  return customs.map(c => ({
+    id: c.id,
+    label: c.label,
+    icon: CUSTOM_ICON,
+    query: c.query,
+    gradient: CUSTOM_GRADIENT,
+    isCustom: true,
+  }))
+}
+
+// At least one favorite is needed to make a random call; no upper bound — the
+// user can pick all of them if they want broad rotation.
+const MIN_PICK = 1
+// Unsplash's `/photos/random` caps `count` at 30 per request. We ask for the
+// max so a single Refresh fills a dense grid for one full API call.
+const RANDOM_COUNT = 30
+
+type Mode = 'loading' | 'picker' | 'gallery'
 
 export default function Wallpapers() {
   const [configured, setConfigured] = useState<boolean | null>(null)
-  const [state, setState] = useState<QueryState>(INITIAL_STATE)
-  const [searchInput, setSearchInput] = useState('')
+  const [favorites, setFavorites] = useState<string[]>([])
+  const [customs, setCustoms] = useState<Category[]>([])
+  const [mode, setMode] = useState<Mode>('loading')
+  const [draft, setDraft] = useState<string[]>([])
   const [photos, setPhotos] = useState<UnsplashPhoto[]>([])
-  const [page, setPage] = useState(1)
-  const [hasMore, setHasMore] = useState(true)
-  const [loading, setLoading] = useState(false)
-  const [loadingMore, setLoadingMore] = useState(false)
+  const [activePickId, setActivePickId] = useState<string | null>(null)
+  const [loadingPhotos, setLoadingPhotos] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [preview, setPreview] = useState<UnsplashPhoto | null>(null)
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null)
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Tracks the in-flight random-fetch so a fast Refresh-then-Refresh doesn't
+  // let an older response overwrite a newer one.
+  const requestTokenRef = useRef(0)
+
   const showToast = useCallback((message: string, type: 'success' | 'error' = 'success') => {
     if (toastTimer.current) clearTimeout(toastTimer.current)
     setToast({ message, type })
     toastTimer.current = setTimeout(() => setToast(null), 3000)
   }, [])
 
-  // Track the currently in-flight request so a fast topic-switch doesn't let a
-  // stale response overwrite the new one. We compare each response's token
-  // against the current ref before applying state.
-  const requestTokenRef = useRef(0)
-
-  useEffect(() => {
-    window.electronAPI?.wallpapersIsConfigured?.().then(setConfigured)
-  }, [])
-
-  const fetchPage = useCallback(async (next: QueryState, pageNum: number, append: boolean) => {
-    if (configured === false) return
+  // Lookup against the union of built-ins and customs. Passed in by the
+  // caller so we don't capture stale customs state across refreshes.
+  const fetchPhotos = useCallback(async (ids: string[], allCategories: Category[]) => {
+    const picks = ids
+      .map(id => allCategories.find(c => c.id === id))
+      .filter((c): c is Category => !!c && (!!c.topic || !!c.query))
+      .map(c => ({ id: c.id, topic: c.topic, query: c.query }))
+    if (picks.length === 0) return
     const token = ++requestTokenRef.current
-    if (append) setLoadingMore(true); else setLoading(true)
+    setLoadingPhotos(true)
     setError(null)
     try {
-      const topic = TOPICS.find(t => t.id === next.topicId)
-      const opts: Parameters<NonNullable<typeof window.electronAPI>['wallpapersList']>[0] = {
-        page: pageNum,
-        perPage: 24,
-      }
-      if (next.orientation !== 'any') opts.orientation = next.orientation
-      if (next.search.trim().length > 0) {
-        opts.query = next.search.trim()
-      } else if (topic?.slug) {
-        opts.topic = topic.slug
-      } else if (topic?.query) {
-        opts.query = topic.query
-      }
-      const result = await window.electronAPI?.wallpapersList(opts)
-      if (token !== requestTokenRef.current) return  // superseded
-      if (!result) {
+      const res = await window.electronAPI?.wallpapersRandom({ picks, count: RANDOM_COUNT })
+      if (token !== requestTokenRef.current) return
+      // On any error path we surface the message via the inline banner but
+      // keep the previously-rendered photos + activePickId in place — the
+      // user can keep browsing the last successful batch instead of staring
+      // at an empty grid because Unsplash hiccuped. Same reasoning for the
+      // catch branch below.
+      if (!res) {
         setError('Wallpapers API not available')
-        return
+      } else if (!res.ok) {
+        setError(res.error)
+      } else {
+        setPhotos(res.photos)
+        setActivePickId(res.pickId)
+        // Persist so subsequent visits read from cache rather than hitting
+        // Unsplash again — only Refresh / changed favorites should re-fetch.
+        window.electronAPI?.setSetting('wallpaperGrid', {
+          photos: res.photos,
+          pickId: res.pickId,
+          fetchedAt: Date.now(),
+        })
       }
-      if (!result.ok) {
-        setError(result.error)
-        if (!append) setPhotos([])
-        setHasMore(false)
-        return
-      }
-      setPhotos(prev => append ? [...prev, ...result.photos] : result.photos)
-      setHasMore(result.photos.length > 0 && pageNum < (result.totalPages || pageNum + 1))
     } catch (err) {
       if (token !== requestTokenRef.current) return
       setError(err instanceof Error ? err.message : String(err))
     } finally {
-      if (token === requestTokenRef.current) {
-        if (append) setLoadingMore(false); else setLoading(false)
-      }
+      if (token === requestTokenRef.current) setLoadingPhotos(false)
     }
-  }, [configured])
+  }, [])
 
-  // Initial + state-change loads. Search is debounced separately below so the
-  // topic/orientation effect can fire immediately on click.
+  // Bootstrap: load configured flag + favorites + cached grid in one shot.
+  // Decide whether to render cache, fetch fresh, or send the user to the
+  // picker. We only fire a fetch on first-ever visit (favorites set, no cache
+  // yet) — afterwards visits read from cache until the user clicks Refresh.
   useEffect(() => {
-    if (configured === null) return
-    setPage(1)
-    fetchPage(state, 1, false)
-  }, [state, configured, fetchPage])
+    let cancelled = false
+    Promise.all([
+      window.electronAPI?.wallpapersIsConfigured?.() ?? Promise.resolve(false),
+      window.electronAPI?.getSettings?.() ?? Promise.resolve(null),
+    ]).then(([conf, settings]) => {
+      if (cancelled) return
+      setConfigured(Boolean(conf))
+      const s = settings as
+        | {
+            wallpaperCategories?: unknown
+            wallpaperCustomCategories?: unknown
+            wallpaperGrid?: unknown
+          }
+        | null
 
-  // Debounce search input → query state. 350ms is short enough to feel
-  // responsive but long enough to skip per-keystroke API calls.
-  useEffect(() => {
-    const handle = setTimeout(() => {
-      if (searchInput !== state.search) {
-        setState(s => ({ ...s, search: searchInput }))
+      // Hydrate customs first — favorites ids are validated against the
+      // union of built-ins + customs, otherwise valid custom selections from
+      // a prior session would be silently dropped.
+      const rawCustoms = s?.wallpaperCustomCategories
+      const loadedCustoms: Category[] = Array.isArray(rawCustoms)
+        ? customsToCategories(
+            (rawCustoms as unknown[]).filter((c): c is CustomEntry =>
+              !!c && typeof c === 'object' &&
+              typeof (c as CustomEntry).id === 'string' &&
+              typeof (c as CustomEntry).label === 'string' &&
+              typeof (c as CustomEntry).query === 'string'
+            )
+          )
+        : []
+      setCustoms(loadedCustoms)
+      const allCats = [...BUILTIN_CATEGORIES, ...loadedCustoms]
+
+      const cats = s?.wallpaperCategories
+      const stored = Array.isArray(cats)
+        ? (cats as unknown[]).filter((id): id is string => typeof id === 'string' && allCats.some(c => c.id === id))
+        : []
+      setFavorites(stored)
+
+      if (stored.length === 0) {
+        setMode('picker')
+        return
       }
-    }, 350)
-    return () => clearTimeout(handle)
-  }, [searchInput, state.search])
 
-  const loadMore = () => {
-    if (loadingMore || loading || !hasMore) return
-    const next = page + 1
-    setPage(next)
-    fetchPage(state, next, true)
+      const cache = s?.wallpaperGrid as
+        | { photos?: UnsplashPhoto[]; pickId?: string }
+        | null
+        | undefined
+      if (cache && Array.isArray(cache.photos) && cache.photos.length > 0) {
+        setPhotos(cache.photos)
+        setActivePickId(typeof cache.pickId === 'string' ? cache.pickId : null)
+        setMode('gallery')
+        return
+      }
+
+      // Favorites set but no cache (first-ever visit, or cache cleared) —
+      // need one fetch to populate. After this it's cache-only until Refresh.
+      setMode('gallery')
+      if (conf) fetchPhotos(stored, allCats)
+    })
+    return () => { cancelled = true }
+  }, [fetchPhotos])
+
+  const allCategories = useMemo(() => [...BUILTIN_CATEGORIES, ...customs], [customs])
+
+  const toggleDraft = (id: string) => {
+    setDraft(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id])
   }
 
-  const handleTopic = (topicId: string) => {
-    if (state.topicId === topicId && !state.search) return
-    setSearchInput('')
-    setState({ topicId, search: '', orientation: state.orientation })
+  // Inline form state lives in the parent so adding a custom while editing
+  // favorites can immediately auto-select it (and so we can persist on add).
+  const persistCustoms = (next: Category[]) => {
+    window.electronAPI?.setSetting(
+      'wallpaperCustomCategories',
+      next
+        .filter(c => c.isCustom)
+        .map(c => ({ id: c.id, label: c.label, query: c.query ?? c.label })),
+    )
   }
 
-  const handleOrientation = (orientation: Orientation) => {
-    if (state.orientation === orientation) return
-    setState(s => ({ ...s, orientation }))
+  const addCustom = (label: string) => {
+    const trimmed = label.trim()
+    if (!trimmed) return
+    const id = `custom-${Date.now().toString(36)}`
+    const newCat: Category = {
+      id,
+      label: trimmed,
+      icon: CUSTOM_ICON,
+      query: trimmed,
+      gradient: CUSTOM_GRADIENT,
+      isCustom: true,
+    }
+    setCustoms(prev => {
+      const next = [...prev, newCat]
+      persistCustoms(next)
+      return next
+    })
+    // Auto-select the new pill so the user doesn't have to click twice.
+    setDraft(prev => prev.includes(id) ? prev : [...prev, id])
+  }
+
+  const deleteCustom = (id: string) => {
+    setCustoms(prev => {
+      const next = prev.filter(c => c.id !== id)
+      persistCustoms(next)
+      return next
+    })
+    setDraft(prev => prev.filter(x => x !== id))
+    setFavorites(prev => prev.filter(x => x !== id))
+  }
+
+  const saveFavorites = async () => {
+    if (draft.length < MIN_PICK) return
+    // If the favorite set actually changed, drop the stale cache and refetch
+    // — otherwise the user would land on a gallery still showing photos from
+    // categories they no longer want.
+    const changed = draft.length !== favorites.length || draft.some(id => !favorites.includes(id))
+    await window.electronAPI?.setSetting('wallpaperCategories', draft)
+    if (changed) {
+      await window.electronAPI?.setSetting('wallpaperGrid', null)
+    }
+    setFavorites(draft)
+    setMode('gallery')
+    if (changed && configured) fetchPhotos(draft, allCategories)
+  }
+
+  const startEdit = () => {
+    setDraft(favorites)
+    setMode('picker')
+  }
+
+  const cancelEdit = () => {
+    if (favorites.length > 0) setMode('gallery')
   }
 
   const handleOpenPreview = (photo: UnsplashPhoto) => {
     setPreview(photo)
-    if (photo.links.downloadLocation) {
-      window.electronAPI?.wallpapersTrackDownload?.(photo.links.downloadLocation)
-    }
   }
-
-  const showEmpty = !loading && !error && photos.length === 0
-  const activeTopic = useMemo(() => TOPICS.find(t => t.id === state.topicId), [state.topicId])
 
   if (configured === false) {
     return (
@@ -174,122 +311,65 @@ export default function Wallpapers() {
     )
   }
 
+  if (mode === 'loading' || configured === null) {
+    return (
+      <div className="h-full overflow-y-auto px-10 py-8">
+        <Header />
+        <div className="mt-8 grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6">
+          {Array.from({ length: 12 }).map((_, i) => (
+            <div key={i} className="aspect-[4/3] rounded-xl bg-white/[0.03] animate-pulse" />
+          ))}
+        </div>
+      </div>
+    )
+  }
+
+  if (mode === 'picker') {
+    return (
+      <PickerView
+        draft={draft}
+        customs={customs}
+        onToggle={toggleDraft}
+        onSave={saveFavorites}
+        onCancel={favorites.length > 0 ? cancelEdit : null}
+        onAddCustom={addCustom}
+        onDeleteCustom={deleteCustom}
+      />
+    )
+  }
+
   return (
     <div className="h-full overflow-y-auto px-10 py-8">
-      <Header />
+      <GalleryHeader
+        favorites={favorites}
+        allCategories={allCategories}
+        activePickId={activePickId}
+        onRefresh={() => fetchPhotos(favorites, allCategories)}
+        onEdit={startEdit}
+        loading={loadingPhotos}
+      />
 
-      {/* Search + filters */}
-      <div className="mt-6 flex flex-col gap-4">
-        <div className="relative max-w-xl">
-          <span className="material-symbols-outlined absolute left-4 top-1/2 -translate-y-1/2 text-[20px] text-slate-400 pointer-events-none">
-            search
-          </span>
-          <input
-            type="text"
-            value={searchInput}
-            onChange={e => setSearchInput(e.target.value)}
-            placeholder="Search wallpapers (e.g. mountains, neon city, ocean)"
-            className="w-full pl-11 pr-10 py-3 rounded-xl bg-white/[0.04] border border-white/[0.08] text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-white/20 transition"
-            style={{ fontFamily: 'Inter, sans-serif' }}
-          />
-          {searchInput && (
-            <button
-              onClick={() => setSearchInput('')}
-              className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white"
-              aria-label="Clear search"
-            >
-              <span className="material-symbols-outlined text-[18px]">close</span>
-            </button>
-          )}
-        </div>
-
-        <div className="flex flex-wrap items-center gap-2">
-          {TOPICS.map(t => {
-            const active = state.topicId === t.id && !state.search
-            return (
-              <button
-                key={t.id}
-                onClick={() => handleTopic(t.id)}
-                className={`px-3.5 py-1.5 rounded-full text-xs font-medium transition-all ${
-                  active
-                    ? 'bg-white text-slate-900 shadow-md'
-                    : 'bg-white/[0.05] text-slate-300 hover:bg-white/[0.1] hover:text-white'
-                }`}
-                style={{ fontFamily: 'Manrope, sans-serif' }}
-              >
-                {t.label}
-              </button>
-            )
-          })}
-
-          <div className="ml-auto flex items-center gap-1 rounded-full bg-white/[0.04] p-1">
-            {ORIENTATIONS.map(o => {
-              const active = state.orientation === o.id
-              return (
-                <button
-                  key={o.id}
-                  onClick={() => handleOrientation(o.id)}
-                  title={o.label}
-                  className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs transition ${
-                    active
-                      ? 'bg-white/15 text-white'
-                      : 'text-slate-400 hover:text-white'
-                  }`}
-                >
-                  <span className="material-symbols-outlined text-[16px]">{o.icon}</span>
-                  <span className="hidden sm:inline">{o.label}</span>
-                </button>
-              )
-            })}
-          </div>
-        </div>
-      </div>
-
-      {/* Status row */}
-      <div className="mt-4 flex items-center justify-between">
-        <p className="text-xs text-slate-500" style={{ fontFamily: 'Inter, sans-serif' }}>
-          {state.search
-            ? `Results for "${state.search}"`
-            : activeTopic
-              ? activeTopic.label
-              : 'Featured'}
-          {photos.length > 0 && ` · ${photos.length} photo${photos.length === 1 ? '' : 's'} loaded`}
-        </p>
-        {error && (
-          <span className="text-xs text-rose-300">
-            <span className="material-symbols-outlined align-middle text-[14px] mr-1">error</span>
-            {error}
-          </span>
-        )}
-      </div>
-
-      {/* Grid */}
-      <div className="mt-4 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">
-        {photos.map(photo => (
-          <PhotoCard key={photo.id} photo={photo} onClick={() => handleOpenPreview(photo)} />
-        ))}
-        {loading && photos.length === 0 && Array.from({ length: 8 }).map((_, i) => (
-          <div key={`skel-${i}`} className="aspect-[4/3] rounded-xl bg-white/[0.03] animate-pulse" />
-        ))}
-      </div>
-
-      {showEmpty && (
-        <div className="mt-12 flex flex-col items-center justify-center gap-3 text-center text-slate-400">
-          <span className="material-symbols-outlined text-4xl">image_search</span>
-          <p className="text-sm">No wallpapers found. Try a different keyword or topic.</p>
+      {error && (
+        <div className="mt-4 flex items-center gap-2 rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
+          <span className="material-symbols-outlined text-[18px]">error</span>
+          <span>{error}</span>
         </div>
       )}
 
-      {hasMore && photos.length > 0 && (
-        <div className="mt-8 flex justify-center">
-          <button
-            onClick={loadMore}
-            disabled={loadingMore}
-            className="px-5 py-2.5 rounded-xl bg-white/[0.05] hover:bg-white/[0.1] text-sm text-white border border-white/[0.08] transition disabled:opacity-50"
-            style={{ fontFamily: 'Manrope, sans-serif' }}
-          >
-            {loadingMore ? 'Loading…' : 'Load more'}
-          </button>
+      <div className="mt-6 grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6">
+        {loadingPhotos
+          ? Array.from({ length: 12 }).map((_, i) => (
+              <div key={`skel-${i}`} className="aspect-[4/3] rounded-xl bg-white/[0.03] animate-pulse" />
+            ))
+          : photos.map(photo => (
+              <PhotoCard key={photo.id} photo={photo} onClick={() => handleOpenPreview(photo)} />
+            ))}
+      </div>
+
+      {!loadingPhotos && photos.length === 0 && !error && (
+        <div className="mt-12 flex flex-col items-center gap-3 text-center text-slate-400">
+          <span className="material-symbols-outlined text-4xl">image_search</span>
+          <p className="text-sm">No wallpapers returned. Try refreshing or pick different categories.</p>
         </div>
       )}
 
@@ -328,8 +408,253 @@ function Header() {
         Wallpapers
       </h1>
       <p className="mt-1 text-sm text-slate-400" style={{ fontFamily: 'Inter, sans-serif' }}>
-        High-quality desktop backgrounds from Unsplash. Browse, search, preview.
+        High-quality desktop backgrounds from Unsplash, picked from your favorite categories.
       </p>
+    </div>
+  )
+}
+
+function GalleryHeader({
+  favorites,
+  allCategories,
+  activePickId,
+  onRefresh,
+  onEdit,
+  loading,
+}: {
+  favorites: string[]
+  allCategories: Category[]
+  activePickId: string | null
+  onRefresh: () => void
+  onEdit: () => void
+  loading: boolean
+}) {
+  // Highlight the chip for the category main just rolled — gives a visual
+  // cue that Refresh rotates between favorites instead of mixing them.
+  const activeId = activePickId && favorites.includes(activePickId) ? activePickId : null
+  return (
+    <div className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
+      <div>
+        <h1 className="text-3xl font-extrabold text-white" style={{ fontFamily: 'Manrope, sans-serif' }}>
+          Wallpapers
+        </h1>
+        <div className="mt-2 flex flex-wrap items-center gap-1.5">
+          {favorites.map(id => {
+            const cat = allCategories.find(c => c.id === id)
+            if (!cat) return null
+            const active = id === activeId
+            return (
+              <span
+                key={id}
+                className={`inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs transition ${
+                  active
+                    ? 'bg-white text-slate-900 shadow-sm'
+                    : 'bg-white/[0.06] text-slate-200'
+                }`}
+                style={{ fontFamily: 'Manrope, sans-serif' }}
+              >
+                <span className="material-symbols-outlined text-[14px]">{cat.icon}</span>
+                {cat.label}
+              </span>
+            )
+          })}
+        </div>
+      </div>
+      <div className="flex shrink-0 items-center gap-2">
+        <button
+          onClick={onEdit}
+          className="flex items-center gap-1.5 rounded-xl border border-white/[0.08] bg-white/[0.04] px-3 py-2 text-xs text-slate-200 transition hover:bg-white/[0.08]"
+          style={{ fontFamily: 'Manrope, sans-serif' }}
+        >
+          <span className="material-symbols-outlined text-[16px]">tune</span>
+          Edit favorites
+        </button>
+        <button
+          onClick={onRefresh}
+          disabled={loading}
+          className="flex items-center gap-1.5 rounded-xl primary-gradient px-4 py-2 text-xs font-bold text-slate-900 shadow-md transition hover:scale-[1.02] active:scale-95 disabled:cursor-wait disabled:opacity-60 disabled:hover:scale-100"
+          style={{ fontFamily: 'Manrope, sans-serif' }}
+        >
+          <span className={`material-symbols-outlined text-[16px] ${loading ? 'animate-spin' : ''}`}>
+            {loading ? 'progress_activity' : 'refresh'}
+          </span>
+          {loading ? 'Loading…' : 'Refresh'}
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function PickerView({
+  draft,
+  customs,
+  onToggle,
+  onSave,
+  onCancel,
+  onAddCustom,
+  onDeleteCustom,
+}: {
+  draft: string[]
+  customs: Category[]
+  onToggle: (id: string) => void
+  onSave: () => void
+  onCancel: (() => void) | null
+  onAddCustom: (label: string) => void
+  onDeleteCustom: (id: string) => void
+}) {
+  const count = draft.length
+  const canSave = count >= MIN_PICK
+  const [adding, setAdding] = useState(false)
+  const [newLabel, setNewLabel] = useState('')
+
+  const submitNew = () => {
+    const v = newLabel.trim()
+    if (!v) {
+      setAdding(false)
+      return
+    }
+    onAddCustom(v)
+    setNewLabel('')
+    setAdding(false)
+  }
+
+  return (
+    <div className="h-full overflow-y-auto px-10 py-8 pb-28">
+      <div>
+        <h1 className="text-3xl font-extrabold text-white" style={{ fontFamily: 'Manrope, sans-serif' }}>
+          Pick your favorites
+        </h1>
+        <p className="mt-1 text-sm text-slate-400" style={{ fontFamily: 'Inter, sans-serif' }}>
+          Pick the categories you'd like wallpapers from — as few or as many as you want. Add your own
+          keywords if none of the built-ins fit. Lumia rotates through your picks every time you click
+          Refresh.
+        </p>
+      </div>
+
+      {/* Tag-style picker — flex-wrap so the row density adapts to whatever
+          width the user is on, and each pill stays compact instead of
+          stretching to fill a grid cell. Selected pills get the category's
+          accent gradient so the choice stays visually distinct. Custom pills
+          show a × delete affordance; built-ins don't. */}
+      <div className="mt-8 flex flex-wrap gap-2">
+        {[...BUILTIN_CATEGORIES, ...customs].map(cat => {
+          const selected = draft.includes(cat.id)
+          return (
+            <div key={cat.id} className="group relative">
+              <button
+                type="button"
+                onClick={() => onToggle(cat.id)}
+                aria-pressed={selected}
+                className={`relative flex items-center gap-2 overflow-hidden rounded-full text-sm transition-all ${
+                  cat.isCustom ? 'pl-3.5 pr-7 py-2' : 'px-3.5 py-2'
+                } ${
+                  selected
+                    ? `bg-gradient-to-br ${cat.gradient} text-white ring-1 ring-white/40 shadow-md`
+                    : 'bg-white/[0.05] text-slate-300 ring-1 ring-white/10 hover:bg-white/[0.1] hover:text-white'
+                }`}
+                style={{ fontFamily: 'Manrope, sans-serif' }}
+              >
+                <span className="material-symbols-outlined text-[18px]">{cat.icon}</span>
+                <span className="font-medium">{cat.label}</span>
+                {selected && (
+                  <span className="material-symbols-outlined ml-0.5 text-[16px]">check</span>
+                )}
+              </button>
+              {cat.isCustom && (
+                <button
+                  type="button"
+                  onClick={e => { e.stopPropagation(); onDeleteCustom(cat.id) }}
+                  aria-label={`Delete ${cat.label}`}
+                  // Sits on top of the pill in the right-edge gutter we left
+                  // via pr-7. Always visible at low opacity so the affordance
+                  // is discoverable; hover/group-hover brightens it.
+                  className="absolute right-1.5 top-1/2 -translate-y-1/2 flex h-5 w-5 items-center justify-center rounded-full bg-black/30 text-white/70 opacity-60 transition hover:bg-black/60 hover:text-white group-hover:opacity-100"
+                >
+                  <span className="material-symbols-outlined text-[14px]">close</span>
+                </button>
+              )}
+            </div>
+          )
+        })}
+
+        {/* Add-custom affordance: pill that turns into a tiny inline form
+            when clicked. Enter submits, Escape/blur with empty cancels. */}
+        {adding ? (
+          <div className="flex items-center gap-1 rounded-full bg-white/[0.08] ring-1 ring-white/20 pl-3 pr-1 py-1">
+            <span className="material-symbols-outlined text-[18px] text-slate-300">tag</span>
+            <input
+              autoFocus
+              value={newLabel}
+              onChange={e => setNewLabel(e.target.value)}
+              onKeyDown={e => {
+                if (e.key === 'Enter') submitNew()
+                else if (e.key === 'Escape') { setNewLabel(''); setAdding(false) }
+              }}
+              onBlur={submitNew}
+              placeholder="e.g. cyberpunk"
+              className="w-32 bg-transparent text-sm text-white placeholder:text-slate-500 focus:outline-none"
+              style={{ fontFamily: 'Manrope, sans-serif' }}
+            />
+            <button
+              type="button"
+              onMouseDown={e => e.preventDefault()}
+              onClick={submitNew}
+              className="flex h-7 w-7 items-center justify-center rounded-full bg-white text-slate-900 shadow"
+              aria-label="Add"
+            >
+              <span className="material-symbols-outlined text-[16px]">check</span>
+            </button>
+          </div>
+        ) : (
+          <button
+            type="button"
+            onClick={() => setAdding(true)}
+            className="flex items-center gap-1.5 rounded-full border border-dashed border-white/20 px-3.5 py-2 text-sm text-slate-300 transition hover:border-white/40 hover:bg-white/[0.04] hover:text-white"
+            style={{ fontFamily: 'Manrope, sans-serif' }}
+          >
+            <span className="material-symbols-outlined text-[18px]">add</span>
+            Add custom
+          </button>
+        )}
+      </div>
+
+      {/* Sticky footer with selection count + actions. Pinned to viewport so the
+          user can scroll the grid without losing the Save button. */}
+      <div className="fixed inset-x-0 bottom-0 z-30 border-t border-white/[0.06] bg-[#07070b]/85 backdrop-blur-md">
+        <div className="mx-auto flex max-w-screen-2xl items-center justify-between px-10 py-3">
+          <div className="text-sm text-slate-300" style={{ fontFamily: 'Manrope, sans-serif' }}>
+            <span className={canSave ? 'font-bold text-white' : 'text-slate-400'}>
+              {count}
+            </span>
+            <span className="text-slate-500"> selected</span>
+            {!canSave && (
+              <span className="ml-2 text-xs text-slate-500">
+                Pick at least {MIN_PICK}
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-2">
+            {onCancel && (
+              <button
+                onClick={onCancel}
+                className="rounded-xl border border-white/[0.08] bg-white/[0.04] px-4 py-2 text-sm text-slate-200 transition hover:bg-white/[0.08]"
+                style={{ fontFamily: 'Manrope, sans-serif' }}
+              >
+                Cancel
+              </button>
+            )}
+            <button
+              onClick={onSave}
+              disabled={!canSave}
+              className="flex items-center gap-1.5 rounded-xl primary-gradient px-5 py-2 text-sm font-bold text-slate-900 shadow-lg transition hover:scale-[1.02] active:scale-95 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:scale-100"
+              style={{ fontFamily: 'Manrope, sans-serif' }}
+            >
+              <span className="material-symbols-outlined text-[18px]">check_circle</span>
+              Save & continue
+            </button>
+          </div>
+        </div>
+      </div>
     </div>
   )
 }

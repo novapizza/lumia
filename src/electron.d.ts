@@ -15,6 +15,13 @@ interface AppSettings {
   lastVideoMode: 'region' | 'window' | 'screen'
   printScreenAsCapture: boolean
   printScreenPromptShown: boolean
+  wallpaperCategories: string[]
+  wallpaperCustomCategories: Array<{ id: string; label: string; query: string }>
+  wallpaperGrid: {
+    photos: import('./types').UnsplashPhoto[]
+    pickId: string
+    fetchedAt: number
+  } | null
 }
 
 declare global {
@@ -165,18 +172,13 @@ declare global {
       ocrScan: (dataUrl: string) => Promise<import('@/types').AutoBlurResult>
 
       // Wallpapers (Unsplash)
-      wallpapersList: (opts: {
-        query?: string
-        page?: number
-        perPage?: number
+      wallpapersRandom: (opts: {
+        picks: Array<{ id: string; topic?: string; query?: string }>
+        count?: number
         orientation?: 'landscape' | 'portrait' | 'squarish'
-        topic?: string
+        preferFeatured?: boolean
       }) => Promise<
-        | { ok: true; photos: import('@/types').UnsplashPhoto[]; total: number; totalPages: number }
-        | { ok: false; error: string }
-      >
-      wallpapersGet: (id: string) => Promise<
-        | { ok: true; photo: import('@/types').UnsplashPhoto }
+        | { ok: true; photos: import('@/types').UnsplashPhoto[]; pickId: string }
         | { ok: false; error: string }
       >
       wallpapersTrackDownload: (downloadLocation: string) => Promise<{ ok: true }>
