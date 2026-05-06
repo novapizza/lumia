@@ -327,69 +327,53 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
 
     useEffect(() => { onZoomChange?.(userZoom) }, [userZoom, onZoomChange])
 
-    // Wheel handling — Figma convention:
-    //   Ctrl/Cmd+wheel (and trackpad pinch, which Chromium translates to
-    //     ctrlKey+wheel) → zoom anchored at cursor
-    //   wheel without modifier (and two-finger trackpad swipe) → pan
+    // Wheel handling — image-editor convention (Photoshop, Preview, etc.):
+    //   any wheel/pinch → zoom anchored at cursor
+    // Pan is handled separately by right-click drag, Space+left-drag, or
+    // the toolbar pan tool — see the mousedown effect below.
     useEffect(() => {
       const el = containerRef.current
       if (!el) return
       const onWheel = (e: WheelEvent) => {
         e.preventDefault()
 
-        if (e.ctrlKey || e.metaKey) {
-          const rect = el.getBoundingClientRect()
-          const mx = e.clientX - rect.left
-          const my = e.clientY - rect.top
-          const pan = panOffsetRef.current
-
-          setUserZoom(prevZoom => {
-            // Trackpad pinch sends small deltaY (~5-15) per event at high
-            // frequency; mouse wheel sends ~100 per notch. Use a higher
-            // coefficient so pinch feels snappy, but clamp the magnitude so
-            // a single mouse-wheel notch still maps to ~14% zoom.
-            const lineHeight = 16
-            const rawDy = e.deltaMode === 1 ? e.deltaY * lineHeight : e.deltaY
-            const clampedDy = Math.sign(rawDy) * Math.min(30, Math.abs(rawDy))
-            const factor = Math.exp(-clampedDy * 0.005)
-            const nextZoom = clampZoom(prevZoom * factor)
-            if (nextZoom === prevZoom) return prevZoom
-
-            const prevScale = baseScale * prevZoom
-            const nextScale = baseScale * nextZoom
-            const prevStageW = naturalW * prevScale
-            const prevStageH = naturalH * prevScale
-            const nextStageW = naturalW * nextScale
-            const nextStageH = naturalH * nextScale
-            const prevLeft = (rect.width  - prevStageW) / 2 + pan.x
-            const prevTop  = (rect.height - prevStageH) / 2 + pan.y
-
-            const imgX = (mx - prevLeft) / prevScale
-            const imgY = (my - prevTop)  / prevScale
-
-            const newPanX = mx - (rect.width  - nextStageW) / 2 - imgX * nextScale
-            const newPanY = my - (rect.height - nextStageH) / 2 - imgY * nextScale
-            const clamped = clampPan({ x: newPanX, y: newPanY }, rect.width, rect.height, nextStageW, nextStageH)
-            setPanOffset(clamped)
-            panOffsetRef.current = clamped
-
-            return nextZoom
-          })
-          return
-        }
-
-        // Pan. deltaMode 1 = lines (mouse wheel on Linux/older browsers); convert to px.
-        const lineHeight = 16
-        const dx = e.deltaMode === 1 ? e.deltaX * lineHeight : e.deltaX
-        const dy = e.deltaMode === 1 ? e.deltaY * lineHeight : e.deltaY
-        // Shift+vertical-only wheel → horizontal pan (matches every native scrollbar).
-        const useShiftSwap = e.shiftKey && dx === 0
-        const panDx = useShiftSwap ? dy : dx
-        const panDy = useShiftSwap ? 0  : dy
         const rect = el.getBoundingClientRect()
-        const stageW = naturalW * baseScale * userZoomRef.current
-        const stageH = naturalH * baseScale * userZoomRef.current
-        setPanOffset(prev => clampPan({ x: prev.x - panDx, y: prev.y - panDy }, rect.width, rect.height, stageW, stageH))
+        const mx = e.clientX - rect.left
+        const my = e.clientY - rect.top
+        const pan = panOffsetRef.current
+
+        setUserZoom(prevZoom => {
+          // Trackpad pinch sends small deltaY (~5-15) per event at high
+          // frequency; mouse wheel sends ~100 per notch. Use a higher
+          // coefficient so pinch feels snappy, but clamp the magnitude so
+          // a single mouse-wheel notch still maps to ~14% zoom.
+          const lineHeight = 16
+          const rawDy = e.deltaMode === 1 ? e.deltaY * lineHeight : e.deltaY
+          const clampedDy = Math.sign(rawDy) * Math.min(30, Math.abs(rawDy))
+          const factor = Math.exp(-clampedDy * 0.005)
+          const nextZoom = clampZoom(prevZoom * factor)
+          if (nextZoom === prevZoom) return prevZoom
+
+          const prevScale = baseScale * prevZoom
+          const nextScale = baseScale * nextZoom
+          const prevStageW = naturalW * prevScale
+          const prevStageH = naturalH * prevScale
+          const nextStageW = naturalW * nextScale
+          const nextStageH = naturalH * nextScale
+          const prevLeft = (rect.width  - prevStageW) / 2 + pan.x
+          const prevTop  = (rect.height - prevStageH) / 2 + pan.y
+
+          const imgX = (mx - prevLeft) / prevScale
+          const imgY = (my - prevTop)  / prevScale
+
+          const newPanX = mx - (rect.width  - nextStageW) / 2 - imgX * nextScale
+          const newPanY = my - (rect.height - nextStageH) / 2 - imgY * nextScale
+          const clamped = clampPan({ x: newPanX, y: newPanY }, rect.width, rect.height, nextStageW, nextStageH)
+          setPanOffset(clamped)
+          panOffsetRef.current = clamped
+
+          return nextZoom
+        })
       }
       el.addEventListener('wheel', onWheel, { passive: false })
       return () => el.removeEventListener('wheel', onWheel)
