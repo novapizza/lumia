@@ -39,6 +39,18 @@ if (process.platform === 'win32') {
   app.commandLine.appendSwitch('enable-features', 'WindowsNativeGraphicsCapture')
 }
 
+// Cap Chromium's on-disk HTTP cache. Default is unlimited and grows
+// indefinitely — Wallpapers fetches dozens of new Unsplash images per
+// Refresh, and a heavy user can balloon the cache past 500 MB.
+//
+// 80 MB is enough headroom for Lumia's actual cacheable surface (the docs
+// site, a few API responses, a few hundred wallpaper thumbnails) while
+// bounding the worst case. Fonts no longer factor in — Inter, Manrope and
+// Material Symbols are self-hosted and bundled, so Chromium doesn't cache
+// them via HTTP. When the cap fills, Chromium evicts LRU; recently-viewed
+// wallpapers stay warm, ancient ones get reclaimed automatically.
+app.commandLine.appendSwitch('disk-cache-size', String(80 * 1024 * 1024))
+
 const isDev = !app.isPackaged
 
 // Only allow a single running instance — prevents cache/lock conflicts
