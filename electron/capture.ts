@@ -1,7 +1,7 @@
 import { desktopCapturer, ipcMain, screen, nativeImage, clipboard } from 'electron'
 import { homedir } from 'os'
 import { join } from 'path'
-import { getMainWindow, createOverlayWindows, closeAllOverlays, getHistoryStore, getOverlayDisplayId, broadcastToOverlays, restoreFromOverlayCancel, waitForViewMounted } from './index'
+import { getMainWindow, createOverlayWindows, closeAllOverlays, getHistoryStore, getOverlayDisplayId, broadcastToOverlays, restoreFromOverlayCancel, waitForViewMounted, openHistoryItemInEditor, isMainDismissed } from './index'
 import { getWindowAtPointPhysical } from './native-input'
 import { getMacWindowAtPoint } from './mac-window-pick'
 import { setOverlayMode, resetOverlayMode } from './scroll-capture'
@@ -525,14 +525,22 @@ export async function sendCaptureToEditor(dataUrlIn: string, source: string) {
     }
   } catch { /* silent */ }
 
-  // Send navigate first, then wait for the renderer to ack that /editor has
-  // actually mounted before showing the window — otherwise the user sees a
-  // brief flash of the previous route (dashboard) while React processes the
-  // navigation. The renderer was alive throughout the capture so we expect
-  // the ack within a frame; the helper has a generous timeout fallback.
-  mainWin.webContents.send('navigate', '/editor', { dataUrl, source, historyId })
-  await waitForViewMounted('/editor')
-  showMainWindow()
+  // Tray-only state: user dismissed the main window before triggering this
+  // capture (hotkey or tray menu). Honor that — surface the toast and stop.
+  // The notification's onClick still calls openHistoryItemInEditor, so a
+  // tap on the toast brings them back into the editor on demand.
+  //
+  // Otherwise: send navigate first, then wait for the renderer to ack that
+  // /editor has actually mounted before showing the window — otherwise the
+  // user sees a brief flash of the previous route (dashboard) while React
+  // processes the navigation. The renderer was alive throughout the capture
+  // so we expect the ack within a frame; the helper has a generous timeout
+  // fallback.
+  if (!isMainDismissed()) {
+    mainWin.webContents.send('navigate', '/editor', { dataUrl, source, historyId })
+    await waitForViewMounted('/editor')
+    showMainWindow()
+  }
 
   // 'active-monitor' / 'fullscreen' are legacy source tags from older
   // builds — preserved here so notifications for existing history items
@@ -542,8 +550,14 @@ export async function sendCaptureToEditor(dataUrlIn: string, source: string) {
     source === 'window' ? 'Window' :
     source === 'screen' || source === 'active-monitor' ? 'Screen' :
     'All Screens'
+  // Snapshot tray state at notification fire time. The user clicking the
+  // toast later (banner or Action Center) should produce the same
+  // X-close behavior regardless of what's happened to the window in
+  // between — capturing this value here makes the decision deterministic.
+  const fromTray = isMainDismissed()
   showNotification({
     body: `${label} captured — copied to clipboard`,
     thumbnailDataUrl: dataUrl,
+    onClick: historyId ? () => { void openHistoryItemInEditor(historyId!, fromTray) } : undefined,
   })
 }
