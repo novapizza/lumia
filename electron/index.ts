@@ -2009,7 +2009,13 @@ app.on('will-quit', () => {
   overlayPool.clear()
 })
 
-app.on('second-instance', () => {
+app.on('second-instance', (_e, argv) => {
+  // A duplicate `--hidden` launch (two HKCU\...\Run entries left over from
+  // older builds, or any other path that re-fires the boot launcher) must
+  // not surface the window — the user's intent for `--hidden` is "stay in
+  // tray", and the first instance has already honored that.
+  if (argv.includes('--hidden')) return
+
   // Windows toast activation routes through here when the toastXml uses
   // `activationType="protocol"` — the click opens our scheme, spawns
   // electron, and lands on second-instance.
