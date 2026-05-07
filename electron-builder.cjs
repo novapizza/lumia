@@ -21,12 +21,13 @@
 //   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY  → S3 publisher auth (read by SDK)
 //   R2_RELEASES_ACCOUNT_ID                     → S3 endpoint host
 //   R2_RELEASES_BUCKET                         → S3 bucket name
-//   R2_RELEASES_PUBLIC_URL                     → public host autoUpdater hits
+//   R2_RELEASES_PUBLIC_URL                     → full URL autoUpdater hits
+//                                                 (scheme + host, no trailing /)
 //   GH_TOKEN                                   → GitHub publisher auth
 const publish = [
   {
     provider: 'generic',
-    url: `https://${process.env.R2_RELEASES_PUBLIC_URL || ''}`
+    url: process.env.R2_RELEASES_PUBLIC_URL || ''
   },
   {
     provider: 's3',
