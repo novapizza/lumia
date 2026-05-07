@@ -14,6 +14,7 @@ import { PrintScreenPromptDialog } from './components/PrintScreenPromptDialog'
 // it would put a Suspense fallback in front of the user on app launch.
 const Editor = lazy(() => import('./windows/editor/Editor'))
 const Workflow = lazy(() => import('./windows/workflow/Workflow'))
+const Wallpapers = lazy(() => import('./windows/wallpapers/Wallpapers'))
 const Settings = lazy(() => import('./windows/settings/Settings'))
 const Overlay = lazy(() => import('./windows/overlay/Overlay'))
 const RecordingToolbar = lazy(() => import('./windows/recording-toolbar/RecordingToolbar'))
@@ -113,6 +114,7 @@ export default function App() {
             {/* /history merged into /dashboard — stale links redirect. */}
             <Route path="/history" element={<Navigate to="/dashboard" replace />} />
             <Route path="/workflow" element={<Workflow />} />
+            <Route path="/wallpapers" element={<Wallpapers />} />
             <Route path="/settings" element={<Settings />} />
             {/* /video-annotator merged into /editor — stale links redirect. */}
             <Route path="/video-annotator" element={<Navigate to="/editor" replace />} />

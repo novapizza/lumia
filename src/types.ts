@@ -104,3 +104,28 @@ export interface AutoBlurResult {
   ocrTimeMs: number
   detectTimeMs: number
 }
+
+export interface UnsplashPhoto {
+  id: string
+  description: string | null
+  width: number
+  height: number
+  color: string | null
+  blurHash: string | null
+  urls: {
+    raw: string
+    full: string
+    regular: string
+    small: string
+    thumb: string
+  }
+  links: {
+    html: string
+    downloadLocation: string
+  }
+  user: {
+    name: string
+    username: string
+    link: string
+  }
+}

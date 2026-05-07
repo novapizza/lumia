@@ -327,17 +327,43 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
 
     useEffect(() => { onZoomChange?.(userZoom) }, [userZoom, onZoomChange])
 
-    // Wheel handling — Figma convention:
-    //   Ctrl/Cmd+wheel (and trackpad pinch, which Chromium translates to
-    //     ctrlKey+wheel) → zoom anchored at cursor
-    //   wheel without modifier (and two-finger trackpad swipe) → pan
+    // Wheel handling:
+    //   • Ctrl/Cmd+wheel and trackpad pinch (Chromium translates pinch
+    //     → ctrlKey+wheel) → zoom anchored at cursor.
+    //   • Plain mouse wheel → zoom (image-editor convention; mouse users
+    //     have no other obvious zoom gesture).
+    //   • Plain trackpad two-finger swipe → pan (trackpad users can't
+    //     right-click, so wheel is their only pan gesture).
+    //
+    // Mouse-vs-trackpad detection uses Chromium's non-standard
+    // `wheelDeltaY` property: a mouse wheel notch always reports a
+    // signed multiple of 120 (Windows WHEEL_DELTA constant) — typical
+    // values ±120, ±240, ±360. Trackpad swipes produce arbitrary values
+    // that almost never land on a clean 120 multiple. This signal is
+    // structural rather than statistical, so it doesn't misfire on fast
+    // wheel rolls or fast trackpad flicks the way pure-magnitude or
+    // event-frequency heuristics do.
+    //
+    // Type cast: `wheelDeltaY` is non-standard / deprecated but
+    // available in all Chromium versions (which is what Electron uses).
     useEffect(() => {
       const el = containerRef.current
       if (!el) return
       const onWheel = (e: WheelEvent) => {
         e.preventDefault()
 
-        if (e.ctrlKey || e.metaKey) {
+        const lineHeight = 16
+        const rawDy = e.deltaMode === 1 ? e.deltaY * lineHeight : e.deltaY
+        const rawDx = e.deltaMode === 1 ? e.deltaX * lineHeight : e.deltaX
+        const wheelDelta = (e as unknown as { wheelDeltaY?: number }).wheelDeltaY ?? 0
+        const isMouseWheelLike =
+          rawDx === 0 &&
+          wheelDelta !== 0 &&
+          Math.abs(wheelDelta) >= 120 &&
+          Math.abs(wheelDelta) % 120 === 0
+        const shouldZoom = e.ctrlKey || e.metaKey || isMouseWheelLike
+
+        if (shouldZoom) {
           const rect = el.getBoundingClientRect()
           const mx = e.clientX - rect.left
           const my = e.clientY - rect.top
@@ -348,8 +374,6 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
             // frequency; mouse wheel sends ~100 per notch. Use a higher
             // coefficient so pinch feels snappy, but clamp the magnitude so
             // a single mouse-wheel notch still maps to ~14% zoom.
-            const lineHeight = 16
-            const rawDy = e.deltaMode === 1 ? e.deltaY * lineHeight : e.deltaY
             const clampedDy = Math.sign(rawDy) * Math.min(30, Math.abs(rawDy))
             const factor = Math.exp(-clampedDy * 0.005)
             const nextZoom = clampZoom(prevZoom * factor)
@@ -378,14 +402,11 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
           return
         }
 
-        // Pan. deltaMode 1 = lines (mouse wheel on Linux/older browsers); convert to px.
-        const lineHeight = 16
-        const dx = e.deltaMode === 1 ? e.deltaX * lineHeight : e.deltaX
-        const dy = e.deltaMode === 1 ? e.deltaY * lineHeight : e.deltaY
-        // Shift+vertical-only wheel → horizontal pan (matches every native scrollbar).
-        const useShiftSwap = e.shiftKey && dx === 0
-        const panDx = useShiftSwap ? dy : dx
-        const panDy = useShiftSwap ? 0  : dy
+        // Trackpad two-finger swipe — pan. Shift+vertical swipe → horizontal
+        // pan (matches every native scrollbar).
+        const useShiftSwap = e.shiftKey && rawDx === 0
+        const panDx = useShiftSwap ? rawDy : rawDx
+        const panDy = useShiftSwap ? 0     : rawDy
         const rect = el.getBoundingClientRect()
         const stageW = naturalW * baseScale * userZoomRef.current
         const stageH = naturalH * baseScale * userZoomRef.current
