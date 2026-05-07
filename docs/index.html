@@ -497,15 +497,15 @@ footer a { color: var(--primary); text-decoration: none; }
       A blazing-fast screen capture tool with built-in annotation editor, video recorder, and workflow engine. One app for screenshots, recordings, and instant sharing.
     </p>
     <div class="hero-actions" id="hero-actions">
-      <a href="https://github.com/emtyty/lumia/releases/latest" target="_blank" rel="noopener" class="btn-primary" data-platform="mac" data-arch="arm64">
+      <a href="https://release.lumia.asia/" rel="noopener" class="btn-primary" data-platform="mac" data-arch="arm64">
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10 10-4.5 10-10S17.5 2 12 2z"/><path d="M12 7c-1.4 0-2.5.9-3 2-.5-1.1-1.6-2-3-2"/><path d="M9 22c1.1-3 1.5-5.5 1.5-9"/></svg>
         Apple Silicon (.dmg)
       </a>
-      <a href="https://github.com/emtyty/lumia/releases/latest" target="_blank" rel="noopener" class="btn-secondary" data-platform="mac" data-arch="x64">
+      <a href="https://release.lumia.asia/" rel="noopener" class="btn-secondary" data-platform="mac" data-arch="x64">
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10 10-4.5 10-10S17.5 2 12 2z"/><path d="M12 7c-1.4 0-2.5.9-3 2-.5-1.1-1.6-2-3-2"/><path d="M9 22c1.1-3 1.5-5.5 1.5-9"/></svg>
         Intel (.dmg)
       </a>
-      <a href="https://github.com/emtyty/lumia/releases/latest" target="_blank" rel="noopener" class="btn-primary" data-platform="win">
+      <a href="https://release.lumia.asia/" rel="noopener" class="btn-primary" data-platform="win">
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="m9 3 0 18"/><path d="m3 9 18 0"/></svg>
         Download for Windows
       </a>
@@ -836,15 +836,15 @@ footer a { color: var(--primary); text-decoration: none; }
       <h2>Ready to capture<br><span class="gradient">everything?</span></h2>
       <p>Free, open-source, and built for speed. Download Lumia and take control of your screen.</p>
       <div class="cta-buttons" id="cta-buttons">
-        <a href="https://github.com/emtyty/lumia/releases/latest" target="_blank" rel="noopener" class="btn-primary" data-platform="mac" data-arch="arm64">
+        <a href="https://release.lumia.asia/" rel="noopener" class="btn-primary" data-platform="mac" data-arch="arm64">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
           Apple Silicon (.dmg)
         </a>
-        <a href="https://github.com/emtyty/lumia/releases/latest" target="_blank" rel="noopener" class="btn-secondary" data-platform="mac" data-arch="x64">
+        <a href="https://release.lumia.asia/" rel="noopener" class="btn-secondary" data-platform="mac" data-arch="x64">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
           Intel (.dmg)
         </a>
-        <a href="https://github.com/emtyty/lumia/releases/latest" target="_blank" rel="noopener" class="btn-primary" data-platform="win">
+        <a href="https://release.lumia.asia/" rel="noopener" class="btn-primary" data-platform="win">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
           Download for Windows
         </a>
@@ -866,59 +866,68 @@ footer a { color: var(--primary); text-decoration: none; }
 // Detect OS, then wire up the latest-release URLs. macOS ships per-arch DMGs
 // (arm64 + x64) so the page exposes both buttons and lets the user pick.
 // Windows ships a single multi-arch installer, so one button is enough.
+//
+// Source of truth is the same `latest.yml` / `latest-mac.yml` that the
+// in-app autoUpdater polls — that way the page version stays consistent
+// with what installed users see, with no extra release manifest to keep
+// in sync. `latest.yml` ships the .exe filename via its `path:` field;
+// `latest-mac.yml` only describes .zip artifacts (electron-updater's
+// channel format), so we read the version from it and reconstruct the
+// .dmg names from electron-builder's default multi-arch template
+// (arm64 carries the arch suffix, x64 omits it).
 (function() {
-  const REPO = 'emtyty/lumia';
-  const API_URL = 'https://api.github.com/repos/' + REPO + '/releases/latest';
-  const RELEASES_URL = 'https://github.com/' + REPO + '/releases/latest';
+  var RELEASE_BASE = 'https://release.lumia.asia';
+  var WIN_FEED = RELEASE_BASE + '/latest.yml';
+  var MAC_FEED = RELEASE_BASE + '/latest-mac.yml';
+  var BROWSE_URL = RELEASE_BASE + '/';
 
-  const ua = navigator.userAgent;
-  const isMac     = /Mac|iPhone|iPad|iPod/i.test(ua);
-  const isWindows = /Win/i.test(ua);
+  var ua = navigator.userAgent;
+  var isMac     = /Mac|iPhone|iPad|iPod/i.test(ua);
+  var isWindows = /Win/i.test(ua);
 
   // Hide all platform buttons immediately to avoid flashing the wrong OS buttons.
   document.querySelectorAll('[data-platform]').forEach(function(el) {
     el.style.display = 'none';
   });
 
-  function pickDmg(assets, arch) {
-    if (arch === 'arm64') {
-      var hit = assets.find(function(a) {
-        return a.name.toLowerCase().indexOf('arm64') !== -1 && a.name.endsWith('.dmg');
-      });
-      if (hit) return hit;
-    }
-    return assets.find(function(a) {
-      return a.name.toLowerCase().indexOf('arm64') === -1 && a.name.endsWith('.dmg');
-    });
+  function parseFeed(text) {
+    if (!text) return {};
+    var v = text.match(/^version:\s*['"]?([^'"\s]+)['"]?\s*$/m);
+    var p = text.match(/^path:\s*['"]?([^'"\r\n]+?)['"]?\s*$/m);
+    return {
+      version: v ? v[1].trim() : '',
+      path: p ? p[1].trim() : ''
+    };
   }
 
-  function pickExe(assets) {
-    return assets.find(function(a) { return a.name.endsWith('.exe'); });
-  }
-
-  function urlOr(asset) {
-    return asset ? asset.browser_download_url : RELEASES_URL;
+  function fetchFeed(url) {
+    return fetch(url, { cache: 'no-store' })
+      .then(function(r) { return r.ok ? r.text() : ''; })
+      .catch(function() { return ''; });
   }
 
   function setHref(selector, url) {
     document.querySelectorAll(selector).forEach(function(el) { el.href = url; });
   }
 
-  fetch(API_URL)
-    .then(function(r) { if (!r.ok) throw new Error('no release'); return r.json(); })
-    .then(function(release) {
-      var assets  = release.assets || [];
-      var version = (release.tag_name || '').replace(/^v/, '');
+  Promise.all([fetchFeed(WIN_FEED), fetchFeed(MAC_FEED)]).then(function(texts) {
+    var win = parseFeed(texts[0]);
+    var mac = parseFeed(texts[1]);
+    var version = win.version || mac.version;
 
-      setHref('[data-platform="mac"][data-arch="arm64"]', urlOr(pickDmg(assets, 'arm64')));
-      setHref('[data-platform="mac"][data-arch="x64"]',   urlOr(pickDmg(assets, 'x64')));
-      setHref('[data-platform="win"]',                    urlOr(pickExe(assets)));
+    if (win.path) {
+      setHref('[data-platform="win"]', RELEASE_BASE + '/' + win.path);
+    }
+    if (version) {
+      setHref('[data-platform="mac"][data-arch="arm64"]',
+              RELEASE_BASE + '/Lumia-' + version + '-arm64.dmg');
+      setHref('[data-platform="mac"][data-arch="x64"]',
+              RELEASE_BASE + '/Lumia-' + version + '.dmg');
 
       var badge = document.getElementById('version-badge');
-      if (badge && version) badge.textContent = 'Version ' + version + ' — Now Available';
-    })
-    .catch(function() { /* fallback URLs are already set on the buttons via HTML href */ })
-    .finally(function() { applyPlatform(); });
+      if (badge) badge.textContent = 'Version ' + version + ' — Now Available';
+    }
+  }).finally(function() { applyPlatform(); });
 
   function applyPlatform() {
     var platformKey = isMac ? 'mac' : isWindows ? 'win' : null;
