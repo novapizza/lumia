@@ -108,7 +108,15 @@ module.exports = {
     oneClick: false,
     allowToChangeInstallationDirectory: true,
     createDesktopShortcut: true,
-    createStartMenuShortcut: true
+    createStartMenuShortcut: true,
+    // Default NSIS template is `${productName} Setup ${version}.${ext}` with
+    // spaces. GitHub Releases auto-sanitizes spaces to hyphens in asset
+    // names, but the S3 publisher uploads the file verbatim — so co-publish
+    // ends up with `Lumia Setup X.exe` on R2, `Lumia-Setup-X.exe` on GitHub,
+    // and a single `latest.yml` carrying the hyphenated URL. autoUpdater
+    // polling R2 then 404s on the hyphenated URL. Force hyphens in the
+    // local artifact name so all three line up.
+    artifactName: '${productName}-Setup-${version}.${ext}'
   },
 
   // ── macOS ──────────────────────────────────────────────────────────────────
