@@ -62,7 +62,7 @@ jobs:
           : "${AWS_SECRET_ACCESS_KEY:?missing R2_RELEASES_SECRET_ACCESS_KEY secret}"
         env:
           R2_RELEASES_PUBLIC_URL: ${{ secrets.R2_RELEASES_PUBLIC_URL }}
-          R2_RELEASES_ACCOUNT_ID: ${{ secrets.MAIN_VITE_R2_ACCOUNT_ID }}
+          R2_RELEASES_ACCOUNT_ID: ${{ secrets.R2_RELEASES_ACCOUNT_ID }}
           R2_RELEASES_BUCKET: ${{ secrets.R2_RELEASES_BUCKET }}
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_RELEASES_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_RELEASES_SECRET_ACCESS_KEY }}
@@ -73,11 +73,9 @@ jobs:
           # ── R2 (primary, S3-compatible) ─────────────────────────────────────
           # AWS_* are read directly by the S3 publisher in electron-builder.
           # R2_RELEASES_* are read by electron-builder.cjs via process.env.
-          # R2_RELEASES_ACCOUNT_ID reuses the existing MAIN_VITE_R2_ACCOUNT_ID
-          # secret since releases share the same R2 account as screenshots.
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_RELEASES_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_RELEASES_SECRET_ACCESS_KEY }}
-          R2_RELEASES_ACCOUNT_ID: ${{ secrets.MAIN_VITE_R2_ACCOUNT_ID }}
+          R2_RELEASES_ACCOUNT_ID: ${{ secrets.R2_RELEASES_ACCOUNT_ID }}
           R2_RELEASES_BUCKET: ${{ secrets.R2_RELEASES_BUCKET }}
           R2_RELEASES_PUBLIC_URL: ${{ secrets.R2_RELEASES_PUBLIC_URL }}
 
@@ -140,7 +138,7 @@ jobs:
           }
         env:
           R2_RELEASES_PUBLIC_URL: ${{ secrets.R2_RELEASES_PUBLIC_URL }}
-          R2_RELEASES_ACCOUNT_ID: ${{ secrets.MAIN_VITE_R2_ACCOUNT_ID }}
+          R2_RELEASES_ACCOUNT_ID: ${{ secrets.R2_RELEASES_ACCOUNT_ID }}
           R2_RELEASES_BUCKET: ${{ secrets.R2_RELEASES_BUCKET }}
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_RELEASES_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_RELEASES_SECRET_ACCESS_KEY }}
@@ -152,7 +150,7 @@ jobs:
           # ── R2 (primary, S3-compatible) ─────────────────────────────────────
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_RELEASES_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_RELEASES_SECRET_ACCESS_KEY }}
-          R2_RELEASES_ACCOUNT_ID: ${{ secrets.MAIN_VITE_R2_ACCOUNT_ID }}
+          R2_RELEASES_ACCOUNT_ID: ${{ secrets.R2_RELEASES_ACCOUNT_ID }}
           R2_RELEASES_BUCKET: ${{ secrets.R2_RELEASES_BUCKET }}
           R2_RELEASES_PUBLIC_URL: ${{ secrets.R2_RELEASES_PUBLIC_URL }}
 
