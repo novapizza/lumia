@@ -176,32 +176,29 @@ jobs:
 
 
   # ── Mark as latest ───────────────────────────────────────────────────────────
-  # Disabled while the GitHub provider is commented out in electron-builder.cjs
-  # — there is no GitHub Release for this tag, so `gh release edit` would fail.
-  # Re-enable together with the GitHub provider for the bridge release.
-  # mark-latest:
-  #   name: Mark release as latest
-  #   runs-on: ubuntu-latest
-  #   needs: [release-mac, release-win]
-  #
-  #   steps:
-  #     - name: Checkout
-  #       uses: actions/checkout@v4
-  #       with:
-  #         fetch-depth: 0
-  #
-  #     # electron-builder creates the release as a draft (releaseType: draft
-  #     # in electron-builder.cjs) so it doesn't surface as `latest` while
-  #     # mac/win are still uploading. Now that both jobs are done, set the
-  #     # release notes from the tagged commit body, un-draft the release,
-  #     # and mark it latest — all in one edit.
-  #     - name: Publish release with notes
-  #       run: |
-  #         NOTES=$(git log -1 --format=%b "${{ github.ref_name }}")
-  #         gh release edit "${{ github.ref_name }}" \
-  #           --draft=false \
-  #           --latest \
-  #           --notes "$NOTES" \
-  #           --repo ${{ github.repository }}
-  #       env:
-  #         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  mark-latest:
+    name: Mark release as latest
+    runs-on: ubuntu-latest
+    needs: [release-mac, release-win]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # electron-builder creates the release as a draft (releaseType: draft
+      # in electron-builder.cjs) so it doesn't surface as `latest` while
+      # mac/win are still uploading. Now that both jobs are done, set the
+      # release notes from the tagged commit body, un-draft the release,
+      # and mark it latest — all in one edit.
+      - name: Publish release with notes
+        run: |
+          NOTES=$(git log -1 --format=%b "${{ github.ref_name }}")
+          gh release edit "${{ github.ref_name }}" \
+            --draft=false \
+            --latest \
+            --notes "$NOTES" \
+            --repo ${{ github.repository }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
