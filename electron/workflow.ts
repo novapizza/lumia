@@ -10,7 +10,7 @@ import { HistoryStore } from './history'
 import { resolveSaveStartDir, rememberSaveDir } from './settings'
 import { localTimestamp } from './utils'
 import { makeThumbnail } from './thumbnail'
-import { getMainWindow } from './index'
+import { getMainWindow, openHistoryItemInEditor, isMainDismissed } from './index'
 import { showNotification } from './notify'
 import { v4 as uuidv4 } from 'uuid'
 
@@ -22,6 +22,12 @@ export class WorkflowEngine {
   async run(templateId: string, imageData: string, destinationIndex?: number, historyId?: string): Promise<WorkflowResult> {
     const template = this.templateStore.getById(templateId)
     if (!template) throw new Error(`Template not found: ${templateId}`)
+
+    // ID the notify-click handler will use to surface this capture in the
+    // Editor. Reuses the caller's historyId when re-sharing from history;
+    // otherwise we mint one upfront so the eventual history.add (below) and
+    // the click handler agree on the same row.
+    const clickHistoryId = historyId ?? uuidv4()
 
     const result: WorkflowResult = {
       templateId,
@@ -102,9 +108,11 @@ export class WorkflowEngine {
         if (uploaded > 0) parts.push(`Uploaded to ${uploaded} destination${uploaded > 1 ? 's' : ''}`)
         if (failed > 0) parts.push(`${failed} upload${failed > 1 ? 's' : ''} failed`)
 
+        const fromTray = isMainDismissed()
         showNotification({
           body: parts.join(' · ') || 'Capture complete',
           thumbnailDataUrl: imageData,
+          onClick: () => { void openHistoryItemInEditor(clickHistoryId, fromTray) },
         })
       }
     }
@@ -126,7 +134,7 @@ export class WorkflowEngine {
       }
     } else {
       this.historyStore.add({
-        id: uuidv4(),
+        id: clickHistoryId,
         timestamp: Date.now(),
         name: `capture-${localTimestamp()}`,
         thumbnailUrl: makeThumbnail(imageData),

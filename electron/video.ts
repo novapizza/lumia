@@ -9,6 +9,8 @@ import {
   getOverlayDisplayId,
   restoreFromOverlayCancel,
   waitForViewMounted,
+  openHistoryItemInEditor,
+  isMainDismissed,
 } from './index'
 import { ORIGINALS_DIR } from './capture'
 import { uploadToR2 } from './uploaders/r2'
@@ -405,9 +407,14 @@ async function saveRecordingBlob(
     historyId = id
   }
 
+  // Snapshot tray state at notification fire time so banner / Action
+  // Center clicks pin the same X-close-to-tray behavior regardless of
+  // what happens to the window between toast appearance and click.
+  const fromTray = isMainDismissed()
   showNotification({
     body: `Recording saved · ${Math.round(durationMs / 1000)}s`,
     thumbnailDataUrl,
+    onClick: historyId ? () => { void openHistoryItemInEditor(historyId!, fromTray) } : undefined,
   })
 
   return { filePath, historyId }
@@ -623,7 +630,15 @@ export function setupVideo() {
       // Open the freshly-saved recording in the video annotator (same pattern
       // as screenshots → /editor). Briefly delay so the toolbar shows "Saved"
       // before the main window steals focus.
+      //
+      // Tray-only mode: user started the recording while the main window was
+      // dismissed to the tray. Skip the editor surface — the toast click
+      // still leads back here on demand via openHistoryItemInEditor.
       setTimeout(async () => {
+        if (isMainDismissed()) {
+          closeRecordingSession()
+          return
+        }
         const main = getMainWindow()
         if (main && !main.isDestroyed()) {
           const { basename } = require('path') as typeof import('path')

@@ -53,10 +53,33 @@ jobs:
       - name: Compile macOS Swift helpers (universal)
         run: bash build/compile-mac-helpers.sh
 
-      - name: Package & publish to GitHub Releases
+      - name: Verify R2 publish env
+        run: |
+          : "${R2_RELEASES_PUBLIC_URL:?missing R2_RELEASES_PUBLIC_URL secret}"
+          : "${R2_RELEASES_ACCOUNT_ID:?missing R2_RELEASES_ACCOUNT_ID secret}"
+          : "${R2_RELEASES_BUCKET:?missing R2_RELEASES_BUCKET secret}"
+          : "${AWS_ACCESS_KEY_ID:?missing R2_RELEASES_ACCESS_KEY_ID secret}"
+          : "${AWS_SECRET_ACCESS_KEY:?missing R2_RELEASES_SECRET_ACCESS_KEY secret}"
+        env:
+          R2_RELEASES_PUBLIC_URL: ${{ secrets.R2_RELEASES_PUBLIC_URL }}
+          R2_RELEASES_ACCOUNT_ID: ${{ secrets.R2_RELEASES_ACCOUNT_ID }}
+          R2_RELEASES_BUCKET: ${{ secrets.R2_RELEASES_BUCKET }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_RELEASES_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_RELEASES_SECRET_ACCESS_KEY }}
+
+      - name: Package & publish to R2 + GitHub Releases
         run: pnpm exec electron-builder --mac --publish always
         env:
-          # ── Publishing ──────────────────────────────────────────────────────
+          # ── R2 (primary, S3-compatible) ─────────────────────────────────────
+          # AWS_* are read directly by the S3 publisher in electron-builder.
+          # R2_RELEASES_* are read by electron-builder.cjs via process.env.
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_RELEASES_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_RELEASES_SECRET_ACCESS_KEY }}
+          R2_RELEASES_ACCOUNT_ID: ${{ secrets.R2_RELEASES_ACCOUNT_ID }}
+          R2_RELEASES_BUCKET: ${{ secrets.R2_RELEASES_BUCKET }}
+          R2_RELEASES_PUBLIC_URL: ${{ secrets.R2_RELEASES_PUBLIC_URL }}
+
+          # ── GitHub (legacy fallback for pre-R2 installs) ────────────────────
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
           # ── Code signing — Developer ID Application ─────────────────────────
@@ -105,15 +128,33 @@ jobs:
           MAIN_VITE_GDRIVE_API_KEY: ${{ secrets.MAIN_VITE_GDRIVE_API_KEY }}
           MAIN_VITE_GDRIVE_PROJECT_NUMBER: ${{ secrets.MAIN_VITE_GDRIVE_PROJECT_NUMBER }}
 
-      - name: Package, sign with Azure, and publish
+      - name: Verify R2 publish env
         shell: pwsh
         run: |
-          pnpm exec electron-builder --win --publish always `
-            "--config.win.azureSignOptions.publisherName=$env:AZURE_PUBLISHER_NAME" `
-            "--config.win.azureSignOptions.endpoint=$env:AZURE_TRUSTED_SIGNING_ENDPOINT" `
-            "--config.win.azureSignOptions.codeSigningAccountName=$env:AZURE_CODE_SIGNING_ACCOUNT_NAME" `
-            "--config.win.azureSignOptions.certificateProfileName=$env:AZURE_CERT_PROFILE_NAME"
+          foreach ($v in 'R2_RELEASES_PUBLIC_URL','R2_RELEASES_ACCOUNT_ID','R2_RELEASES_BUCKET','AWS_ACCESS_KEY_ID','AWS_SECRET_ACCESS_KEY') {
+            if (-not (Get-Item "env:$v" -ErrorAction SilentlyContinue).Value) {
+              Write-Error "::error::missing $v secret"; exit 1
+            }
+          }
         env:
+          R2_RELEASES_PUBLIC_URL: ${{ secrets.R2_RELEASES_PUBLIC_URL }}
+          R2_RELEASES_ACCOUNT_ID: ${{ secrets.R2_RELEASES_ACCOUNT_ID }}
+          R2_RELEASES_BUCKET: ${{ secrets.R2_RELEASES_BUCKET }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_RELEASES_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_RELEASES_SECRET_ACCESS_KEY }}
+
+      - name: Package, sign with Azure, and publish
+        shell: pwsh
+        run: pnpm exec electron-builder --win --publish always
+        env:
+          # ── R2 (primary, S3-compatible) ─────────────────────────────────────
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_RELEASES_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_RELEASES_SECRET_ACCESS_KEY }}
+          R2_RELEASES_ACCOUNT_ID: ${{ secrets.R2_RELEASES_ACCOUNT_ID }}
+          R2_RELEASES_BUCKET: ${{ secrets.R2_RELEASES_BUCKET }}
+          R2_RELEASES_PUBLIC_URL: ${{ secrets.R2_RELEASES_PUBLIC_URL }}
+
+          # ── GitHub (legacy fallback for pre-R2 installs) ────────────────────
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
           # Azure auth for Trusted Signing
@@ -121,7 +162,10 @@ jobs:
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
 
-          # Azure Trusted Signing config
+          # Azure Trusted Signing config — read by electron-builder.cjs via
+          # process.env. All four must be present for the sign step to engage;
+          # if any are missing the cjs omits azureSignOptions and the build
+          # falls back to the unsigned path.
           AZURE_PUBLISHER_NAME: ${{ secrets.AZURE_PUBLISHER_NAME }}
           AZURE_TRUSTED_SIGNING_ENDPOINT: ${{ secrets.AZURE_TRUSTED_SIGNING_ENDPOINT }}
           AZURE_CODE_SIGNING_ACCOUNT_NAME: ${{ secrets.AZURE_CODE_SIGNING_ACCOUNT_NAME }}
@@ -144,7 +188,7 @@ jobs:
           fetch-depth: 0
 
       # electron-builder creates the release as a draft (releaseType: draft
-      # in electron-builder.yml) so it doesn't surface as `latest` while
+      # in electron-builder.cjs) so it doesn't surface as `latest` while
       # mac/win are still uploading. Now that both jobs are done, set the
       # release notes from the tagged commit body, un-draft the release,
       # and mark it latest — all in one edit.

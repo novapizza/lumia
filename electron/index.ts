@@ -20,10 +20,11 @@ import { WorkflowEngine } from './workflow'
 import { TemplateStore } from './templates'
 import { HistoryStore } from './history'
 import { makeThumbnail } from './thumbnail'
-import { showNotification } from './notify'
+import { showNotification, consumePendingNotificationClick } from './notify'
 import type { HistoryItem } from './types'
 import { getSettings, setSetting, resolveSaveStartDir, rememberSaveDir, type AppSettings } from './settings'
 import { applyLaunchAtStartup, wasLaunchedAtStartup } from './startup'
+import { ensureDevStartMenuShortcut } from './dev-shortcut'
 import { setSnippingHijack } from './printscreen-key'
 import { preflightPermissions } from './permissions'
 import { autoUpdater } from 'electron-updater'
@@ -38,6 +39,18 @@ Object.assign(console, log.functions)
 if (process.platform === 'win32') {
   app.commandLine.appendSwitch('enable-features', 'WindowsNativeGraphicsCapture')
 }
+
+// Cap Chromium's on-disk HTTP cache. Default is unlimited and grows
+// indefinitely — Wallpapers fetches dozens of new Unsplash images per
+// Refresh, and a heavy user can balloon the cache past 500 MB.
+//
+// 80 MB is enough headroom for Lumia's actual cacheable surface (the docs
+// site, a few API responses, a few hundred wallpaper thumbnails) while
+// bounding the worst case. Fonts no longer factor in — Inter, Manrope and
+// Material Symbols are self-hosted and bundled, so Chromium doesn't cache
+// them via HTTP. When the cap fills, Chromium evicts LRU; recently-viewed
+// wallpapers stay warm, ancient ones get reclaimed automatically.
+app.commandLine.appendSwitch('disk-cache-size', String(80 * 1024 * 1024))
 
 const isDev = !app.isPackaged
 
@@ -77,6 +90,18 @@ let isQuitting = false
 // runs `isVisible()` always reads false. The flag captures user *intent*,
 // which survives transient hides for capture / Cmd+H.
 let mainDismissedByUser = false
+// Set when `openHistoryItemInEditor` surfaces the window from a
+// dismissed-to-tray state (i.e. the user clicked a notification while in
+// tray-only mode). Causes the next X-close on /editor to skip the
+// "navigate back to dashboard" behavior and drop straight back to tray —
+// the user came from tray, they go back to tray.
+//
+// Deliberately NOT cleared by `win.on('show')`. On Windows the 'show'
+// event can fire asynchronously after `win.show()` returns, racing with
+// the assignment in `openHistoryItemInEditor`. Tying clear-on-show would
+// produce a Heisenbug where adding console.logs makes the bug disappear.
+// Only the close handler clears it (one-shot semantic).
+let surfacedFromTray = false
 // Set by the autoUpdater 'update-downloaded' handler. Allows the install to
 // happen the moment the user drops the app to the tray instead of waiting
 // for an explicit Quit / next launch.
@@ -140,6 +165,11 @@ function showDock() {
 
 export function getMainWindow() { return mainWindow }
 export function getHistoryStore() { return historyStoreInstance }
+/** True when the user has explicitly dismissed the main window to the tray
+ *  (X close on a non-/editor route). Capture flows use this to decide
+ *  whether to surface the editor afterwards or just leave the user in tray
+ *  with a clickable notification. */
+export function isMainDismissed() { return mainDismissedByUser }
 export function getOverlayWindow() {
   if (activeOverlayDisplayId == null) return null
   return overlayWindows.get(activeOverlayDisplayId) ?? null
@@ -172,6 +202,99 @@ export function waitForViewMounted(route: string, timeoutMs = 800): Promise<void
     ipcMain.on('view:mounted', listener)
     const timer = setTimeout(finish, timeoutMs)
   })
+}
+
+/** Surface a history item in the Editor — used by notification-click
+ *  handlers so a user who closed the Editor can still hop back to the
+ *  freshly-captured image / video by tapping the toast. Mirrors the
+ *  Dashboard `openItem` flow but routes through the navigate IPC since
+ *  we're calling from the main process. */
+export async function openHistoryItemInEditor(
+  historyId: string,
+  /** True when the original capture happened while the main window was
+   *  dismissed to the tray. Captured *at notification creation time* so
+   *  the decision survives whatever Windows does between toast click and
+   *  this function running — banner clicks in particular can bring the
+   *  window forward before activation reaches us, clearing
+   *  `mainDismissedByUser` and breaking a check-at-click-time approach. */
+  fromTray = false,
+): Promise<void> {
+  const main = mainWindow
+  if (!main || main.isDestroyed()) return
+
+  const item = historyStoreInstance?.getAll().find(i => i.id === historyId)
+
+  // Latch surfacedFromTray *before* the show call so the X-close handler
+  // sees a stable value regardless of when 'show' fires. Either the
+  // notification was created from a tray state (fromTray) or the window
+  // happens to be dismissed right now (mainDismissedByUser) — both
+  // signal "user came from tray, return them to tray on X close".
+  if (fromTray || mainDismissedByUser) surfacedFromTray = true
+
+  // Build the navigate payload *before* surfacing the window, then send
+  // it while the window may still be hidden so the renderer can commit
+  // the route change in the background. Otherwise users see a brief
+  // flash of whatever route was last live (typically /dashboard) before
+  // React processes the navigation.
+  let route: '/editor' | '/dashboard' = '/dashboard'
+  let state: Record<string, unknown> | undefined
+
+  if (!item) {
+    // History entry already pruned/deleted — fall through to dashboard.
+  } else if (item.type === 'recording') {
+    const { basename } = await import('path')
+    route = '/editor'
+    state = {
+      kind: 'video',
+      filePath: item.filePath,
+      name: item.name ?? (item.filePath ? basename(item.filePath) : 'Recording'),
+      historyId: item.id,
+      annotations: item.annotations,
+    }
+  } else {
+    // Image: re-read the original from disk (history.json only stores
+    // the thumbnail). If the file is gone, fall back to dashboard.
+    let dataUrl: string | null = null
+    if (item.filePath) {
+      try {
+        const { readFile } = await import('fs/promises')
+        const { resolve, normalize, extname } = await import('path')
+        const { homedir } = await import('os')
+        const normalized = resolve(normalize(item.filePath))
+        if (normalized.startsWith(homedir())) {
+          const ext = extname(normalized).toLowerCase()
+          const mime = ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg' : 'image/png'
+          const buf = await readFile(normalized)
+          dataUrl = `data:${mime};base64,${buf.toString('base64')}`
+        }
+      } catch { /* missing file → dashboard */ }
+    }
+    if (dataUrl) {
+      route = '/editor'
+      state = {
+        kind: 'image',
+        dataUrl,
+        source: 'history',
+        historyId: item.id,
+        annotations: item.annotations,
+      }
+    }
+  }
+
+  const wasHidden = !main.isVisible()
+  if (state) main.webContents.send('navigate', route, state)
+  else main.webContents.send('navigate', route)
+
+  // Only gate the show() call on view:mounted when we're surfacing from
+  // a hidden state — that's where the flash is visible. If the window
+  // was already on screen, the route change ripples in live and there's
+  // no flash to suppress (and view:mounted may not fire at all when
+  // pathname stays the same, e.g. /editor → /editor with new state).
+  if (wasHidden) await waitForViewMounted(route)
+
+  if (main.isMinimized()) main.restore()
+  main.show()
+  main.focus()
 }
 
 /** Restore window/dock state after the user cancels an overlay session
@@ -275,20 +398,34 @@ function createMainWindow(startHidden = false): BrowserWindow {
 
   // Intercept close: keep the app alive in the tray instead of exiting. Only
   // actually close when we're explicitly quitting (tray Quit / hotkey / IPC).
-  // On /editor, X is a "discard capture" button — navigate back to the
-  // dashboard and keep the window open instead of hiding to tray.
-  win.on('close', (e) => {
+  // On /editor, X is normally a "discard capture" button — navigate back
+  // to the dashboard and keep the window open. Exception: if the user
+  // surfaced this editor session by clicking a notification while in tray
+  // (`surfacedFromTray`), they came from tray — return them to tray.
+  win.on('close', async (e) => {
     if (isQuitting) return
     e.preventDefault()
-    if (currentRoute === '/editor') {
+    if (currentRoute === '/editor' && !surfacedFromTray) {
       currentRoute = '/dashboard'
       win.webContents.send('navigate', '/dashboard')
       return
     }
-    // Explicit user close → hide window to tray AND drop the dock icon.
-    // This is the only path that should put the app into Accessory mode;
-    // transient hides (capture flow, Cmd+H) intentionally leave the dock
-    // alone so app activation keeps working for the overlay.
+    // Either an explicit user close on a non-/editor route, or a close on
+    // /editor after a tray-notification surface — both end the same way:
+    // hide window to tray AND drop the dock icon. Clear the one-shot tray
+    // flag so the next session starts fresh. If we were on /editor,
+    // reset the renderer to /dashboard first — otherwise the next time
+    // the user surfaces the window, Chromium serves the cached editor
+    // frame before React's pending /dashboard commit gets a paint pass,
+    // producing a visible flash of stale state. `waitForViewMounted`
+    // gates the hide on the renderer ack so the cached frame *is* the
+    // dashboard.
+    if (currentRoute === '/editor') {
+      currentRoute = '/dashboard'
+      win.webContents.send('navigate', '/dashboard')
+      await waitForViewMounted('/dashboard')
+    }
+    surfacedFromTray = false
     mainDismissedByUser = true
     hideDock()
     win.hide()
@@ -297,7 +434,14 @@ function createMainWindow(startHidden = false): BrowserWindow {
   // After the window goes to the tray, schedule install of any pending update.
   // Cancelled if the user surfaces the window again within the grace window.
   win.on('hide', () => { scheduleAutoInstall() })
-  win.on('show', () => { mainDismissedByUser = false; cancelAutoInstall(); showDock() })
+  win.on('show', () => {
+    mainDismissedByUser = false
+    // Note: surfacedFromTray is NOT cleared here — see its declaration
+    // for the timing rationale. The flag is cleared by the close handler
+    // (one-shot) and never auto-cleared on show.
+    cancelAutoInstall()
+    showDock()
+  })
 
   win.on('closed', () => { mainWindow = null })
   return win
@@ -534,13 +678,38 @@ if (isDev) {
 }
 
 if (process.platform === 'win32') {
-  // Must match `appId` in electron-builder.yml — NSIS registers the Start
-  // Menu shortcut under that AUMID, and WinRT silently drops toasts when
-  // the runtime AUMID doesn't match the shortcut.
-  app.setAppUserModelId('com.lumia.app')
+  // Packaged: must match `appId` in electron-builder.yml — NSIS registers
+  // the Start Menu shortcut under that AUMID, and WinRT silently drops
+  // toasts when the runtime AUMID doesn't match the shortcut.
+  //
+  // Dev: a parallel-installed production build owns `com.lumia.app`, so
+  // toast activations from the dev process would race-route to the
+  // production launcher. Suffix `.dev` keeps the two namespaces separate
+  // and lets `dev-shortcut.ts` plant a matching shortcut just for dev.
+  const aumid = app.isPackaged ? 'com.lumia.app' : 'com.lumia.app.dev'
+  app.setAppUserModelId(aumid)
+
+  // Register the URL scheme our toasts use as the `launch` target. Without
+  // this, clicking a toast — which Windows resolves as "open lumia:notify"
+  // — has no registered handler and silently no-ops. With it, Windows
+  // spawns electron via the registered protocol command, which trips our
+  // single-instance lock and surfaces as `app.on('second-instance')`.
+  // Dev needs to embed the project root in the registered command so the
+  // spawned electron.exe knows what to load.
+  const protocol = app.isPackaged ? 'lumia' : 'lumia-dev'
+  if (app.isPackaged) {
+    app.setAsDefaultProtocolClient(protocol)
+  } else {
+    app.setAsDefaultProtocolClient(protocol, process.execPath, [app.getAppPath()])
+  }
 }
 
 app.whenReady().then(async () => {
+  // Plant the Start Menu shortcut that registers our AUMID with the Windows
+  // shell. Without it, dev-mode toast clicks have no launcher to activate
+  // and silently no-op. Fire-and-forget; failure is non-fatal.
+  ensureDevStartMenuShortcut()
+
   // Allow getUserMedia desktop capture in all windows (needed for overlay region capture)
   const { session } = await import('electron')
   session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
@@ -601,6 +770,15 @@ app.whenReady().then(async () => {
 
   // IPC: Renderer route tracking — used to intercept close on /editor
   ipcMain.on('app:route-changed', (_e, route: string) => {
+    // Leaving /editor via in-app navigation (the Editor's Back button
+    // calls react-router's navigate('/dashboard')) means the user
+    // explicitly stepped out of the notification-opened editor session.
+    // Clear the tray flag so the next /editor X-close (after they pick
+    // a different item from the dashboard) follows the normal
+    // dashboard-return behavior, not the tray-return one.
+    if (currentRoute === '/editor' && route !== '/editor') {
+      surfacedFromTray = false
+    }
     currentRoute = route
   })
 
@@ -1097,6 +1275,43 @@ app.whenReady().then(async () => {
   ipcMain.handle('ocr:scan', async (_e, dataUrl: string) => {
     const { scanForSensitiveData } = await import('./auto-blur')
     return scanForSensitiveData(dataUrl)
+  })
+
+  // IPC: Wallpapers (Unsplash). Lazy-import keeps the access-key check off the
+  // hot path — Unsplash failures shouldn't bubble through `ipcMain.handle`'s
+  // generic error path, so we surface them as `{ ok: false, error }` shapes
+  // the renderer can render inline.
+  ipcMain.handle('wallpapers:random', async (_e, opts) => {
+    try {
+      const { getRandomWallpapers } = await import('./wallpapers')
+      const { photos, pickId } = await getRandomWallpapers(opts ?? { picks: [] })
+      return { ok: true as const, photos, pickId }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      return { ok: false as const, error: message }
+    }
+  })
+
+  ipcMain.handle('wallpapers:trackDownload', async (_e, downloadLocation: string) => {
+    const { trackWallpaperDownload } = await import('./wallpapers')
+    await trackWallpaperDownload(downloadLocation)
+    return { ok: true as const }
+  })
+
+  ipcMain.handle('wallpapers:isConfigured', async () => {
+    const { isUnsplashConfigured } = await import('./wallpapers')
+    return isUnsplashConfigured()
+  })
+
+  ipcMain.handle('wallpapers:setAsWallpaper', async (_e, photo) => {
+    try {
+      const { setDesktopWallpaper } = await import('./wallpapers')
+      const result = await setDesktopWallpaper(photo)
+      return { ok: true as const, filePath: result.filePath }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      return { ok: false as const, error: message }
+    }
   })
 
   // Favicon served by the local OAuth + picker servers so the browser tab the
@@ -1794,7 +2009,32 @@ app.on('will-quit', () => {
   overlayPool.clear()
 })
 
-app.on('second-instance', () => {
+app.on('second-instance', (_e, argv) => {
+  // A duplicate `--hidden` launch (two HKCU\...\Run entries left over from
+  // older builds, or any other path that re-fires the boot launcher) must
+  // not surface the window — the user's intent for `--hidden` is "stay in
+  // tray", and the first instance has already honored that.
+  if (argv.includes('--hidden')) return
+
+  // Windows toast activation routes through here when the toastXml uses
+  // `activationType="protocol"` — the click opens our scheme, spawns
+  // electron, and lands on second-instance.
+  //
+  // If a notification click is pending, defer the window surfacing to
+  // `openHistoryItemInEditor`. Calling `mainWindow.show()` here would
+  // fire the 'show' listener which clears `mainDismissedByUser`, and the
+  // pending callback would then snapshot `wasDismissed=false` and skip
+  // setting `surfacedFromTray` — making the X-close-to-tray behavior
+  // never trigger.
+  const pending = consumePendingNotificationClick()
+  if (pending) {
+    try {
+      pending()
+      return
+    } catch { /* fall through to plain show */ }
+  }
+  // Plain second-instance (e.g. user double-clicked the .lnk directly,
+  // or any non-notification activation) — just surface the window.
   mainWindow?.show()
   mainWindow?.focus()
 })

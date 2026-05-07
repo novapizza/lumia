@@ -32,6 +32,24 @@ export interface AppSettings {
    *  printScreenAsCapture from Settings, so manual configuration counts as
    *  having been asked. */
   printScreenPromptShown: boolean
+  /** User-picked wallpaper category IDs. Matches either a built-in id from
+   *  the renderer's curated list or a custom id from `wallpaperCustomCategories`.
+   *  Empty = first run, show the picker. */
+  wallpaperCategories: string[]
+  /** User-defined wallpaper categories on top of the built-in curated set.
+   *  Each is just a label + free-text search query — no editorial topic
+   *  resolution since users wouldn't know Unsplash topic slugs. */
+  wallpaperCustomCategories: Array<{ id: string; label: string; query: string }>
+  /** Cached result of the last Unsplash random fetch — re-rendered on every
+   *  Wallpapers visit until the user explicitly clicks Refresh, so we don't
+   *  burn API quota on idle navigation. `photos` is the same shape as
+   *  `UnsplashPhoto` in `wallpapers.ts`; kept loosely typed here to avoid
+   *  pulling in the wallpapers module just for a type. */
+  wallpaperGrid: {
+    photos: unknown[]
+    pickId: string
+    fetchedAt: number
+  } | null
 }
 
 // On macOS, binding PrintScreen has no downside: built-in Apple keyboards
@@ -60,7 +78,10 @@ const store = new Store<AppSettings>({
     lastImageMode: 'region',
     lastVideoMode: 'region',
     printScreenAsCapture: PRINT_SCREEN_DEFAULT,
-    printScreenPromptShown: PRINT_SCREEN_DEFAULT
+    printScreenPromptShown: PRINT_SCREEN_DEFAULT,
+    wallpaperCategories: [],
+    wallpaperCustomCategories: [],
+    wallpaperGrid: null
   }
 })
 
@@ -90,7 +111,10 @@ export function getSettings(): AppSettings {
     lastImageMode: store.get('lastImageMode'),
     lastVideoMode: store.get('lastVideoMode'),
     printScreenAsCapture: store.get('printScreenAsCapture'),
-    printScreenPromptShown: store.get('printScreenPromptShown')
+    printScreenPromptShown: store.get('printScreenPromptShown'),
+    wallpaperCategories: store.get('wallpaperCategories'),
+    wallpaperCustomCategories: store.get('wallpaperCustomCategories'),
+    wallpaperGrid: store.get('wallpaperGrid')
   }
 }
 
