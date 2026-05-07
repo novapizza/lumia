@@ -13,7 +13,7 @@ Headline features:
 - Auto-blur of sensitive content (email, phone, credit-card, API key, JWT, etc.) via OCR
 - Workflow pipeline: after-capture → upload → after-upload, configurable per template
 - Built-in uploaders: Cloudflare R2 (baked credentials) and Google Drive (OAuth)
-- System tray, global hotkeys, launch-at-startup, auto-update via GitHub Releases
+- System tray, global hotkeys, launch-at-startup, auto-update via Cloudflare R2
 
 ## Commands
 
@@ -36,7 +36,7 @@ Releases are produced by **GitHub Actions** (`.github/workflows/release.yml`), n
 - Windows: `WIN_CSC_LINK` (base64 .pfx) + `WIN_CSC_KEY_PASSWORD`
 - macOS: `CSC_LINK` (base64 .p12) + `CSC_KEY_PASSWORD`, plus `APPLE_*` env vars for notarization
 
-`build/notarize.cjs` exits cleanly when notarization credentials are absent (so local unsigned builds still succeed). Published artifacts go to `emtyty/lumia` GitHub Releases — `electron-updater` polls the same repo for updates every 4 hours.
+`build/notarize.cjs` exits cleanly when notarization credentials are absent (so local unsigned builds still succeed). Published artifacts go to a Cloudflare R2 bucket served at `https://release.lumia.asia` (S3 publisher uploads, `generic` provider for client downloads). `electron-updater` polls `latest.yml` / `latest-mac.yml` from that origin every 4 hours. The 1.2.x line published to GitHub Releases as well; 2.0.0+ is R2-only — see `electron-builder.cjs` for the publish array.
 
 ## Architecture
 

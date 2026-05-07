@@ -8,23 +8,18 @@
 //     of an array.
 // Same reason `azureSignOptions` is set via --config in the CI workflow.
 
-// ── Publish — bridge release (R2 primary, GitHub fallback) ──────────────────
-// Order matters: the FIRST provider is baked into `app-update.yml` shipped in
-// the app, so once a user installs this build, autoUpdater polls R2 forever.
+// ── Publish — Cloudflare R2 ─────────────────────────────────────────────────
 // `s3` is upload-only here (R2 endpoint requires auth); `generic` is the
-// read path the client uses against the public R2 URL.
-// `github` stays in this build so users on legacy versions (pre-R2) still
-// see this update via their GitHub-pinned `app-update.yml` and can migrate.
-// 1.2.14 is the planned final GitHub-published release — drop the `github`
-// entry (and the mark-latest workflow job) in the next bump.
+// read path the client uses against the public R2 URL. `generic` stays
+// first so it's the provider baked into the `app-update.yml` shipped in
+// the app — that's what autoUpdater polls.
 //
-// Env vars resolved at build time (CI workflow + .env.example):
+// Env vars resolved at build time (CI workflow):
 //   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY  → S3 publisher auth (read by SDK)
 //   R2_RELEASES_ACCOUNT_ID                     → S3 endpoint host
 //   R2_RELEASES_BUCKET                         → S3 bucket name
 //   R2_RELEASES_PUBLIC_URL                     → full URL autoUpdater hits
 //                                                 (scheme + host, no trailing /)
-//   GH_TOKEN                                   → GitHub publisher auth
 const publish = [
   {
     provider: 'generic',
@@ -37,15 +32,6 @@ const publish = [
     region: 'auto',
     // R2 doesn't support ACLs; sending one trips a SignatureDoesNotMatch error.
     acl: null
-  },
-  {
-    provider: 'github',
-    owner: 'emtyty',
-    repo: 'lumia',
-    // Publish as a draft so GitHub's /releases/latest API doesn't surface
-    // the new version while the mac/win jobs are still uploading. The
-    // mark-latest workflow job un-drafts after both finish.
-    releaseType: 'draft'
   }
 ]
 
