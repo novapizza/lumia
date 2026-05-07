@@ -15,7 +15,8 @@
 // read path the client uses against the public R2 URL.
 // `github` stays in this build so users on legacy versions (pre-R2) still
 // see this update via their GitHub-pinned `app-update.yml` and can migrate.
-// Drop the `github` entry once the long tail of legacy installs has moved.
+// 1.2.14 is the planned final GitHub-published release — drop the `github`
+// entry (and the mark-latest workflow job) in the next bump.
 //
 // Env vars resolved at build time (CI workflow + .env.example):
 //   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY  → S3 publisher auth (read by SDK)
