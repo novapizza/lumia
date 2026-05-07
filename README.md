@@ -4,6 +4,10 @@ A cross-platform screen capture, screen recording, annotation, and sharing tool 
 
 Inspired by ShareX, rebuilt from scratch with a modern Liquid Glass UI, scrolling capture, video recording, OCR-driven auto-blur of sensitive content, and a workflow engine that runs uploads in true parallel.
 
+## Download
+
+**[lumia.asia](https://lumia.asia)** — installer download for Windows (x64 + arm64) and macOS (Apple Silicon + Intel). Auto-update is built in; you only need to fetch the installer once.
+
 ---
 
 ## Features
@@ -94,7 +98,7 @@ save to disk                                        OS share
 
 - **System tray** with capture shortcuts and quit
 - **Launch at startup** — auto-hides to tray on boot when launched by the OS startup entry
-- **Auto-update** — checks `emtyty/lumia` releases every 4 hours; downloads in background, installs on quit
+- **Auto-update** — polls `release.lumia.asia` every 4 hours; downloads in background, installs on quit
 - **Single-instance lock** — relaunching focuses the existing window instead of crashing on cache locks
 
 ### Settings
@@ -189,7 +193,7 @@ lumia/
 ├── build/                          # Notarization, entitlements, icon generator
 ├── .github/workflows/release.yml   # CI build + sign + publish
 ├── electron.vite.config.ts
-├── electron-builder.yml
+├── electron-builder.cjs
 ├── eng.traineddata                 # Tesseract English language data
 └── package.json
 ```
@@ -256,7 +260,9 @@ Production releases are produced by **GitHub Actions** (`.github/workflows/relea
 
 `build/notarize.cjs` exits cleanly when notarization credentials are absent, so unsigned local builds still complete.
 
-Published artifacts go to `emtyty/lumia` GitHub Releases. Installed copies poll the same repo every 4 hours via `electron-updater` and install pending updates on the next quit.
+Published artifacts go to a Cloudflare R2 bucket served at **`https://release.lumia.asia`** (S3 publisher uploads, `generic` provider for client downloads — see [`electron-builder.cjs`](electron-builder.cjs)). Installed copies poll `latest.yml` / `latest-mac.yml` from that origin every 4 hours via `electron-updater` and install pending updates on the next quit.
+
+The 1.2.x line was also published to GitHub Releases as a one-shot bridge so existing installs could migrate to the R2 channel; 2.0.0 onward is R2-only.
 
 ---
 
