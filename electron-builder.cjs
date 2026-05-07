@@ -37,15 +37,18 @@ const publish = [
     // R2 doesn't support ACLs; sending one trips a SignatureDoesNotMatch error.
     acl: null
   },
-  {
-    provider: 'github',
-    owner: 'emtyty',
-    repo: 'lumia',
-    // Publish as a draft so GitHub's /releases/latest API doesn't surface
-    // the new version while the mac/win jobs are still uploading. The
-    // mark-latest workflow job un-drafts after both finish.
-    releaseType: 'draft'
-  }
+  // GitHub provider temporarily disabled — testing a R2-only publish first.
+  // Re-enable for the bridge release so 1.2.x users still get the update
+  // through their existing GitHub-pinned app-update.yml.
+  // {
+  //   provider: 'github',
+  //   owner: 'emtyty',
+  //   repo: 'lumia',
+  //   // Publish as a draft so GitHub's /releases/latest API doesn't surface
+  //   // the new version while the mac/win jobs are still uploading. The
+  //   // mark-latest workflow job un-drafts after both finish.
+  //   releaseType: 'draft'
+  // }
 ]
 
 module.exports = {
