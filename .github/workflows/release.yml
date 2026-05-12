@@ -48,6 +48,8 @@ jobs:
           MAIN_VITE_R2_PUBLIC_URL: ${{ secrets.MAIN_VITE_R2_PUBLIC_URL }}
           MAIN_VITE_GDRIVE_CLIENT_ID: ${{ secrets.MAIN_VITE_GDRIVE_CLIENT_ID }}
           MAIN_VITE_GDRIVE_CLIENT_SECRET: ${{ secrets.MAIN_VITE_GDRIVE_CLIENT_SECRET }}
+          MAIN_VITE_GDRIVE_API_KEY: ${{ secrets.MAIN_VITE_GDRIVE_API_KEY }}
+          MAIN_VITE_GDRIVE_PROJECT_NUMBER: ${{ secrets.MAIN_VITE_GDRIVE_PROJECT_NUMBER }}
 
       # Rebuild Swift helpers as universal binaries so the same DMG works on
       # both arm64 and x86_64 Macs. Committed binaries (if any) are only used
