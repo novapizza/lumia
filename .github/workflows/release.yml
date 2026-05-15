@@ -171,3 +171,45 @@ jobs:
 
           # Optional: reduce Azure CLI output in logs
           AZURE_CORE_OUTPUT: none
+
+  # ── GitHub Release (notes only, no artifacts) ────────────────────────────────
+  # Binaries live on R2 (release.lumia.asia). The GitHub release here is just a
+  # public changelog page — body is taken from the tag commit's message and a
+  # footer points users at lumia.asia for the actual installer.
+  release-github:
+    name: Publish GitHub release notes
+    needs: [release-mac, release-win]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build release notes
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          {
+            # Drop the "Release version X.Y.Z" subject line + blank separator
+            # and strip the Co-Authored-By trailer. What's left is whatever
+            # changelog body the maintainer wrote in the release commit.
+            git log -1 --format=%B HEAD \
+              | tail -n +3 \
+              | sed '/^Co-Authored-By:/d'
+            echo ""
+            echo "Download the installer at [lumia.asia](https://lumia.asia)."
+          } > release-notes.md
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # `--latest` matches the manual releases we've been making; safe while
+        # tag pattern stays v*.*.* (no -rc / -beta). Re-running this job for
+        # an existing tag will fail — re-create the release manually if you
+        # need to overwrite.
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$VERSION" \
+            --notes-file release-notes.md \
+            --latest
