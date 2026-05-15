@@ -113,7 +113,16 @@ export default function Dashboard() {
     // Settings can change while we're on this view (user goes to Settings,
     // connects Drive, comes back) — refresh on connect events + window focus.
     window.electronAPI?.onGdriveConnected(refreshGdriveReady)
-    window.addEventListener('focus', refreshGdriveReady)
+    // Re-fetch history every time the window regains focus. Captures fired
+    // while the window was hidden in tray (hotkey path) add entries to the
+    // store but the renderer can't observe that — it's still alive with its
+    // stale recentItems array, so the user opens the window back up and
+    // sees pre-capture state until something else triggers a refetch.
+    const onWindowFocus = () => {
+      refreshGdriveReady()
+      window.electronAPI?.getHistory().then(setRecentItems)
+    }
+    window.addEventListener('focus', onWindowFocus)
 
     window.electronAPI?.onCaptureReady(({ dataUrl, source }) => {
       navigate('/editor', { state: { dataUrl, source } })
@@ -128,7 +137,7 @@ export default function Dashboard() {
       window.electronAPI?.removeAllListeners('recorder:open')
       window.electronAPI?.removeAllListeners('scroll-capture:open')
       window.electronAPI?.removeAllListeners('gdrive:connected')
-      window.removeEventListener('focus', refreshGdriveReady)
+      window.removeEventListener('focus', onWindowFocus)
     }
   }, [navigate])
 
