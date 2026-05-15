@@ -42,6 +42,7 @@ let _DwmGetWindowAttribute: (hwnd: any, attr: number, pvAttribute: any, cbAttrib
 // scalar attributes like DWMWA_CLOAKED where the RECT-shaped binding above
 // would over-allocate and read garbage past the first 4 bytes.
 let _DwmGetWindowAttributeDword: (hwnd: any, attr: number, pvAttribute: any, cbAttribute: number) => number
+let _DwmSetWindowAttribute: (hwnd: any, attr: number, pvAttribute: any, cbAttribute: number) => number
 let _IsIconic: (hwnd: any) => boolean
 let _SetThreadDpiAwarenessContext: (ctx: any) => any
 let _SetWindowDisplayAffinity: (hwnd: any, affinity: number) => boolean
@@ -86,6 +87,7 @@ function ensureLoaded(): boolean {
     const dwmapi = koffi.load('dwmapi.dll')
     _DwmGetWindowAttribute = dwmapi.func('int32_t __stdcall DwmGetWindowAttribute(intptr_t hwnd, uint32_t dwAttribute, _Out_ RECT *pvAttribute, uint32_t cbAttribute)')
     _DwmGetWindowAttributeDword = dwmapi.func('int32_t __stdcall DwmGetWindowAttribute(intptr_t hwnd, uint32_t dwAttribute, _Out_ uint32_t *pvAttribute, uint32_t cbAttribute)')
+    _DwmSetWindowAttribute = dwmapi.func('int32_t __stdcall DwmSetWindowAttribute(intptr_t hwnd, uint32_t dwAttribute, _In_ uint32_t *pvAttribute, uint32_t cbAttribute)')
     _IsIconic = user32.func('bool __stdcall IsIconic(intptr_t hWnd)')
     void RECT // suppress unused warning
 
@@ -339,6 +341,31 @@ export function scrollToTopNative(cx: number, cy: number): void {
   const hwnd = windowFromPoint(cx, cy)
   if (hwnd) {
     sendMessage(hwnd, WM_VSCROLL, SB_TOP, 0)
+  }
+}
+
+/** Force-disable DWM's show/hide transition animations on a specific HWND.
+ *  Without this, ShowWindow plays the system "window open/close" fade-in/out
+ *  (~150-200ms alpha ramp). Two places that hurts us:
+ *    - overlay: even after we've gated win.show() on a renderer paint ack,
+ *      the OS-level alpha ramp adds its own fade flicker on top.
+ *    - main: when capture hides main before freezeAllDisplays, the fade
+ *      keeps main on the compositor for ~200ms, so the frozen snapshot
+ *      bakes a translucent Lumia frame (theme accents) on top of the
+ *      real screen pixels.
+ *  Setting DWMWA_TRANSITIONS_FORCEDISABLED opts the HWND out of both. */
+export function disableDwmTransitions(win: { isDestroyed(): boolean; getNativeWindowHandle(): Buffer }) {
+  if (process.platform !== 'win32') return
+  if (!ensureLoaded()) return
+  if (win.isDestroyed()) return
+  if (!_DwmSetWindowAttribute) return
+  try {
+    const DWMWA_TRANSITIONS_FORCEDISABLED = 3
+    const buf = win.getNativeWindowHandle()
+    const hwnd = buf.length >= 8 ? buf.readBigInt64LE(0) : BigInt(buf.readInt32LE(0))
+    _DwmSetWindowAttribute(hwnd, DWMWA_TRANSITIONS_FORCEDISABLED, [1], 4)
+  } catch (err) {
+    console.warn('[native-input] DwmSetWindowAttribute(TRANSITIONS_FORCEDISABLED) failed', err)
   }
 }
 

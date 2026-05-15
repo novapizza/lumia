@@ -184,6 +184,14 @@ export default function Overlay() {
   const [isDrawing, setIsDrawing] = useState(false)
   const [isActive, setIsActive] = useState(true)
   const [hoveredWindow, setHoveredWindow] = useState<Rect | null>(null)
+  // Frozen snapshot pushed from main at hotkey-press time. Two-stage:
+  // `frozenBg` is the raw IPC payload; `frozenBgReady` is the post-decode
+  // mirror that drives DOM. Decoding off-DOM before mounting the <img> means
+  // the first paint commits rasterized pixels in one composite frame — no
+  // fade-in from transparent. Main gates win.setOpacity(1) on our ack, so
+  // the overlay only surfaces after this <img> reports onLoad.
+  const [frozenBg, setFrozenBg] = useState<string | null>(null)
+  const [frozenBgReady, setFrozenBgReady] = useState<string | null>(null)
   const overlayRef = useRef<HTMLDivElement>(null)
   const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const hoveredWindowRef = useRef<{ x: number; y: number; width: number; height: number } | null>(null)
@@ -205,10 +213,38 @@ export default function Overlay() {
       setIsDrawing(false)
       setHoveredWindow(null)
     })
+    window.electronAPI?.onOverlayFrozenBgChanged?.((dataUrl) => setFrozenBg(dataUrl))
     return () => {
       window.electronAPI?.removeAllListeners('overlay:set-active')
       window.electronAPI?.removeAllListeners('overlay:mode-changed')
+      window.electronAPI?.removeAllListeners('overlay:frozen-bg-changed')
     }
+  }, [])
+
+  // Decode the new bg off-DOM, then publish to `frozenBgReady` which gates the
+  // <img> mount. Image-element cache shares with CSS bg cache, but using a
+  // real <img> in the DOM tree (vs CSS background-image) means we get an
+  // onLoad event with first-paint guarantees.
+  useEffect(() => {
+    if (!frozenBg) { setFrozenBgReady(null); return }
+    let cancelled = false
+    const img = new window.Image()
+    img.src = frozenBg
+    img.decode()
+      .then(() => { if (!cancelled) setFrozenBgReady(frozenBg) })
+      .catch(() => { if (!cancelled) setFrozenBgReady(frozenBg) })
+    return () => { cancelled = true }
+  }, [frozenBg])
+
+  // The <img> in the tree fires onLoad once the browser has the rasterized
+  // bitmap ready. Two rAFs after that the GPU has committed at least one
+  // frame containing the bg → safe to ack so main can ramp opacity to 1.
+  const onBgImgLoad = useCallback(() => {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        window.electronAPI?.notifyOverlayBgReady?.()
+      })
+    })
   }, [])
 
   // Window-pick: poll window under cursor (throttled 80ms)
@@ -316,6 +352,24 @@ export default function Overlay() {
 
   const rect = getRect()
 
+  // Full-bleed snapshot rendered as a real <img> (not CSS bg-image) so it
+  // uses the same decode cache primed by Image.decode() above. Tint is
+  // intentionally not layered on top — any blanket darken misrepresents
+  // the user's on-screen colors to the picker, and the picker UI elements
+  // already convey "capture mode active". For inactive overlays
+  // (cursor on another display) the snapshot still shows so the user can
+  // see what's on each monitor.
+  const FrozenBgLayer = frozenBgReady ? (
+    <img
+      src={frozenBgReady}
+      alt=""
+      draggable={false}
+      onLoad={onBgImgLoad}
+      className="absolute inset-0 w-full h-full pointer-events-none select-none"
+      style={{ objectFit: 'fill', zIndex: 0 }}
+    />
+  ) : null
+
   // ── Monitor-pick / video-screen UI ───────────────────────────────────────
   if (base === 'screen') {
     const onClick = () => {
@@ -331,10 +385,13 @@ export default function Overlay() {
         className="fixed inset-0 select-none"
         style={{
           cursor: isActive ? 'pointer' : 'default',
-          background: isActive ? accent.activeBg : 'transparent',
+          // Tint only over a transparent (video) overlay; over a frozen
+          // snapshot any darken misrepresents the user's screen colors.
+          background: !frozenBgReady && isActive ? accent.activeBg : 'transparent',
         }}
         onClick={onClick}
       >
+        {FrozenBgLayer}
         {isActive && (
           <>
             <div
@@ -362,11 +419,12 @@ export default function Overlay() {
         className="fixed inset-0 select-none"
         style={{
           cursor: isActive ? 'crosshair' : 'default',
-          background: isActive ? 'rgba(0,0,0,0.03)' : 'transparent',
+          background: !frozenBgReady && isActive ? 'rgba(0,0,0,0.03)' : 'transparent',
         }}
         onMouseMove={handleMouseMove}
         onMouseDown={handleMouseDown}
       >
+        {FrozenBgLayer}
 
         {isActive && (
           <ModeBar mode={mode} intent={intent} icon="window" hint={hint} />
@@ -418,13 +476,13 @@ export default function Overlay() {
       className="fixed inset-0 select-none"
       style={{
         cursor: isActive ? 'crosshair' : 'default',
-        background: isActive ? 'rgba(0,0,0,0.08)' : 'transparent',
-        transition: 'background 0.15s ease'
+        background: !frozenBgReady && isActive ? 'rgba(0,0,0,0.08)' : 'transparent',
       }}
       onMouseDown={handleMouseDown}
       onMouseMove={handleMouseMove}
       onMouseUp={handleMouseUp}
     >
+      {FrozenBgLayer}
       <style>{`
         @keyframes scroll-region-border-pulse {
           0%, 100% { border-color: rgba(56, 189, 248, 0.8); box-shadow: 0 0 0 9999px rgba(0,0,0,0.18); }

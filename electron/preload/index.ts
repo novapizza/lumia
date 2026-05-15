@@ -222,6 +222,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   onOverlaySetActive: (cb: (active: boolean) => void) => {
     ipcRenderer.on('overlay:set-active', (_e, active) => cb(active))
   },
+  onOverlayFrozenBgChanged: (cb: (dataUrl: string | null) => void) => {
+    ipcRenderer.on('overlay:frozen-bg-changed', (_e, dataUrl) => cb(dataUrl))
+  },
+  notifyOverlayBgReady: () => ipcRenderer.send('overlay:bg-ready'),
   overlayDrawing: (drawing: boolean) => ipcRenderer.send('overlay:drawing', drawing),
   notifyRoute: (route: string) => ipcRenderer.send('app:route-changed', route),
 

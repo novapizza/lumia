@@ -100,6 +100,8 @@ declare global {
       ) => Promise<void>
       onOverlayModeChanged: (cb: (mode: string) => void) => void
       onOverlaySetActive: (cb: (active: boolean) => void) => void
+      onOverlayFrozenBgChanged: (cb: (dataUrl: string | null) => void) => void
+      notifyOverlayBgReady: () => void
       overlayDrawing: (drawing: boolean) => void
       notifyRoute: (route: string) => void
 

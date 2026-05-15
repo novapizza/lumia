@@ -39,19 +39,55 @@ async function saveOriginalImage(dataUrl: string): Promise<{ filePath: string; f
 export type CaptureMode = 'all-screen' | 'region' | 'window' | 'screen'
 
 const HIDE_DELAY_MS = process.platform === 'darwin' ? 250 : 200
-const OVERLAY_GONE_DELAY_MS = 120
-
-function waitForOverlayGone(): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, OVERLAY_GONE_DELAY_MS))
-}
 
 function hideMainWindow(): Promise<void> {
   return new Promise(resolve => {
     const win = getMainWindow()
     if (!win || win.isDestroyed()) { resolve(); return }
+    // Already hidden → no compositor work needed, skip the delay so we get
+    // closer to hotkey-press time when freezing (preserves transient UI like
+    // tooltips/popovers that auto-dismiss on focus change).
+    if (!win.isVisible()) { resolve(); return }
     win.hide()
     setTimeout(resolve, HIDE_DELAY_MS)
   })
+}
+
+// Frozen snapshot cache, filled the moment before the overlay surfaces, then
+// consumed by the confirm handlers. Lets us capture the exact pixels visible
+// when the user pressed the hotkey — preserving tooltips/popovers that
+// auto-dismiss as soon as the overlay (or any other window) steals focus
+// from the source app.
+const frozenImages = new Map<number, Electron.NativeImage>()
+const frozenDataUrls = new Map<number, string>()
+
+export function getFrozenBgForDisplay(displayId: number): string | null {
+  return frozenDataUrls.get(displayId) ?? null
+}
+
+function clearFrozenCache() {
+  frozenImages.clear()
+  frozenDataUrls.clear()
+}
+
+/** Snapshot every display at full physical resolution into the frozen cache.
+ *  Caller must have already hidden the main window (otherwise main bakes
+ *  into the cached frame). Runs all displays in parallel. */
+async function freezeAllDisplays(): Promise<void> {
+  clearFrozenCache()
+  const allDisplays = screen.getAllDisplays()
+  await Promise.all(allDisplays.map(async d => {
+    const sf = d.scaleFactor || 1
+    const physW = Math.max(1, Math.round(d.size.width * sf))
+    const physH = Math.max(1, Math.round(d.size.height * sf))
+    const sources = await desktopCapturer.getSources({
+      types: ['screen'],
+      thumbnailSize: { width: physW, height: physH },
+    })
+    const img = findSourceForDisplay(sources, allDisplays, d.id).thumbnail
+    frozenImages.set(d.id, img)
+    frozenDataUrls.set(d.id, img.toDataURL())
+  }))
 }
 
 function showMainWindow() {
@@ -121,8 +157,10 @@ export function setupCapture() {
     const displayId = getOverlayDisplayId()
     resetOverlayMode()
     closeAllOverlays()
-    await waitForOverlayGone()
+    // No overlay-gone wait — the crop comes from the frozen snapshot, not a
+    // fresh screen grab, so the overlay's residual presence doesn't matter.
     const dataUrl = await captureRect(payload.rect, displayId)
+    clearFrozenCache()
     await sendCaptureToEditor(dataUrl, 'region')
     return dataUrl
   })
@@ -245,10 +283,10 @@ export function setupCapture() {
     lastWindowPickPhysical = null
     resetOverlayMode()
     closeAllOverlays()
-    await waitForOverlayGone()
     const dataUrl = cached
       ? await capturePhysicalRect(cached)
       : await captureRect(rect, overlayId)
+    clearFrozenCache()
     await sendCaptureToEditor(dataUrl, 'window')
     return dataUrl
   })
@@ -256,12 +294,14 @@ export function setupCapture() {
   ipcMain.handle('window-pick:cancel', () => {
     resetOverlayMode()
     closeAllOverlays()
+    clearFrozenCache()
     restoreFromOverlayCancel()
   })
 
   ipcMain.handle('region:cancel', () => {
     resetOverlayMode()
     closeAllOverlays()
+    clearFrozenCache()
     restoreFromOverlayCancel()
   })
 
@@ -283,8 +323,8 @@ export function setupCapture() {
     const target = allDisplays.find(d => d.id === displayId) ?? screen.getPrimaryDisplay()
     resetOverlayMode()
     closeAllOverlays()
-    await waitForOverlayGone()
     const dataUrl = await captureDisplay(target, allDisplays)
+    clearFrozenCache()
     await sendCaptureToEditor(dataUrl, 'screen')
     return dataUrl
   })
@@ -292,6 +332,7 @@ export function setupCapture() {
   ipcMain.handle('monitor-pick:cancel', () => {
     resetOverlayMode()
     closeAllOverlays()
+    clearFrozenCache()
     restoreFromOverlayCancel()
   })
 }
@@ -387,12 +428,14 @@ async function captureAllScreen(): Promise<string> {
 async function captureWindow(): Promise<void> {
   setOverlayMode('window-pick')
   await hideMainWindow()
+  await freezeAllDisplays()
   createOverlayWindows()
   // Capture happens after overlay fires window-pick:confirm
 }
 
 async function captureRegion(): Promise<void> {
   await hideMainWindow()
+  await freezeAllDisplays()
   createOverlayWindows()
 }
 
@@ -405,8 +448,13 @@ async function capturePhysicalRect(rect: { x: number; y: number; width: number; 
   const sf = target.scaleFactor || 1
   const physW = Math.max(1, Math.round(target.size.width  * sf))
   const physH = Math.max(1, Math.round(target.size.height * sf))
-  const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: physW, height: physH } })
-  const fullImg = findSourceForDisplay(sources, allDisplays, target.id).thumbnail
+  // Frozen cache hit → use the snapshot taken at hotkey time (preserves
+  // tooltips/popovers that the overlay would otherwise have dismissed).
+  let fullImg = frozenImages.get(target.id) ?? null
+  if (!fullImg) {
+    const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: physW, height: physH } })
+    fullImg = findSourceForDisplay(sources, allDisplays, target.id).thumbnail
+  }
   const fullSize = fullImg.getSize()
 
   // Map virtual-screen physical → display-local physical (thumbnail-local).
@@ -437,8 +485,13 @@ async function captureRect(rect: { x: number; y: number; width: number; height: 
   // mixed-DPI multi-monitor setups still crop correctly.
   const physW = Math.max(1, Math.round(targetDisplay.size.width * scaleFactor))
   const physH = Math.max(1, Math.round(targetDisplay.size.height * scaleFactor))
-  const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: physW, height: physH } })
-  const fullImg = findSourceForDisplay(sources, allDisplays, targetDisplay.id).thumbnail
+  // Prefer the frozen snapshot captured at hotkey time. Falls through to a
+  // live capture if cache is empty (legacy paths, scrolling capture).
+  let fullImg = frozenImages.get(targetDisplay.id) ?? null
+  if (!fullImg) {
+    const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: physW, height: physH } })
+    fullImg = findSourceForDisplay(sources, allDisplays, targetDisplay.id).thumbnail
+  }
   const fullSize = fullImg.getSize()
   // Derive actual scale from captured image vs logical size — handles cases where
   // the capturer returns a resolution different from what we requested.
@@ -455,6 +508,10 @@ async function captureRect(rect: { x: number; y: number; width: number; height: 
 }
 
 async function captureDisplay(display: Electron.Display, allDisplays: Electron.Display[]): Promise<string> {
+  // Frozen cache hit (monitor-pick path) — return the snapshot directly.
+  const cached = frozenDataUrls.get(display.id)
+  if (cached) return cached
+
   const sf = display.scaleFactor || 1
   const sources = await desktopCapturer.getSources({
     types: ['screen'],
@@ -481,6 +538,7 @@ async function captureActiveMonitor(): Promise<string | void> {
   // Multiple displays → show overlays, let the user click one.
   setOverlayMode('monitor-pick')
   await hideMainWindow()
+  await freezeAllDisplays()
   createOverlayWindows()
 }
 

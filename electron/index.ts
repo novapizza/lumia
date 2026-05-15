@@ -2,7 +2,7 @@ import { app, BrowserWindow, ipcMain, shell, dialog, nativeImage, clipboard, scr
 import { join, dirname } from 'path'
 import fs from 'fs/promises'
 import { constants as fsConstants } from 'fs'
-import { setupCapture, ORIGINALS_DIR } from './capture'
+import { setupCapture, ORIGINALS_DIR, getFrozenBgForDisplay } from './capture'
 import { setupVideo } from './video'
 import { uploadToR2 } from './uploaders/r2'
 import {
@@ -12,7 +12,7 @@ import {
   exchangeGoogleAuthCode,
 } from './uploaders/googledrive'
 import { localTimestamp } from './utils'
-import { registerOverlayHwnd, unregisterOverlayHwnd } from './native-input'
+import { registerOverlayHwnd, unregisterOverlayHwnd, disableDwmTransitions } from './native-input'
 import { setupHotkeys, teardownHotkeys, getHotkeys, saveHotkeys, resetHotkeys, defaultHotkeys, type HotkeyConfig } from './hotkeys'
 import { setupTray, destroyTray } from './tray'
 import { setupScrollCapture, getOverlayMode } from './scroll-capture'
@@ -318,11 +318,30 @@ export function closeAllOverlays() {
     overlayPollTimer = null
   }
   overlayDrawingInProgress = false
-  // Hide instead of destroy — the windows live in overlayPool and get reused
-  // on the next createOverlayWindows() call. Destroying them would force a
-  // full BrowserWindow + renderer rebuild on every capture.
+  // Snipping-Tool-style opacity trick: instead of win.hide() (which incurs
+  // DWM fade-out + drops the alpha compositor for the renderer's frame,
+  // causing the next show to flicker as the pipeline warms back up), keep
+  // the overlay "shown" in DWM at opacity 0 over its display. The renderer
+  // stays composited; ramping opacity back to 1 next capture is instant.
+  // We intentionally do NOT setBounds off-screen — Electron's per-monitor
+  // DPI tracking can get scrambled on Windows when a window is moved
+  // between monitors with different scale factors, manifesting as a
+  // mis-scaled snapshot when the overlay returns to its display.
   for (const [, win] of overlayWindows) {
-    if (!win.isDestroyed() && win.isVisible()) win.hide()
+    if (win.isDestroyed()) continue
+    win.setOpacity(0)
+    // Drop `forward: true` while parked — with it set, Chromium keeps
+    // dispatching mouse-move to the renderer, and the renderer's CSS
+    // `cursor: 'crosshair'` then bleeds through over apps below the
+    // (invisible) overlay. Plain setIgnoreMouseEvents(true) sets
+    // WS_EX_TRANSPARENT cleanly so the cursor hit-test falls through.
+    win.setIgnoreMouseEvents(true)
+    // Reset renderer state to its idle look (cursor default, no
+    // crosshair) for the parked period. Belt-and-suspenders alongside
+    // the EX_TRANSPARENT flag above.
+    if (!win.webContents.isDestroyed()) {
+      win.webContents.send('overlay:set-active', false)
+    }
   }
   overlayWindows.clear()
   activeOverlayDisplayId = null
@@ -394,6 +413,11 @@ function createMainWindow(startHidden = false): BrowserWindow {
   ipcMain.once('window:ready', () => showOnce())
   win.once('ready-to-show', () => {
     setTimeout(showOnce, 1000)
+    // Opt main out of DWM's hide animation so capture flows can rely on
+    // win.hide() removing it from the compositor instantly. Without this,
+    // Windows fades main over ~200ms; freezeAllDisplays lands mid-fade
+    // and bakes a translucent Lumia frame into the cached screenshot.
+    disableDwmTransitions(win)
   })
 
   // Intercept close: keep the app alive in the tray instead of exiting. Only
@@ -485,12 +509,26 @@ function addOverlayToPool(display: Electron.Display): BrowserWindow {
   }
 
   // One-time per-window setup: register the HWND for the native click-through
-  // helper. The overlay is reused across captures so this only fires once.
+  // helper, kill DWM transitions, then immediately surface the window at
+  // opacity 0 over its display. This lights up the alpha compositor + caches
+  // the first rendered frame *before* the user ever triggers a capture, so
+  // the hot-path (createOverlayWindows) just bumps opacity to 1 — no fade,
+  // no cold-start render, no transparent-window flicker. Bounds stay at the
+  // display: moving an Electron window across monitors with different DPI
+  // scrambles its scale-factor tracking on Windows.
   win.once('ready-to-show', () => {
-    if (process.platform === 'win32' && !win.isDestroyed()) {
+    if (win.isDestroyed()) return
+    if (process.platform === 'win32') {
       const hwnd = win.getNativeWindowHandle().readInt32LE(0)
       registerOverlayHwnd(hwnd)
+      disableDwmTransitions(win)
     }
+    win.setOpacity(0)
+    // No `forward` — pool windows are parked invisible at this point; we
+    // want cursor hit-test to fall through (otherwise the renderer's
+    // crosshair cursor leaks over apps below).
+    win.setIgnoreMouseEvents(true)
+    win.showInactive()
   })
 
   win.on('closed', () => {
@@ -534,6 +572,45 @@ export function setupOverlayPool() {
   })
 }
 
+// Wait for the renderer to ack that the frozen bg is decoded + painted, then
+// ramp opacity to 1 in one shot. Without the gate, opacity flips before the
+// renderer has committed the new bg → user sees a stale frame from the
+// previous capture for one composite cycle. Falls back after a generous
+// timeout so a renderer hang doesn't strand the user with an invisible
+// overlay.
+const BG_READY_TIMEOUT_MS = 1500
+
+function revealOverlayWhenBgReady(win: BrowserWindow, displayId: number, isActive: boolean): void {
+  const wcId = win.webContents.id
+  let done = false
+
+  const reveal = () => {
+    if (done) return
+    done = true
+    clearTimeout(timer)
+    ipcMain.off('overlay:bg-ready', handler)
+    if (win.isDestroyed() || !overlayWindows.has(displayId)) return
+    if (isActive) {
+      win.setIgnoreMouseEvents(false)
+      // Bring to top + grab keyboard focus so the renderer's ESC handler
+      // receives keydown without the user having to click the overlay
+      // first. We surfaced with showInactive() at pool time to avoid
+      // stealing focus pre-capture, but during a live capture the user
+      // expects ESC to work immediately.
+      win.focus()
+    }
+    else win.setIgnoreMouseEvents(true, { forward: true })
+    win.setOpacity(1)
+  }
+
+  const handler = (e: Electron.IpcMainEvent) => {
+    if (e.sender.id === wcId) reveal()
+  }
+
+  const timer = setTimeout(reveal, BG_READY_TIMEOUT_MS)
+  ipcMain.on('overlay:bg-ready', handler)
+}
+
 export function createOverlayWindows(): Map<number, BrowserWindow> {
   closeAllOverlays()
   // Lazy fallback: caller might invoke this before whenReady has finished
@@ -567,21 +644,37 @@ export function createOverlayWindows(): Map<number, BrowserWindow> {
     const displayBounds = { x, y, width, height }
     const isActive = display.id === activeOverlayDisplayId
 
+    // Move into position while still invisible (opacity 0) — bounds change is
+    // free under DWM when the window isn't rendering pixels to the desktop.
     win.setBounds(displayBounds)
-    if (!isActive) {
-      win.setIgnoreMouseEvents(true, { forward: true })
-    } else {
-      win.setIgnoreMouseEvents(false)
-    }
 
     // Reset renderer state for a fresh session: pushes the current mode and
     // clears any leftover draw state from a previous capture. The renderer
     // listens for 'overlay:mode-changed' and resets startPos/currentPos/etc.
     win.webContents.send('overlay:mode-changed', currentMode)
     win.webContents.send('overlay:set-active', isActive)
+    // Push the frozen-screen snapshot captured at hotkey-press time (null
+    // for video flows). Renderer renders it as an <img> and acks once
+    // decoded; we gate setOpacity(1) on that ack so the first visible frame
+    // already has the snapshot. Without this gate, opacity flips before the
+    // renderer commits → user sees the previous capture's bg for one frame.
+    const frozenBg = getFrozenBgForDisplay(display.id)
+    win.webContents.send('overlay:frozen-bg-changed', frozenBg)
 
     overlayWindows.set(display.id, win)
-    win.show()
+
+    if (frozenBg) {
+      revealOverlayWhenBgReady(win, display.id, isActive)
+    } else {
+      // Video flow: no snapshot to wait for, surface immediately.
+      if (isActive) {
+        win.setIgnoreMouseEvents(false)
+        win.focus()
+      } else {
+        win.setIgnoreMouseEvents(true, { forward: true })
+      }
+      win.setOpacity(1)
+    }
   }
 
   // Poll cursor position to switch active overlay when mouse moves between displays
@@ -608,6 +701,7 @@ export function createOverlayWindows(): Map<number, BrowserWindow> {
       if (newWin && !newWin.isDestroyed()) {
         newWin.webContents.send('overlay:set-active', true)
         newWin.setIgnoreMouseEvents(false)
+        newWin.focus()
       }
     }
   }, 100)
