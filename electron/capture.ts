@@ -11,6 +11,8 @@ import { showNotification } from './notify'
 import { applyWatermark } from './watermark'
 import { getSettings } from './settings'
 import { startVideoCapture } from './video'
+import { getDisplayIcc } from './display-icc'
+import { tagPngWithIcc } from './png-icc'
 
 /** Canonical folder for original captures (both images and videos). Not
  *  user-configurable — user-chosen locations are for the Save-As dialog only,
@@ -18,17 +20,31 @@ import { startVideoCapture } from './video'
 export const ORIGINALS_DIR = join(homedir(), 'Pictures', 'Lumia')
 
 /** Write the just-captured image to disk at {ORIGINALS_DIR}/capture-{ts}.{ext}.
- *  Best-effort — returns null if anything goes wrong so capture still completes. */
-async function saveOriginalImage(dataUrl: string): Promise<{ filePath: string; filename: string } | null> {
+ *  Best-effort — returns null if anything goes wrong so capture still completes.
+ *
+ *  When `displayId` is provided and the OS exposes an ICC profile for that
+ *  display, the PNG gets an `iCCP` chunk before write — so color-managed
+ *  viewers render wide-gamut content (P3 MacBooks, calibrated monitors)
+ *  faithfully instead of falling back to sRGB. JPEG path skips tagging
+ *  (different container, not currently produced by our capture pipeline). */
+async function saveOriginalImage(dataUrl: string, displayId?: number): Promise<{ filePath: string; filename: string } | null> {
   try {
     const { writeFile, mkdir } = await import('fs/promises')
     await mkdir(ORIGINALS_DIR, { recursive: true })
     const ts = localTimestamp()
-    const ext = dataUrl.startsWith('data:image/jpeg') ? 'jpg' : 'png'
+    const isJpeg = dataUrl.startsWith('data:image/jpeg')
+    const ext = isJpeg ? 'jpg' : 'png'
     const filename = `capture-${ts}.${ext}`
     const filePath = join(ORIGINALS_DIR, filename)
     const base64 = dataUrl.replace(/^data:image\/\w+;base64,/, '')
-    await writeFile(filePath, Buffer.from(base64, 'base64'))
+    let buf = Buffer.from(base64, 'base64')
+
+    if (!isJpeg && displayId != null) {
+      const icc = await getDisplayIcc(displayId)
+      if (icc) buf = tagPngWithIcc(buf, icc, 'Display')
+    }
+
+    await writeFile(filePath, buf)
     return { filePath, filename }
   } catch (err) {
     console.error('[capture] failed to save original image', err)
@@ -182,7 +198,7 @@ export function setupCapture() {
     // fresh screen grab, so the overlay's residual presence doesn't matter.
     const dataUrl = await captureRect(payload.rect, displayId)
     clearFrozenCache()
-    await sendCaptureToEditor(dataUrl, 'region')
+    await sendCaptureToEditor(dataUrl, 'region', displayId ?? undefined)
     return dataUrl
   })
 
@@ -308,7 +324,7 @@ export function setupCapture() {
       ? await capturePhysicalRect(cached)
       : await captureRect(rect, overlayId)
     clearFrozenCache()
-    await sendCaptureToEditor(dataUrl, 'window')
+    await sendCaptureToEditor(dataUrl, 'window', cached?.displayId ?? overlayId ?? undefined)
     return dataUrl
   })
 
@@ -346,7 +362,7 @@ export function setupCapture() {
     closeAllOverlays()
     const dataUrl = await captureDisplay(target, allDisplays)
     clearFrozenCache()
-    await sendCaptureToEditor(dataUrl, 'screen')
+    await sendCaptureToEditor(dataUrl, 'screen', target.id)
     return dataUrl
   })
 
@@ -394,7 +410,7 @@ async function captureAllScreen(): Promise<string> {
       }
     })
     const dataUrl = findSourceForDisplay(sources, allDisplays, d.id).thumbnail.toDataURL()
-    await sendCaptureToEditor(dataUrl, 'all-screen')
+    await sendCaptureToEditor(dataUrl, 'all-screen', d.id)
     return dataUrl
   }
 
@@ -442,7 +458,11 @@ async function captureAllScreen(): Promise<string> {
   }
 
   const dataUrl = compositeBGRA(items, totalW, totalH)
-  await sendCaptureToEditor(dataUrl, 'all-screen')
+  // Multi-display composite has mixed color spaces by construction (each
+  // display's pixels are in its own native space). Tag with the primary
+  // display's profile — accepts inaccuracy across non-primary regions in
+  // exchange for at least labeling the dominant color space.
+  await sendCaptureToEditor(dataUrl, 'all-screen', screen.getPrimaryDisplay().id)
   return dataUrl
 }
 
@@ -555,7 +575,7 @@ async function captureActiveMonitor(): Promise<string | void> {
     const activeDisplay = allDisplays[0] ?? screen.getPrimaryDisplay()
     await hideMainWindow()
     const dataUrl = await captureDisplay(activeDisplay, allDisplays)
-    await sendCaptureToEditor(dataUrl, 'screen')
+    await sendCaptureToEditor(dataUrl, 'screen', activeDisplay.id)
     return dataUrl
   }
 
@@ -566,7 +586,7 @@ async function captureActiveMonitor(): Promise<string | void> {
   createOverlayWindows()
 }
 
-export async function sendCaptureToEditor(dataUrlIn: string, source: string) {
+export async function sendCaptureToEditor(dataUrlIn: string, source: string, displayId?: number) {
   const mainWin = getMainWindow()
   if (!mainWin || mainWin.isDestroyed()) return
 
@@ -583,7 +603,8 @@ export async function sendCaptureToEditor(dataUrlIn: string, source: string) {
 
   // Always save the original capture to ~/Pictures/Lumia/ (fixed location).
   // Editor's Save button is a separate flow that writes to a user-chosen path.
-  const saved = await saveOriginalImage(dataUrl)
+  // Pass displayId so the PNG carries the originating display's ICC profile.
+  const saved = await saveOriginalImage(dataUrl, displayId)
 
   // Capture the new entry's id so the Editor knows it's already in history.
   // Without this, a follow-up runWorkflow(...) sees historyId=undefined and the

@@ -3,6 +3,7 @@ import { join, dirname } from 'path'
 import fs from 'fs/promises'
 import { constants as fsConstants } from 'fs'
 import { setupCapture, ORIGINALS_DIR, getFrozenBgrForDisplay, prewarmDesktopCapturer } from './capture'
+import { getIccFromPng, tagPngWithIcc } from './png-icc'
 import { setupVideo } from './video'
 import { uploadToR2 } from './uploaders/r2'
 import {
@@ -1103,7 +1104,22 @@ app.whenReady().then(async () => {
       const stem = basename(originalPath, ext)
       const sidecar = join(dir, `${stem}-annotated.png`)
       const base64 = flattenedDataUrl.replace(/^data:image\/\w+;base64,/, '')
-      await writeFile(sidecar, Buffer.from(base64, 'base64'))
+      let sidecarBuf = Buffer.from(base64, 'base64')
+
+      // Konva's stage.toDataURL() doesn't embed any color profile, so the
+      // sidecar comes out un-tagged. Lift the iCCP chunk off the on-disk
+      // original (already tagged at capture time) and stamp it onto the
+      // sidecar so both files share the same color space. Best-effort —
+      // missing original ICC just leaves the sidecar un-tagged (same as
+      // pre-2.0.4 behavior, no regression).
+      try {
+        const { readFile } = await import('fs/promises')
+        const originalBuf = await readFile(originalPath)
+        const icc = getIccFromPng(originalBuf)
+        if (icc) sidecarBuf = tagPngWithIcc(sidecarBuf, icc, 'Display')
+      } catch { /* original missing or unreadable — write sidecar un-tagged */ }
+
+      await writeFile(sidecar, sidecarBuf)
       annotatedFilePath = sidecar
       thumbnailUrl = makeThumbnail(flattenedDataUrl)
     }

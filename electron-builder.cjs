@@ -56,7 +56,8 @@ module.exports = {
     // build/compile-mac-helpers.sh. The same script is what local devs run.
     { from: 'electron/helpers/ocr-vision', to: 'ocr-vision' },
     { from: 'electron/helpers/window-at-point', to: 'window-at-point' },
-    { from: 'electron/helpers/scroll-helper', to: 'scroll-helper' }
+    { from: 'electron/helpers/scroll-helper', to: 'scroll-helper' },
+    { from: 'electron/helpers/get-display-icc', to: 'get-display-icc' }
   ],
 
   directories: {
