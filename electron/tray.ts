@@ -10,7 +10,6 @@ export function setupTray() {
   const trayIconPath = app.isPackaged
     ? join(process.resourcesPath, `tray/${isMac ? 'mac' : 'win'}/tray-icon.png`)
     : join(__dirname, `../../resources/tray/${isMac ? 'mac' : 'win'}/tray-icon.png`)
-  console.log(`Tray icon path: ${trayIconPath}`)
   let icon: Electron.NativeImage
 
 
