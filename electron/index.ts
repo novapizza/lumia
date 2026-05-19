@@ -1006,8 +1006,8 @@ app.whenReady().then(async () => {
   ipcMain.handle('workflow:run', async (_e, templateId: string, imageData: string, destinationIndex?: number, historyId?: string) => {
     return workflowEngine.run(templateId, imageData, destinationIndex, historyId)
   })
-  ipcMain.handle('workflow:inlineAction', async (_e, actionType: 'clipboard' | 'save', imageData: string) => {
-    return workflowEngine.runInlineAction(actionType, imageData)
+  ipcMain.handle('workflow:inlineAction', async (_e, actionType: 'clipboard' | 'save', imageData: string, historyId?: string) => {
+    return workflowEngine.runInlineAction(actionType, imageData, historyId)
   })
 
   // IPC: History
@@ -1103,15 +1103,20 @@ app.whenReady().then(async () => {
       const ext = extname(originalPath) || '.png'
       const stem = basename(originalPath, ext)
       const sidecar = join(dir, `${stem}-annotated.png`)
-      const base64 = flattenedDataUrl.replace(/^data:image\/\w+;base64,/, '')
-      let sidecarBuf = Buffer.from(base64, 'base64')
 
-      // Konva's stage.toDataURL() doesn't embed any color profile, so the
-      // sidecar comes out un-tagged. Lift the iCCP chunk off the on-disk
-      // original (already tagged at capture time) and stamp it onto the
-      // sidecar so both files share the same color space. Best-effort —
-      // missing original ICC just leaves the sidecar un-tagged (same as
-      // pre-2.0.4 behavior, no regression).
+      // Renderer's canvas.toDataURL emits 32-bit RGBA PNGs even when the
+      // composite is fully opaque (annotation drawn over an opaque
+      // background → every output pixel ends at alpha=255). Pipe through
+      // NativeImage so Chromium's main-process PNG encoder — which detects
+      // all-opaque images and downgrades to 24-bit RGB (colorType=2) —
+      // takes over. Lossless pixel-wise, ~25-30% smaller on opaque content.
+      let sidecarBuf = nativeImage.createFromDataURL(flattenedDataUrl).toPNG()
+
+      // Konva's canvas encoder also doesn't embed any color profile. Lift
+      // the iCCP chunk off the on-disk original (already tagged at capture
+      // time) and stamp it onto the sidecar so both files share the same
+      // color space. Best-effort — missing original ICC just leaves the
+      // sidecar un-tagged (same as pre-2.0.4 behavior, no regression).
       try {
         const { readFile } = await import('fs/promises')
         const originalBuf = await readFile(originalPath)

@@ -369,7 +369,7 @@ export default function Editor() {
     }
   }, [])
 
-  const handleExport = useCallback((dataUrl: string) => {
+  const handleExport = useCallback(async (dataUrl: string) => {
     setExportedDataUrl(dataUrl)
     setExportTrigger(0)
 
@@ -385,20 +385,28 @@ export default function Editor() {
     // is about not creating a *new* history entry — `runInlineAction` doesn't
     // touch the history store, so updating an existing item's annotations
     // here is fine.
+    //
+    // AWAIT instead of fire-and-forget: runInlineAction('save') below reads
+    // the just-written sidecar off disk and copies it to the user's chosen
+    // location (preserves bytes + iCCP, avoids a lossy decode/re-encode
+    // round-trip through Konva canvas). Racing the two would let copyFile
+    // pick up stale sidecar contents from the previous edit.
     if (historyId && !isVideo && canvasRef.current) {
       if (annotationSaveTimer.current) { clearTimeout(annotationSaveTimer.current); annotationSaveTimer.current = null }
       pendingAnnotationSave.current = null  // action save supersedes any pending debounced save
       const objects = canvasRef.current.getObjects() as AnnotationObject[]
-      window.electronAPI?.saveHistoryAnnotations(historyId, objects, dataUrl).catch((err) => {
+      try {
+        await window.electronAPI?.saveHistoryAnnotations(historyId, objects, dataUrl)
+      } catch (err) {
         console.error('[editor] failed to save annotations', err)
-      })
+      }
     }
 
     if (!pending) return
     const { key, templateId, destinationIndex, actionType } = pending
     setActionBusy(key)
     if (actionType) {
-      window.electronAPI?.runInlineAction(actionType, dataUrl)
+      window.electronAPI?.runInlineAction(actionType, dataUrl, historyId)
         .then((res) => {
           if (res?.canceled) return // user dismissed the save dialog
           showToast(actionType === 'clipboard' ? 'Copied to clipboard' : 'Saved to file', 'check_circle')

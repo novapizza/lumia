@@ -19,8 +19,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Workflow
   runWorkflow: (templateId: string, imageData: string, destinationIndex?: number, historyId?: string) =>
     ipcRenderer.invoke('workflow:run', templateId, imageData, destinationIndex, historyId),
-  runInlineAction: (actionType: 'clipboard' | 'save', imageData: string) =>
-    ipcRenderer.invoke('workflow:inlineAction', actionType, imageData),
+  runInlineAction: (actionType: 'clipboard' | 'save', imageData: string, historyId?: string) =>
+    ipcRenderer.invoke('workflow:inlineAction', actionType, imageData, historyId),
   getTemplates: () => ipcRenderer.invoke('workflow:getTemplates'),
   saveTemplate: (template: unknown) => ipcRenderer.invoke('workflow:saveTemplate', template),
   deleteTemplate: (id: string) => ipcRenderer.invoke('workflow:deleteTemplate', id),

@@ -37,7 +37,7 @@ declare global {
       showAfterRecording: () => Promise<void>
 
       runWorkflow: (templateId: string, imageData: string, destinationIndex?: number, historyId?: string) => Promise<import('./types').WorkflowResult>
-      runInlineAction: (actionType: 'clipboard' | 'save', imageData: string) => Promise<{ canceled?: boolean }>
+      runInlineAction: (actionType: 'clipboard' | 'save', imageData: string, historyId?: string) => Promise<{ canceled?: boolean }>
       getTemplates: () => Promise<import('./types').WorkflowTemplate[]>
       saveTemplate: (template: import('./types').WorkflowTemplate) => Promise<import('./types').WorkflowTemplate>
       deleteTemplate: (id: string) => Promise<boolean>
