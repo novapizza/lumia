@@ -2,7 +2,7 @@ import { app, BrowserWindow, ipcMain, shell, dialog, nativeImage, clipboard, scr
 import { join, dirname } from 'path'
 import fs from 'fs/promises'
 import { constants as fsConstants } from 'fs'
-import { setupCapture, ORIGINALS_DIR, getFrozenBgForDisplay } from './capture'
+import { setupCapture, ORIGINALS_DIR, getFrozenBgrForDisplay, prewarmDesktopCapturer } from './capture'
 import { setupVideo } from './video'
 import { uploadToR2 } from './uploaders/r2'
 import {
@@ -654,16 +654,21 @@ export function createOverlayWindows(): Map<number, BrowserWindow> {
     win.webContents.send('overlay:mode-changed', currentMode)
     win.webContents.send('overlay:set-active', isActive)
     // Push the frozen-screen snapshot captured at hotkey-press time (null
-    // for video flows). Renderer renders it as an <img> and acks once
-    // decoded; we gate setOpacity(1) on that ack so the first visible frame
-    // already has the snapshot. Without this gate, opacity flips before the
-    // renderer commits → user sees the previous capture's bg for one frame.
-    const frozenBg = getFrozenBgForDisplay(display.id)
-    win.webContents.send('overlay:frozen-bg-changed', frozenBg)
+    // for video flows) as raw BGRA bytes. Renderer paints it to a <canvas>
+    // via putImageData and acks once a frame has been committed; we gate
+    // setOpacity(1) on that ack so the first visible frame already has the
+    // snapshot. Without this gate, opacity flips before the renderer
+    // commits → user sees the previous capture's bg for one frame.
+    //
+    // We pass raw BGRA (not a data URL) because PNG-encoding a 4K display
+    // takes ~500-1000ms and would land on the critical path before the
+    // overlay can surface. toBitmap() is free.
+    const frozenBgr = getFrozenBgrForDisplay(display.id)
+    win.webContents.send('overlay:frozen-bgra-changed', frozenBgr)
 
     overlayWindows.set(display.id, win)
 
-    if (frozenBg) {
+    if (frozenBgr) {
       revealOverlayWhenBgReady(win, display.id, isActive)
     } else {
       // Video flow: no snapshot to wait for, surface immediately.
@@ -839,6 +844,10 @@ app.whenReady().then(async () => {
   setupHotkeys()
   setupTray()
   setupScrollCapture(mainWindow, createOverlayWindows, closeAllOverlays, getOverlayDisplayId, restoreFromOverlayCancel)
+
+  // Init the desktopCapturer pipeline now so the first hotkey press doesn't
+  // pay the ~300-500ms cold-start. Fire-and-forget — no consumer waits on it.
+  void prewarmDesktopCapturer()
 
   // Pre-warm the overlay pool: one hidden BrowserWindow per display, with
   // the renderer already loaded. The first capture after boot drops from

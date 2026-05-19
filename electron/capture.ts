@@ -58,16 +58,25 @@ function hideMainWindow(): Promise<void> {
 // when the user pressed the hotkey — preserving tooltips/popovers that
 // auto-dismiss as soon as the overlay (or any other window) steals focus
 // from the source app.
+//
+// We only cache the NativeImage. Encoding to PNG via toDataURL() for a 4K
+// display takes ~500-1000ms and lands on the critical path before overlay
+// creation — so we hand the overlay raw BGRA bytes (free) instead, and only
+// PNG-encode when the user actually confirms a capture.
 const frozenImages = new Map<number, Electron.NativeImage>()
-const frozenDataUrls = new Map<number, string>()
 
-export function getFrozenBgForDisplay(displayId: number): string | null {
-  return frozenDataUrls.get(displayId) ?? null
+/** Raw BGRA bitmap of the frozen snapshot for the given display, intended for
+ *  the overlay window to render as background via canvas putImageData. The
+ *  buffer comes straight from NativeImage.toBitmap() — no encode round-trip. */
+export function getFrozenBgrForDisplay(displayId: number): { buffer: Buffer; width: number; height: number } | null {
+  const img = frozenImages.get(displayId)
+  if (!img) return null
+  const size = img.getSize()
+  return { buffer: img.toBitmap(), width: size.width, height: size.height }
 }
 
 function clearFrozenCache() {
   frozenImages.clear()
-  frozenDataUrls.clear()
 }
 
 /** Snapshot every display at full physical resolution into the frozen cache.
@@ -86,8 +95,20 @@ async function freezeAllDisplays(): Promise<void> {
     })
     const img = findSourceForDisplay(sources, allDisplays, d.id).thumbnail
     frozenImages.set(d.id, img)
-    frozenDataUrls.set(d.id, img.toDataURL())
   }))
+}
+
+/** One-shot warm-up of the desktopCapturer pipeline. First call after launch
+ *  initializes the underlying WGC / CGDisplayStream session and is ~300-500ms
+ *  slower than steady-state. Fire from app.whenReady() so the user's first
+ *  hotkey press doesn't eat that cold-start cost. */
+export async function prewarmDesktopCapturer(): Promise<void> {
+  try {
+    await desktopCapturer.getSources({
+      types: ['screen'],
+      thumbnailSize: { width: 1, height: 1 },
+    })
+  } catch { /* silent — best-effort */ }
 }
 
 function showMainWindow() {
@@ -508,9 +529,12 @@ async function captureRect(rect: { x: number; y: number; width: number; height: 
 }
 
 async function captureDisplay(display: Electron.Display, allDisplays: Electron.Display[]): Promise<string> {
-  // Frozen cache hit (monitor-pick path) — return the snapshot directly.
-  const cached = frozenDataUrls.get(display.id)
-  if (cached) return cached
+  // Frozen cache hit (monitor-pick path) — encode the cached NativeImage to
+  // PNG now. We deliberately don't pre-encode during freezeAllDisplays(): the
+  // encode is ~500-1000ms on 4K and would block overlay creation. At confirm
+  // time it's off the critical path (overlay already gone) so the cost is OK.
+  const cachedImg = frozenImages.get(display.id)
+  if (cachedImg) return cachedImg.toDataURL()
 
   const sf = display.scaleFactor || 1
   const sources = await desktopCapturer.getSources({
