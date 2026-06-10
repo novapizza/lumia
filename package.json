@@ -26,6 +26,7 @@
     "koffi": "^2.16.0",
     "material-symbols": "^0.44.4",
     "tesseract.js": "^7.0.0",
+    "ts-ebml": "^3.0.2",
     "uuid": "^10.0.0"
   },
   "pnpm": {
