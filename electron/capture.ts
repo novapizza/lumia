@@ -13,6 +13,7 @@ import { getSettings } from './settings'
 import { startVideoCapture } from './video'
 import { getDisplayIcc } from './display-icc'
 import { tagPngWithIcc } from './png-icc'
+import { captureDisplayNative } from './native-screen'
 
 /** Canonical folder for original captures (both images and videos). Not
  *  user-configurable — user-chosen locations are for the Save-As dialog only,
@@ -102,6 +103,15 @@ async function freezeAllDisplays(): Promise<void> {
   clearFrozenCache()
   const allDisplays = screen.getAllDisplays()
   await Promise.all(allDisplays.map(async d => {
+    // Fast path: native capture (Windows GDI BitBlt). ~5–20 ms vs ~50–150 ms
+    // for desktopCapturer, with no WGC session setup per-call. No-op on macOS
+    // (returns null) — see native-screen.ts.
+    const nativeImg = await captureDisplayNative(d)
+    if (nativeImg) {
+      frozenImages.set(d.id, nativeImg)
+      return
+    }
+    // Fallback: desktopCapturer (if native capture fails for any reason).
     const sf = d.scaleFactor || 1
     const physW = Math.max(1, Math.round(d.size.width * sf))
     const physH = Math.max(1, Math.round(d.size.height * sf))
