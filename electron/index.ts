@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, shell, dialog, nativeImage, clipboard, screen, Menu, nativeTheme, protocol, net, powerMonitor } from 'electron'
+import { app, BrowserWindow, ipcMain, shell, dialog, nativeImage, clipboard, screen, Menu, nativeTheme, protocol, powerMonitor } from 'electron'
 import { join, dirname } from 'path'
 import fs from 'fs/promises'
 import { setupCapture, ORIGINALS_DIR, getFrozenBgrForDisplay, prewarmDesktopCapturer } from './capture'
@@ -55,8 +55,8 @@ app.commandLine.appendSwitch('disk-cache-size', String(80 * 1024 * 1024))
 // Privileged scheme for streaming local recordings into <video> without
 // reading the whole file into renderer memory as a Blob. Chromium's media
 // stack issues HTTP Range requests against this scheme; the handler (wired in
-// whenReady) proxies them to the file via net.fetch, which supports ranges.
-// Must be registered before app 'ready', i.e. here at module top level.
+// whenReady) serves them from disk with explicit 206/Content-Range responses
+// so seeking works. Must be registered before app 'ready', i.e. at top level.
 protocol.registerSchemesAsPrivileged([
   {
     scheme: 'lumia-media',
@@ -2131,20 +2131,62 @@ app.whenReady().then(async () => {
   // Stream a local recording into <video> with Range support, instead of the
   // renderer reading the entire file over IPC and holding it as a Blob (a
   // multi-hundred-MB recording would OOM both processes). The URL shape is
-  // `lumia-media://stream/?path=<encodeURIComponent(absPath)>`. net.fetch of a
-  // file:// URL natively honors the Range header Chromium sends for seeking.
+  // `lumia-media://stream/?path=<encodeURIComponent(absPath)>`.
+  //
+  // Range is handled explicitly: <video> seeks by re-requesting a byte range,
+  // and the response MUST be 206 with Content-Range / Accept-Ranges or the
+  // scrubber is dead. (net.fetch of a file:// URL does not forward the Range
+  // header, so seeking silently fell back to a full-file 200 — no seeking.)
   protocol.handle('lumia-media', async (request) => {
     try {
       const reqUrl = new URL(request.url)
       const filePath = reqUrl.searchParams.get('path')
       if (!filePath) return new Response('Missing path', { status: 400 })
-      const { resolve, normalize } = await import('path')
+      const { resolve, normalize, extname } = await import('path')
       const { homedir } = await import('os')
-      const { pathToFileURL } = await import('url')
+      const { stat } = await import('fs/promises')
+      const { createReadStream } = await import('fs')
+      const { Readable } = await import('stream')
       const normalized = resolve(normalize(filePath))
       // Same homedir sandbox as file:read — never serve arbitrary disk paths.
       if (!normalized.startsWith(homedir())) return new Response('Forbidden', { status: 403 })
-      return net.fetch(pathToFileURL(normalized).toString())
+
+      const total = (await stat(normalized)).size
+      const ext = extname(normalized).toLowerCase()
+      const contentType = ext === '.mp4' ? 'video/mp4' : ext === '.webm' ? 'video/webm' : 'application/octet-stream'
+
+      const toWeb = (start?: number, end?: number) =>
+        Readable.toWeb(createReadStream(normalized, { start, end })) as unknown as ReadableStream<Uint8Array>
+
+      const rangeHeader = request.headers.get('range')
+      const m = rangeHeader ? /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim()) : null
+      if (m && total > 0) {
+        let start = m[1] ? parseInt(m[1], 10) : 0
+        let end = m[2] ? parseInt(m[2], 10) : total - 1
+        if (Number.isNaN(start)) start = 0
+        if (Number.isNaN(end) || end >= total) end = total - 1
+        if (start > end || start >= total) {
+          return new Response(null, { status: 416, headers: { 'Content-Range': `bytes */${total}` } })
+        }
+        return new Response(toWeb(start, end), {
+          status: 206,
+          headers: {
+            'Content-Type': contentType,
+            'Content-Range': `bytes ${start}-${end}/${total}`,
+            'Accept-Ranges': 'bytes',
+            'Content-Length': String(end - start + 1),
+          },
+        })
+      }
+
+      return new Response(toWeb(), {
+        status: 200,
+        headers: {
+          'Content-Type': contentType,
+          'Accept-Ranges': 'bytes',
+          'Content-Length': String(total),
+        },
+      })
     } catch (err) {
       console.error('[lumia-media] stream failed', err)
       return new Response('Error', { status: 500 })
