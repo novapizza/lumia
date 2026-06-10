@@ -1,6 +1,7 @@
 import { app, BrowserWindow, clipboard, desktopCapturer, dialog, ipcMain, screen } from 'electron'
 import { basename, dirname, extname, join } from 'path'
 import { homedir } from 'os'
+import type { WriteStream } from 'fs'
 import {
   getMainWindow,
   getHistoryStore,
@@ -53,6 +54,19 @@ let recorderHost: BrowserWindow | null = null
 let recordingToolbar: BrowserWindow | null = null
 let recordingBorder: BrowserWindow | null = null
 
+// True once MediaRecorder has actually started (toolbar:begin fired). Used to
+// distinguish a Stop pressed during the countdown (→ cancel, nothing to save)
+// from a real stop, so the session can't wedge in 'stopping' forever.
+let recordingBegun = false
+
+// Streamed save state: the finished webm is forwarded from the recorder host
+// to disk in bounded slices (save-begin → save-chunk* → save-end) rather than
+// one multi-GB ArrayBuffer over IPC, which OOM'd the renderer and could blow
+// the structured-clone limit on long recordings.
+let recordingWriteStream: WriteStream | null = null
+let recordingSaveFilePath: string | null = null
+let recordingSaveBytes = 0
+
 export function getRecordingTarget(): RecordingTarget | null {
   return recordingTarget
 }
@@ -92,8 +106,17 @@ async function resolveScreenSourceId(displayId: number): Promise<string> {
   const allDisplays = screen.getAllDisplays()
   const byId = sources.find(s => s.display_id === String(displayId))
   if (byId) return byId.id
+  // Fallback: some platform/Electron combos report empty display_id on
+  // screen sources. Pairing by enumeration order is not contractually
+  // aligned with screen.getAllDisplays(), so on multi-monitor setups this
+  // can capture the wrong display — warn so it's diagnosable.
   const idx = allDisplays.findIndex(d => d.id === displayId)
-  if (idx >= 0 && idx < sources.length) return sources[idx].id
+  if (idx >= 0 && idx < sources.length) {
+    if (sources.length > 1) {
+      console.warn('[video] display_id unavailable on capture sources; falling back to index pairing — recorded monitor may differ from selection')
+    }
+    return sources[idx].id
+  }
   return sources[0]?.id ?? ''
 }
 
@@ -182,6 +205,17 @@ function createRecorderHost() {
   win.setMenu(null)
   loadRoute(win, '/recorder-host')
   win.on('closed', () => { recorderHost = null })
+  // A renderer crash (e.g. OOM finalizing a very long recording) would
+  // otherwise leave recorderHost non-null forever — isRecordingActive() stays
+  // true, the mic/desktop capture stays held, and every recording hotkey is
+  // disabled until app restart. Tear the session down and surface an error.
+  win.webContents.on('render-process-gone', (_e, details) => {
+    if (details.reason === 'clean-exit') return
+    if (recorderHost !== win) return
+    console.error('[video] recorder host renderer gone:', details.reason)
+    sendToToolbar('toolbar:state', { phase: 'error', error: 'Recording process crashed' })
+    setTimeout(() => { closeRecordingSession(); showMain() }, 2000)
+  })
   recorderHost = win
   return win
 }
@@ -312,6 +346,7 @@ function createRecordingBorder(display: Electron.Display, rect: { x: number; y: 
 
 function openRecordingSession(target: RecordingTarget) {
   recordingTarget = target
+  recordingBegun = false
   const allDisplays = screen.getAllDisplays()
   const display = allDisplays.find(d => d.id === target.displayId) ?? screen.getPrimaryDisplay()
 
@@ -329,6 +364,15 @@ function openRecordingSession(target: RecordingTarget) {
 
 export function closeRecordingSession() {
   recordingTarget = null
+  recordingBegun = false
+  // Tear down any half-open save stream (e.g. cancel during finalize) so a
+  // dangling fd / partial file doesn't leak into the next session.
+  if (recordingWriteStream) {
+    try { recordingWriteStream.destroy() } catch { /* ignore */ }
+    recordingWriteStream = null
+    recordingSaveFilePath = null
+    recordingSaveBytes = 0
+  }
   // destroyAnnotation, not closeAnnotation: end of session means strokes
   // shouldn't outlive the recording. closeAnnotation only hides the
   // palette, which is the wrong behaviour here.
@@ -359,34 +403,12 @@ function sendToToolbar(channel: string, ...args: unknown[]) {
 
 // ── Save recorded blob ─────────────────────────────────────────────────────
 
-async function saveRecordingBlob(
-  buffer: ArrayBuffer | Uint8Array | Buffer,
+async function recordHistoryAndNotify(
+  filePath: string,
   thumbnailDataUrl: string,
   durationMs: number,
 ): Promise<{ filePath: string; historyId?: string }> {
-  const { writeFile, mkdir } = await import('fs/promises')
-
-  // Originals (images + videos) live in a single fixed location. The user's
-  // Save-As dialog path is a separate concern — it never touches this folder.
-  await mkdir(ORIGINALS_DIR, { recursive: true })
-
-  const ts = localTimestamp()
-  const filename = `recording-${ts}.webm`
-  const filePath = join(ORIGINALS_DIR, filename)
-
-  // Normalise buffer: Electron IPC may deliver ArrayBuffer, Uint8Array, or Buffer
-  // depending on the channel — Buffer.from handles all three but produces a
-  // zero-length buffer if given a bare object, so check byteLength first.
-  const bytes =
-    Buffer.isBuffer(buffer) ? buffer :
-    buffer instanceof Uint8Array ? Buffer.from(buffer.buffer, buffer.byteOffset, buffer.byteLength) :
-    Buffer.from(buffer as ArrayBuffer)
-
-  if (bytes.byteLength === 0) {
-    throw new Error('Recording produced no data (stopped before any frames were captured?)')
-  }
-
-  await writeFile(filePath, bytes)
+  const filename = basename(filePath)
 
   // History entry. Capture the id so the editor can pass it through to
   // runWorkflow — without it, a follow-up Upload R2 lands in the "no
@@ -415,6 +437,7 @@ async function saveRecordingBlob(
     body: `Recording saved · ${Math.round(durationMs / 1000)}s`,
     thumbnailDataUrl,
     onClick: historyId ? () => { void openHistoryItemInEditor(historyId!, fromTray) } : undefined,
+    launchId: historyId ?? undefined,
   })
 
   return { filePath, historyId }
@@ -537,17 +560,25 @@ export function setupVideo() {
   ipcMain.handle('recorder:get-watermark', () => getWatermarkLogoDataUrl())
 
   // RecorderHost reports readiness (stream acquired or error)
-  ipcMain.handle('recorder:ready', (_e, ok: boolean, error?: string) => {
+  ipcMain.handle('recorder:ready', (_e, ok: boolean, error?: string, micAvailable?: boolean) => {
     if (!ok) {
       sendToToolbar('toolbar:state', { phase: 'error', error: error ?? 'Unable to start capture' })
+      // Stream acquisition failed (permission denied, source vanished). Nothing
+      // recovers this session — auto-dismiss after a beat so the host/toolbar
+      // windows don't wedge isRecordingActive() true forever, which would
+      // disable every recording hotkey until the app is restarted.
+      setTimeout(() => { closeRecordingSession(); showMain() }, 3000)
       return
     }
-    // Kick off countdown in toolbar
-    sendToToolbar('toolbar:state', { phase: 'countdown', countdown: 3 })
+    // Kick off countdown in toolbar. Forward whether a mic track was actually
+    // acquired so the toolbar can disable the mic toggle (otherwise it shows a
+    // "live" mic while no audio is being captured).
+    sendToToolbar('toolbar:state', { phase: 'countdown', countdown: 3, micAvailable: micAvailable ?? false })
   })
 
   // Toolbar countdown finished → tell host to begin MediaRecorder
   ipcMain.handle('toolbar:begin', () => {
+    recordingBegun = true
     sendToHost('recorder:begin')
     sendToToolbar('toolbar:state', { phase: 'recording', elapsedMs: 0 })
   })
@@ -561,6 +592,10 @@ export function setupVideo() {
     sendToToolbar('toolbar:state', { phase: 'recording' })
   })
   ipcMain.handle('toolbar:stop', () => {
+    // Stop pressed before MediaRecorder began (during the countdown): there's
+    // nothing to finalize, so treat it as a cancel instead of leaving the
+    // session stuck in 'stopping' while the countdown still fires begin.
+    if (!recordingBegun) { closeRecordingSession(); showMain(); return }
     sendToHost('recorder:stop-request')
     sendToToolbar('toolbar:state', { phase: 'stopping' })
   })
@@ -615,16 +650,66 @@ export function setupVideo() {
 
   // RecorderHost reports state changes (including tick)
   ipcMain.handle('recorder:tick', (_e, elapsedMs: number) => {
-    sendToToolbar('toolbar:state', { phase: 'recording', elapsedMs })
+    // No phase here — a tick that was already in flight when the user hit
+    // Pause must not flip the toolbar back to 'recording'. The toolbar keeps
+    // its current phase for phase-less updates.
+    sendToToolbar('toolbar:state', { elapsedMs })
   })
   ipcMain.handle('recorder:state', (_e, state: string, payload?: unknown) => {
     sendToToolbar('toolbar:state', { phase: state as any, ...(payload as any || {}) })
   })
 
-  // RecorderHost saves final blob
-  ipcMain.handle('recorder:save-blob', async (_e, buffer: ArrayBuffer, thumbnailDataUrl: string, durationMs: number) => {
+  // ── Streamed save (replaces the old single recorder:save-blob) ───────────
+  // The recorder host forwards the finished webm to disk in bounded slices so
+  // a long (multi-GB) recording never has to materialize one contiguous
+  // ArrayBuffer in the renderer or structured-clone it across IPC.
+
+  ipcMain.handle('recorder:save-begin', async () => {
+    const { createWriteStream } = await import('fs')
+    const { mkdir } = await import('fs/promises')
+    // Originals (images + videos) live in a single fixed location. The user's
+    // Save-As dialog path is a separate concern — it never touches this folder.
+    await mkdir(ORIGINALS_DIR, { recursive: true })
+    // Tear down any half-open stream from a previous aborted save.
+    if (recordingWriteStream) { try { recordingWriteStream.destroy() } catch { /* ignore */ } }
+    const ts = localTimestamp()
+    const filename = `recording-${ts}.webm`
+    recordingSaveFilePath = join(ORIGINALS_DIR, filename)
+    recordingSaveBytes = 0
+    recordingWriteStream = createWriteStream(recordingSaveFilePath)
+    return { ok: true }
+  })
+
+  ipcMain.handle('recorder:save-chunk', async (_e, chunk: ArrayBuffer) => {
+    const stream = recordingWriteStream
+    if (!stream) throw new Error('No active recording write stream')
+    const buf = Buffer.from(chunk)
+    recordingSaveBytes += buf.byteLength
+    // Respect backpressure: resolve only once the write drains (or errors).
+    await new Promise<void>((resolve, reject) => {
+      stream.write(buf, (err) => err ? reject(err) : resolve())
+    })
+    return { ok: true }
+  })
+
+  ipcMain.handle('recorder:save-end', async (_e, thumbnailDataUrl: string, durationMs: number) => {
+    const stream = recordingWriteStream
+    const filePath = recordingSaveFilePath
+    const bytes = recordingSaveBytes
+    recordingWriteStream = null
+    recordingSaveFilePath = null
+    recordingSaveBytes = 0
     try {
-      const { filePath, historyId } = await saveRecordingBlob(buffer, thumbnailDataUrl, durationMs)
+      if (!stream || !filePath) throw new Error('No active recording to finalize')
+      await new Promise<void>((resolve, reject) => {
+        stream.once('error', reject)
+        stream.end(() => resolve())
+      })
+      if (bytes === 0) {
+        throw new Error('Recording produced no data (stopped before any frames were captured?)')
+      }
+
+      const { historyId } = await recordHistoryAndNotify(filePath, thumbnailDataUrl, durationMs)
       sendToToolbar('toolbar:state', { phase: 'done' })
 
       // Open the freshly-saved recording in the video annotator (same pattern
@@ -641,7 +726,6 @@ export function setupVideo() {
         }
         const main = getMainWindow()
         if (main && !main.isDestroyed()) {
-          const { basename } = require('path') as typeof import('path')
           // Send navigate then wait for the renderer to ack /editor mounted
           // before showing — same reasoning as the screenshot path.
           main.webContents.send('navigate', '/editor', {
@@ -651,13 +735,13 @@ export function setupVideo() {
             historyId,
           })
           await waitForViewMounted('/editor')
-          main.show()
-          main.focus()
+          if (!main.isDestroyed()) { main.show(); main.focus() }
         }
         closeRecordingSession()
       }, 600)
       return { filePath }
     } catch (err: any) {
+      try { stream?.destroy() } catch { /* ignore */ }
       sendToToolbar('toolbar:state', { phase: 'error', error: err?.message ?? String(err) })
       setTimeout(() => { closeRecordingSession(); showMain() }, 1500)
       throw err
@@ -668,6 +752,9 @@ export function setupVideo() {
 // Exported for external callers (e.g. hotkey stop-request)
 export function requestStop() {
   if (!isRecordingActive()) return
+  // Stop hotkey pressed during the countdown — cancel rather than wedge the
+  // toolbar in 'stopping' (the host has no recorder to stop yet).
+  if (!recordingBegun) { closeRecordingSession(); showMain(); return }
   sendToHost('recorder:stop-request')
   sendToToolbar('toolbar:state', { phase: 'stopping' })
 }

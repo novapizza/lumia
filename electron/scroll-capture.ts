@@ -360,6 +360,9 @@ function robustOverlapScore(
   topSkip: number = 0,
   bottomSkip: number = 0
 ): number {
+  // A non-positive step means the two frames overlap fully (or the geometry is
+  // degenerate) — there is no real scroll to score, so return the worst score.
+  if (step <= 0) return 0
   const bytesPerRow = width * 4
   const overlapRows = height - step
   if (overlapRows <= 0) return 0
@@ -422,6 +425,9 @@ function overlapMismatch(
   topSkip: number = 0,
   bottomSkip: number = 0
 ): number {
+  // A non-positive step means the frames overlap fully (or the geometry is
+  // degenerate) — return the worst mismatch so callers never accept it.
+  if (step <= 0) return 1
   const bytesPerRow = width * 4
   const overlapRows = height - step
   if (overlapRows <= 0) return 1
@@ -625,13 +631,22 @@ function detectScrollStepFFT(
 
   let bestIdx = defaultStep
   let bestVal = -Infinity
-  let secondBestVal = -Infinity
   for (let i = minStep; i <= maxStep; i++) {
     if (corrAccum[i] > bestVal) {
-      secondBestVal = bestVal
       bestVal = corrAccum[i]
       bestIdx = i
-    } else if (corrAccum[i] > secondBestVal) {
+    }
+  }
+
+  // Find the runner-up peak OUTSIDE a small neighborhood of the main peak.
+  // Without this exclusion the second-best is almost always the peak's
+  // immediate neighbor, so bestVal/secondBestVal ≈ 1 and the reliability check
+  // below always fails — making the FFT path effectively dead.
+  const EXCLUDE = 3
+  let secondBestVal = -Infinity
+  for (let i = minStep; i <= maxStep; i++) {
+    if (Math.abs(i - bestIdx) <= EXCLUDE) continue
+    if (corrAccum[i] > secondBestVal) {
       secondBestVal = corrAccum[i]
     }
   }
@@ -844,136 +859,6 @@ function findSeamDPBuffer(
 }
 
 /**
- * Stitch scroll-captured frames into a single image using raw RGBA buffers.
- * Runs in the main process — avoids sending all frame dataUrls over IPC.
- *
- * Pipeline:
- * 1. Strip fixed header/footer from middle frames
- * 2. Use per-pair scroll steps to determine content overlap
- * 3. Find optimal seam row (DP shortest path)
- * 4. Alpha-blend across the seam
- * 5. Return final stitched image as dataUrl
- */
-function stitchFramesBuffer(
-  frames: Electron.NativeImage[],
-  scrollSteps: number[],
-  topFixed: number = 0,
-  bottomFixed: number = 0
-): string {
-  if (frames.length === 0) return ''
-  if (frames.length === 1) return frames[0].toDataURL()
-
-  const { width, height: frameH } = frames[0].getSize()
-
-  const safeTopFixed = Math.min(Math.max(0, Math.round(topFixed)), Math.floor(frameH * 0.4))
-  const safeBottomFixed = Math.min(Math.max(0, Math.round(bottomFixed)), Math.floor(frameH * 0.4))
-  const contentTop = safeTopFixed
-  const contentH = frameH - safeTopFixed - safeBottomFixed
-
-  if (contentH <= 0) return frames[0].toDataURL()
-
-  // Compute strip Y offsets in output
-  const stripYOffsets: number[] = [safeTopFixed]
-  for (let i = 0; i < scrollSteps.length; i++) {
-    stripYOffsets.push(stripYOffsets[i] + Math.max(0, scrollSteps[i]))
-  }
-
-  const totalHeight = stripYOffsets[stripYOffsets.length - 1] + contentH + safeBottomFixed
-  const bytesPerRow = width * 4
-
-  // Safety: cap max output size at ~256 megapixels (~1 GB buffer) to prevent OOM
-  if (totalHeight * width > 256_000_000) {
-    console.warn('[scroll-capture] stitched image too large, returning last frame')
-    return frames[frames.length - 1].toDataURL()
-  }
-
-  const outBuf = Buffer.alloc(totalHeight * bytesPerRow)
-
-  // Helper: copy rows from source bitmap to output buffer
-  function copyRows(src: Buffer, srcY: number, dstY: number, rows: number) {
-    if (rows <= 0) return
-    // Bounds check to prevent buffer overflow
-    const maxSrcRows = Math.floor(src.length / bytesPerRow)
-    const maxDstRows = Math.floor(outBuf.length / bytesPerRow)
-    const safeRows = Math.min(rows, maxSrcRows - srcY, maxDstRows - dstY)
-    if (safeRows <= 0) return
-    const srcOff = srcY * bytesPerRow
-    const dstOff = dstY * bytesPerRow
-    src.copy(outBuf, dstOff, srcOff, srcOff + safeRows * bytesPerRow)
-  }
-
-  // Get bitmaps — free previous after use to save memory
-  const bitmaps: (Buffer | null)[] = frames.map(f => f.toBitmap())
-
-  // Draw header from frame 0
-  if (safeTopFixed > 0) {
-    copyRows(bitmaps[0]!, 0, 0, safeTopFixed)
-  }
-
-  // Draw content from frame 0
-  copyRows(bitmaps[0]!, contentTop, stripYOffsets[0], contentH)
-
-  // Draw content from frames 1..N-1 with seam-aware blending
-  for (let i = 1; i < frames.length; i++) {
-    const stripY = stripYOffsets[i]
-    const prevStripBottom = stripYOffsets[i - 1] + contentH
-    let overlapH = prevStripBottom - stripY
-    overlapH = Math.max(0, Math.min(overlapH, contentH))
-
-    const curBitmap = bitmaps[i]!
-
-    if (overlapH <= 0) {
-      // No overlap — copy content directly
-      copyRows(curBitmap, contentTop, stripY, contentH)
-    } else {
-      const overlapStartInPrev = contentTop + (contentH - overlapH)
-      const overlapStartInCurr = contentTop
-
-      const seamRow = (bitmaps[i - 1] != null)
-        ? findSeamDPBuffer(
-            bitmaps[i - 1]!, curBitmap,
-            width,
-            overlapStartInPrev, overlapStartInCurr,
-            overlapH
-          )
-        : Math.floor(overlapH / 2) // fallback: middle of overlap
-
-      // Hard cut at seam row: prev frame above, current frame below
-      const belowSeamInOverlap = overlapH - seamRow
-      if (belowSeamInOverlap > 0) {
-        copyRows(curBitmap, contentTop + seamRow, stripY + seamRow, belowSeamInOverlap)
-      }
-
-      // Non-overlapping content below overlap
-      if (overlapH < contentH) {
-        copyRows(curBitmap, contentTop + overlapH, stripY + overlapH, contentH - overlapH)
-      }
-    }
-
-    // Free previous frame bitmap to reduce memory pressure
-    bitmaps[i - 1] = null
-  }
-
-  // Draw footer from last frame
-  if (safeBottomFixed > 0 && bitmaps[frames.length - 1]) {
-    copyRows(bitmaps[frames.length - 1]!, frameH - safeBottomFixed, totalHeight - safeBottomFixed, safeBottomFixed)
-  }
-
-  // ── Force alpha=255 for all pixels ──────────────────────────────────
-  // On Windows with GDI fallback capture, the alpha channel in raw bitmaps
-  // may be 0 (GDI doesn't set alpha). The Canvas-based stitching was immune
-  // because toDataURL→Image→drawImage pipeline implicitly handled this.
-  // With raw buffer stitching we must ensure all alpha bytes are 0xFF.
-  for (let i = 3; i < outBuf.length; i += 4) {
-    outBuf[i] = 255
-  }
-
-  // Convert raw bitmap buffer → NativeImage → PNG dataUrl
-  const result = nativeImage.createFromBitmap(outBuf, { width, height: totalHeight })
-  return result.toDataURL()
-}
-
-/**
  * Incremental stitching: extract bitmaps one at a time, stitch, free NativeImages.
  * Peak memory: accumulator buffer + 2 frame bitmaps (prev + current).
  * This is much better than holding all NativeImages + all bitmaps at once.
@@ -1107,15 +992,26 @@ async function captureScrollingInRect(
   // Centre of capture rect in ABSOLUTE screen coordinates (for scroll-wheel targeting).
   // rect coordinates are relative to the overlay window which fills the target display,
   // so we add the display's origin offset for multi-display setups.
-  const centerX = displayBounds.x + rect.x + rect.width / 2
-  const centerY = displayBounds.y + rect.y + rect.height / 2
+  const centerDipX = displayBounds.x + rect.x + rect.width / 2
+  const centerDipY = displayBounds.y + rect.y + rect.height / 2
+
+  // The native Win32 scroll path (SetCursorPos / mouse_event / WindowFromPoint)
+  // expects virtual-screen PHYSICAL pixels, which only equal DIP at 100% scale.
+  // Convert here on Windows; macOS uses points throughout (points == DIP), so
+  // leave the coordinates untouched there.
+  const center = process.platform === 'win32'
+    ? screen.dipToScreenPoint({ x: centerDipX, y: centerDipY })
+    : { x: centerDipX, y: centerDipY }
+  const centerX = center.x
+  const centerY = center.y
 
   const scrollMethod: ScrollMethod = opts.scrollMethod ?? 'mouseWheel'
 
   console.log(`[scroll-capture] start: display=${targetDisplay.id} scale=${scaleFactor} rect=${JSON.stringify(rect)} center=(${centerX},${centerY}) method=${scrollMethod}`)
 
   // ── Debug: save individual frames to Desktop/scroll-debug/ ─────────
-  const DEBUG_FRAMES = true
+  // Dev builds only — never dump frame PNGs to the user's Desktop in production.
+  const DEBUG_FRAMES = !app.isPackaged
   const debugDir = DEBUG_FRAMES ? join(app.getPath('desktop'), 'scroll-debug') : ''
   if (DEBUG_FRAMES) {
     try { mkdirSync(debugDir, { recursive: true }) } catch { /* ok */ }
@@ -1135,8 +1031,11 @@ async function captureScrollingInRect(
 
   // Target overlap: 40% of frame height for reliable matching on dynamic pages
   const TARGET_OVERLAP_PX = Math.max(150, Math.floor(framePhysH * 0.40))
-  // Ideal scroll step = frame height minus target overlap
-  const targetStep = framePhysH - TARGET_OVERLAP_PX
+  // Ideal scroll step = frame height minus target overlap. For very short
+  // regions (< ~150 physical px) framePhysH - TARGET_OVERLAP_PX goes negative,
+  // which cascades into broken overlap detection — clamp to a positive minimum.
+  const minStepPx = 1
+  const targetStep = Math.max(minStepPx, framePhysH - TARGET_OVERLAP_PX)
   // Default prediction for detectScrollStep (first pair)
   const defaultStep = targetStep
 
@@ -1193,11 +1092,15 @@ async function captureScrollingInRect(
       try { writeFileSync(join(debugDir, `frame-${String(i).padStart(2, '0')}.png`), cropped.toPNG()) } catch { /* ok */ }
     }
 
-    // Early fixed region detection after 3 frames are captured
+    // Early fixed region detection after 3 frames are captured. Cap each region
+    // at 40% of the frame height (same rule the stitch step applies) so an
+    // oversized detection can't drive rowEnd <= rowStart in overlapMismatch —
+    // which would make every pair fail.
     if (frames.length === 3 && earlyTopFixed === 0 && earlyBottomFixed === 0) {
       const early = detectFixedRegions(frames)
-      earlyTopFixed = early.topFixed
-      earlyBottomFixed = early.bottomFixed
+      const fixedCap = Math.floor(framePhysH * 0.4)
+      earlyTopFixed = Math.min(Math.max(0, early.topFixed), fixedCap)
+      earlyBottomFixed = Math.min(Math.max(0, early.bottomFixed), fixedCap)
     }
 
     // Detect scroll step for each consecutive pair
@@ -1426,6 +1329,10 @@ export function setupScrollCapture(
 
   // Step 2: Overlay confirms region selection
   ipcMain.handle('scroll-region:confirm', async (_e, rect: { x: number; y: number; width: number; height: number }) => {
+    // Reset here too: the hotkey path opens the overlay without going through
+    // scroll-capture:start, so a previous ESC leaves `cancelled` stuck true and
+    // every subsequent capture would abort at frame 0.
+    cancelled = false
     const captureDisplayId = getOverlayDisplayId()
     resetOverlayMode()
     closeAllOverlays()
@@ -1448,6 +1355,10 @@ export function setupScrollCapture(
       if (!mainWindow.isDestroyed()) {
         mainWindow.show()
         mainWindow.focus()
+        // Only Dashboard listens for scroll-capture:open/result, so make sure
+        // it's the mounted route before we emit — otherwise the result is lost
+        // when the user kicked the capture off from another view (e.g. Settings).
+        mainWindow.webContents.send('navigate', '/dashboard')
         await sleep(100)
         mainWindow.webContents.send('scroll-capture:open')
         // Wait for React to mount ScrollCaptureDialog and register its IPC listener
@@ -1459,6 +1370,10 @@ export function setupScrollCapture(
       if (!mainWindow.isDestroyed()) {
         mainWindow.show()
         mainWindow.focus()
+        // Same as the success path: Dashboard is the only listener for
+        // scroll-capture:open/error, so route there first.
+        mainWindow.webContents.send('navigate', '/dashboard')
+        await sleep(100)
         mainWindow.webContents.send('scroll-capture:open')
         await sleep(500)
         mainWindow.webContents.send('scroll-capture:error', { error: err instanceof Error ? err.message : 'Unknown error' })

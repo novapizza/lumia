@@ -3,18 +3,37 @@ import { localTimestamp } from '../utils'
 
 const GOOGLE_DRIVE_UPLOAD_URL = 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart'
 
-/** Returns true if the string looks like a real Drive file ID (not a folder name) */
+/** Returns true if the string looks like a real Drive file ID (not a folder
+ *  name). Drive IDs are long, base64url-ish, and — crucially for telling them
+ *  apart from human folder names — they're never all-letters. Real IDs reliably
+ *  mix in digits, '-' and '_'; ordinary folder names like
+ *  "CompanyScreenshotsArchive" are pure alphabetic CamelCase. So in addition to
+ *  the length + charset check we require at least one non-letter character,
+ *  which keeps long folder names from being mistaken for IDs (→ Drive 404). */
 function looksLikeDriveId(s: string): boolean {
-  return /^[a-zA-Z0-9_-]{20,}$/.test(s)
+  return s.length >= 25 && /^[a-zA-Z0-9_-]+$/.test(s) && /[0-9_-]/.test(s)
 }
 
-/** Find folder by name, returns its ID or null */
+/** Escape a value for use inside a single-quoted Drive query string literal.
+ *  Drive's query syntax requires '\' and "'" to be backslash-escaped; without
+ *  this a folder name containing an apostrophe produces a malformed query
+ *  (HTTP 400). */
+function escapeDriveQueryValue(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/'/g, "\\'")
+}
+
+/** Find folder by name, returns its ID or null when no such folder exists.
+ *  Throws on an API error so the caller doesn't mistake a transient/400 failure
+ *  for "folder not found" and create a duplicate folder. */
 async function findFolderByName(name: string, accessToken: string): Promise<string | null> {
-  const q = encodeURIComponent(`name='${name}' and mimeType='application/vnd.google-apps.folder' and trashed=false`)
+  const q = encodeURIComponent(`name='${escapeDriveQueryValue(name)}' and mimeType='application/vnd.google-apps.folder' and trashed=false`)
   const res = await fetch(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name)`, {
     headers: { Authorization: `Bearer ${accessToken}` }
   })
-  if (!res.ok) return null
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(`Folder lookup failed: HTTP ${res.status}: ${text}`)
+  }
   const json = await res.json() as { files: { id: string }[] }
   return json.files[0]?.id ?? null
 }

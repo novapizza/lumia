@@ -95,20 +95,27 @@ export function captureRectGdi(
   let hdcMem = 0, hbmp = 0, hOld = 0
   try {
     hdcMem = _CreateCompatibleDC(hdcScreen)
+    if (!hdcMem) return null
     hbmp   = _CreateCompatibleBitmap(hdcScreen, w, h)
+    if (!hbmp) return null
     hOld   = _SelectObject(hdcMem, hbmp)
 
     // Copy pixels from virtual screen into the compatible bitmap.
     // CAPTUREBLT ensures layered/transparent windows are included.
-    _BitBlt(hdcMem, 0, 0, w, h, hdcScreen, x, y, SRCCOPY | CAPTUREBLT)
+    // On failure GetDIBits would read an uninitialized/garbage bitmap, so bail
+    // out and let the caller fall back to desktopCapturer.
+    if (!_BitBlt(hdcMem, 0, 0, w, h, hdcScreen, x, y, SRCCOPY | CAPTUREBLT)) return null
 
     // GetDIBits requires the bitmap NOT be selected into any DC, so deselect it
     // here (restoring the DC's default bitmap) rather than waiting for finally.
     _SelectObject(hdcMem, hOld)
     hOld = 0
 
-    const pixels = Buffer.allocUnsafe(w * h * 4)
-    _GetDIBits(hdcScreen, hbmp, 0, h, pixels, {
+    // Zero-fill (not allocUnsafe): if GetDIBits underfills the buffer we return
+    // black rather than leaking uninitialized heap memory into the screenshot.
+    const pixels = Buffer.alloc(w * h * 4)
+    // GetDIBits returns the number of scan lines copied, or 0 on failure.
+    const scanLines = _GetDIBits(hdcScreen, hbmp, 0, h, pixels, {
       biSize:          40,  // sizeof(BITMAPINFOHEADER)
       biWidth:         w,
       biHeight:        -h,  // negative → top-down row order
@@ -121,6 +128,7 @@ export function captureRectGdi(
       biClrUsed:       0,
       biClrImportant:  0,
     }, DIB_RGB_COLORS)
+    if (!scanLines) return null
 
     // GDI leaves the alpha byte (byte 3 of each BGRA pixel) as 0, which
     // NativeImage treats as fully transparent. Set it to 0xFF (opaque) via a

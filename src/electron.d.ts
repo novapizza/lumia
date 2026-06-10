@@ -6,6 +6,10 @@ interface AppSettings {
   activeWorkflowId: string
   googleDriveRefreshToken: string
   googleDriveAccessToken: string
+  // Derived flag sent by settings:get in place of the raw tokens (which are
+  // blanked before crossing the IPC boundary). True when a refresh token is
+  // stored in the main process.
+  googleDriveConnected?: boolean
   googleDriveTokenExpiresAt: number
   googleDriveFolderId: string
   launchAtStartup: boolean
@@ -44,6 +48,7 @@ declare global {
 
       getHistory: () => Promise<import('./types').HistoryItem[]>
       deleteHistoryItem: (id: string) => Promise<boolean>
+      deleteHistoryItems: (ids: string[]) => Promise<number>
       openHistoryFile: (filePath: string) => Promise<void>
       addHistoryItem: (item: import('./types').HistoryItem) => Promise<void>
       readHistoryFile: (filePath: string) => Promise<string | null>
@@ -131,10 +136,12 @@ declare global {
         outputSize?: { width: number; height: number }                   // physical-pixel output canvas dims (region/window)
       } | null>
       recorderGetWatermark: () => Promise<string | null>
-      recorderReady: (ok: boolean, error?: string) => Promise<void>
+      recorderReady: (ok: boolean, error?: string, micAvailable?: boolean) => Promise<void>
       recorderStateChange: (state: 'countdown' | 'recording' | 'paused' | 'stopping' | 'saving' | 'done' | 'error', payload?: unknown) => Promise<void>
       recorderTick: (elapsedMs: number) => Promise<void>
-      recorderSaveBlob: (buffer: ArrayBuffer, thumbnailDataUrl: string, durationMs: number) => Promise<{ filePath: string }>
+      recorderSaveBegin: () => Promise<{ ok: boolean }>
+      recorderSaveChunk: (chunk: ArrayBuffer) => Promise<{ ok: boolean }>
+      recorderSaveEnd: (thumbnailDataUrl: string, durationMs: number) => Promise<{ filePath: string }>
       onRecorderBegin: (cb: () => void) => void
       onRecorderPause: (cb: () => void) => void
       onRecorderResume: (cb: () => void) => void

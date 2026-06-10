@@ -81,7 +81,6 @@ export default function Editor() {
   const [color, setColor] = useState('#f87171')
   const [strokeWidth, setStrokeWidth] = useState(3)
   const [exportTrigger, setExportTrigger] = useState(0)
-  const [, setExportedDataUrl] = useState<string>('')
   const [templates, setTemplates] = useState<WorkflowTemplate[]>([])
   const [activeWorkflowId, setActiveWorkflowId] = useState<string>('')
   const [gdriveConnected, setGdriveConnected] = useState(false)
@@ -190,7 +189,6 @@ export default function Editor() {
     setHistoryId(state.historyId)
     setInitialAnnotations(state.annotations)
     userEditedRef.current = false
-    baselineObjectsLenRef.current = state.annotations?.length ?? 0
     if (nextKind === 'video') {
       setKind('video')
       setVideoFilePath(state.filePath ?? '')
@@ -218,7 +216,6 @@ export default function Editor() {
       setHistoryId(undefined)
       setInitialAnnotations(undefined)
       userEditedRef.current = false
-      baselineObjectsLenRef.current = 0
       resetForNewImage(dataUrl)
     })
     Promise.all([
@@ -227,7 +224,7 @@ export default function Editor() {
     ]).then(([t, s]) => {
       if (t) setTemplates(t)
       if (s?.activeWorkflowId) setActiveWorkflowId(s.activeWorkflowId)
-      setGdriveConnected(!!s?.googleDriveRefreshToken)
+      setGdriveConnected(!!s?.googleDriveConnected)
     })
     return () => { window.electronAPI?.removeAllListeners('capture:ready') }
   }, [])
@@ -252,10 +249,15 @@ export default function Editor() {
     })
   }, [])
 
-  const loadClipboardItem = useCallback(async (entry: { id: string; filePath?: string; annotatedFilePath?: string; legacyDataUrl?: string }) => {
-    // Prefer the annotated sidecar so switching back to a history item shows
-    // the user's edited version, not the untouched original.
-    const sourcePath = entry.annotatedFilePath ?? entry.filePath
+  const loadClipboardItem = useCallback(async (entry: { id: string; filePath?: string; annotatedFilePath?: string; legacyDataUrl?: string; annotations?: AnnotationObject[] }) => {
+    // When the item carries vector annotations, load the ORIGINAL file and let
+    // Canvas replay the vectors on top — same as Dashboard. Using the annotated
+    // sidecar here would flatten the annotations into pixels AND replay the
+    // vectors, doubling them (and leaving ghosts when one is deleted). Only when
+    // there are no vectors do we fall back to the annotated sidecar so a legacy
+    // item edited before vectors were persisted still shows its edited version.
+    const hasVectors = (entry.annotations?.length ?? 0) > 0
+    const sourcePath = hasVectors ? entry.filePath : (entry.annotatedFilePath ?? entry.filePath)
     if (sourcePath) {
       try {
         const dataUrl = await window.electronAPI?.readHistoryFile(sourcePath)
@@ -277,6 +279,10 @@ export default function Editor() {
         if (e.key === '-')                  { e.preventDefault(); canvasRef.current?.zoomOut(); return }
         if (e.key === '0')                  { e.preventDefault(); canvasRef.current?.zoomReset(); return }
       }
+      // Don't let a modified chord (Ctrl+V/A/R/T/B/E/P, etc.) silently switch
+      // the active tool — those are clipboard/select/etc. shortcuts, not the
+      // bare single-key tool picks.
+      if (e.ctrlKey || e.metaKey || e.altKey) return
       const match = matchToolShortcut(e.key)
       if (match) setTool(match)
     }
@@ -352,11 +358,10 @@ export default function Editor() {
   // Suppress saves triggered by Canvas's replay of `initialAnnotations`. The
   // replay fires before `useImage` has finished loading the background, so
   // `stage.toDataURL()` at that moment captures the strokes on a transparent
-  // canvas — the resulting sidecar PNG would lose the original image. We
-  // only enable saves after a genuine user edit (objects diverge from the
-  // baseline length seeded from `initialAnnotations`).
+  // canvas — the resulting sidecar PNG would lose the original image. We only
+  // enable saves after Canvas reports a genuine user edit via the `userEdited`
+  // flag on onHistoryChange.
   const userEditedRef = useRef(false)
-  const baselineObjectsLenRef = useRef(0)
   useEffect(() => () => {
     if (annotationSaveTimer.current) {
       clearTimeout(annotationSaveTimer.current)
@@ -370,7 +375,6 @@ export default function Editor() {
   }, [])
 
   const handleExport = useCallback(async (dataUrl: string) => {
-    setExportedDataUrl(dataUrl)
     setExportTrigger(0)
 
     const pendingRaw = pendingAction.current
@@ -431,7 +435,7 @@ export default function Editor() {
     setExportTrigger((n) => n + 1)
   }
 
-  const handleHistoryChange = useCallback((u: boolean, r: boolean) => {
+  const handleHistoryChange = useCallback((u: boolean, r: boolean, userEdited?: boolean) => {
     setCanUndo(u)
     setCanRedo(r)
     // Lightweight auto-save: just the annotation JSON, no flattened PNG. That
@@ -446,25 +450,25 @@ export default function Editor() {
     // would wipe the user's persisted annotations.
     if (!u && !r) return
     if (historyId && !isVideo && canvasRef.current) {
-      const objects = canvasRef.current.getObjects() as AnnotationObject[]
-      // Gate out Canvas replay: the first fire with objects.length matching
-      // the baseline is the rehydration of `initialAnnotations`, not a user
-      // edit. `useImage` is still loading the background at that point, so
-      // `toDataURL` would flatten strokes onto a transparent canvas. Once the
-      // user draws/edits/clears the object count diverges and we latch
-      // `userEditedRef` so every subsequent commit saves.
+      // Gate out Canvas replay using its explicit `userEdited` signal rather
+      // than an object-count diff — the count check missed same-length first
+      // edits (e.g. dragging a single Text), silently dropping that save.
+      // `userEditedRef` latches once Canvas reports the first real edit.
       if (!userEditedRef.current) {
-        if (objects.length === baselineObjectsLenRef.current) return
+        if (!userEdited) return
         userEditedRef.current = true
       }
-      // Capture the flattened PNG synchronously here — at unmount the Konva
-      // stage may already be torn down, so stashing it now guarantees the
-      // sidecar survives a Back/close within the 600ms debounce window.
-      let flattenedDataUrl: string | undefined
-      try { flattenedDataUrl = canvasRef.current.toDataURL() } catch { /* stage unavailable */ }
-      pendingAnnotationSave.current = { historyId, objects, flattenedDataUrl }
+      const objects = canvasRef.current.getObjects() as AnnotationObject[]
+      // Stash JSON now; defer the expensive full-resolution rasterisation to
+      // the debounce callback so we don't flatten the whole stage on every
+      // stroke commit. The unmount flush below may run before this fires and
+      // sends JSON-only (flattenedDataUrl undefined) — that's fine, the next
+      // action refreshes the sidecar.
+      pendingAnnotationSave.current = { historyId, objects, flattenedDataUrl: undefined }
       if (annotationSaveTimer.current) clearTimeout(annotationSaveTimer.current)
       annotationSaveTimer.current = setTimeout(() => {
+        // Rasterise inside the debounce window — the stage is still alive here.
+        try { if (canvasRef.current && pendingAnnotationSave.current) pendingAnnotationSave.current.flattenedDataUrl = canvasRef.current.toDataURL() } catch { /* stage unavailable */ }
         const pending = pendingAnnotationSave.current
         pendingAnnotationSave.current = null
         annotationSaveTimer.current = null
@@ -771,7 +775,6 @@ export default function Editor() {
                       setHistoryId(item.id)
                       setInitialAnnotations(item.annotations)
                       userEditedRef.current = false
-                      baselineObjectsLenRef.current = item.annotations?.length ?? 0
                       resetForNewImage(dataUrl)
                     }}
                   >

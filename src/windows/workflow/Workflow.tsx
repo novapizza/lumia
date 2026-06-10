@@ -37,7 +37,7 @@ export default function Workflow() {
       const savedId = s?.activeWorkflowId ?? ''
       const valid = t?.some(tmpl => tmpl.id === savedId)
       setActiveId(valid ? savedId : 'builtin-r2')
-      setGdriveConnected(!!s?.googleDriveRefreshToken)
+      setGdriveConnected(!!s?.googleDriveConnected)
     })
   }, [])
 

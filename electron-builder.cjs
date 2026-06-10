@@ -51,6 +51,10 @@ module.exports = {
     { from: 'resources/icons/png/icon.png', to: 'icons/png/icon.png' },
     { from: 'resources/icon.png', to: 'icon.png' },
     { from: 'resources/picker.html', to: 'picker.html' },
+    // Tesseract.js OCR model — shipped so the fallback works OFFLINE. Without
+    // this, packaged builds fetch the ~12 MB model from a CDN and fail with no
+    // network. ocr.ts points tesseract.js's langPath at process.resourcesPath.
+    { from: 'eng.traineddata', to: 'eng.traineddata' },
     // macOS Swift helpers — looked up at runtime via process.resourcesPath.
     // CI compiles them as universal (arm64 + x86_64) before packaging via
     // build/compile-mac-helpers.sh. The same script is what local devs run.

@@ -95,6 +95,16 @@ export type R2UploadInput =
   | { dataUrl: string }
   | { buffer: Buffer; contentType: string; ext: string; keyPrefix?: string }
 
+// Decode an image data URL, deriving content-type + extension from the actual
+// `data:image/<type>` prefix (png/jpeg/webp) rather than assuming PNG — a JPEG
+// dataUrl was previously stored with a .png key and image/png content-type.
+function decodeImageDataUrl(dataUrl: string): { buffer: Buffer; contentType: string; ext: string } {
+  const mime = /^data:(image\/(png|jpeg|webp))/.exec(dataUrl)?.[1] ?? 'image/png'
+  const ext = mime === 'image/jpeg' ? 'jpg' : mime === 'image/webp' ? 'webp' : 'png'
+  const base64 = dataUrl.replace(/^data:image\/\w+;base64,/, '')
+  return { buffer: Buffer.from(base64, 'base64'), contentType: mime, ext }
+}
+
 export async function uploadToR2(
   input: string | R2UploadInput,
   accountId: string,
@@ -113,15 +123,9 @@ export async function uploadToR2(
   let ext: string
   let keyPrefix = 'captures'
   if (typeof input === 'string') {
-    const base64 = input.replace(/^data:image\/\w+;base64,/, '')
-    buffer = Buffer.from(base64, 'base64')
-    contentType = 'image/png'
-    ext = 'png'
+    ({ buffer, contentType, ext } = decodeImageDataUrl(input))
   } else if ('dataUrl' in input) {
-    const base64 = input.dataUrl.replace(/^data:image\/\w+;base64,/, '')
-    buffer = Buffer.from(base64, 'base64')
-    contentType = 'image/png'
-    ext = 'png'
+    ({ buffer, contentType, ext } = decodeImageDataUrl(input.dataUrl))
   } else {
     buffer = input.buffer
     contentType = input.contentType

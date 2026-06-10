@@ -1,5 +1,5 @@
 import { Notification, nativeImage, app } from 'electron'
-import { writeFileSync } from 'fs'
+import { writeFileSync, unlinkSync } from 'fs'
 import { join } from 'path'
 import { randomUUID } from 'crypto'
 
@@ -15,7 +15,30 @@ export interface NotifyOptions {
    *  toastXml notifications). Errors are swallowed so a bad handler
    *  can't crash the main process. */
   onClick?: () => void
+  /** Stable id encoded into the Windows toast `launch` URI so a click in
+   *  Action Center routes to THIS toast's target (e.g. a history item) even
+   *  when newer toasts have since latched their own callback. Parsed back out
+   *  in the `second-instance` handler. */
+  launchId?: string
 }
+
+// Temp hero-image PNGs accumulate in %TEMP% — Windows does NOT auto-purge it
+// (only opt-in Storage Sense does). Track what we write and bound it: evict +
+// unlink the oldest beyond the cap, and clean everything on quit. Cap mirrors
+// the live-notification ring since older images aren't needed once their toast
+// ages out of Action Center.
+const tempImagePaths: string[] = []
+function trackTempImage(p: string): void {
+  tempImagePaths.unshift(p)
+  while (tempImagePaths.length > MAX_LIVE_NOTIFICATIONS) {
+    const old = tempImagePaths.pop()
+    if (old) { try { unlinkSync(old) } catch { /* ignore */ } }
+  }
+}
+app.on('will-quit', () => {
+  for (const p of tempImagePaths) { try { unlinkSync(p) } catch { /* ignore */ } }
+  tempImagePaths.length = 0
+})
 
 const DEFAULT_TITLE = 'Lumia'
 // Windows Toast hero image renders well at these bounds — anything
@@ -104,7 +127,7 @@ export function showNotification(opts: NotifyOptions): void {
 
   try {
     if (useToastXml && imagePath) {
-      const xml = buildToastXml(title, opts.body, imagePath)
+      const xml = buildToastXml(title, opts.body, imagePath, opts.launchId)
       const n = new Notification({ toastXml: xml })
       wire(n)
       // If WinRT rejects the XML (bad AUMID, malformed path, etc.), fall
@@ -124,9 +147,9 @@ export function showNotification(opts: NotifyOptions): void {
   } catch { /* silent */ }
 }
 
-// Resolve a usable on-disk image path. If we're given an inline data URL
-// we decode → optionally downscale → write to the temp dir; the OS
-// recycles that directory on its own so we don't track cleanup.
+// Resolve a usable on-disk image path. If we're given an inline data URL we
+// decode → optionally downscale → write to the temp dir, and track that temp
+// file so it gets cleaned up (Windows does not recycle %TEMP% on its own).
 function prepareImagePath(dataUrl?: string, filePath?: string): string | undefined {
   try {
     if (filePath) return filePath
@@ -140,6 +163,7 @@ function prepareImagePath(dataUrl?: string, filePath?: string): string | undefin
     const buf = img.toPNG()
     const tempPath = join(app.getPath('temp'), `lumia-notif-${randomUUID()}.png`)
     writeFileSync(tempPath, buf)
+    trackTempImage(tempPath)
     return tempPath
   } catch {
     return undefined
@@ -158,14 +182,16 @@ function prepareImagePath(dataUrl?: string, filePath?: string): string | undefin
 // dev), which our registered scheme handler resolves by spawning
 // electron — that hits our single-instance lock and replays the pending
 // notification click.
-function buildToastXml(title: string, body: string, imagePath: string): string {
+function buildToastXml(title: string, body: string, imagePath: string, launchId?: string): string {
   // Windows WinRT toasts want each path segment percent-encoded. The
   // easiest way to get that right across drive letters and UUIDs is to
   // pass the slashed path through `encodeURI`, which preserves the
   // `file:///` scheme but escapes spaces / unicode / the like.
   const src = encodeURI(`file:///${imagePath.replace(/\\/g, '/')}`)
   const protocol = app.isPackaged ? 'lumia' : 'lumia-dev'
-  const launch = `${protocol}:notify`
+  // Encode the per-toast id so an Action Center click on an OLDER toast routes
+  // to ITS target rather than replaying the most-recent latched callback.
+  const launch = launchId ? `${protocol}:notify?id=${encodeURIComponent(launchId)}` : `${protocol}:notify`
   return [
     `<toast launch="${escapeXml(launch)}" activationType="protocol">`,
       '<visual>',

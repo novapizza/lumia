@@ -34,7 +34,10 @@ async function ocrMacOS(imageBuffer: Buffer): Promise<OcrWord[]> {
     const { width, height } = img.getSize()
 
     const output = await new Promise<string>((resolve, reject) => {
-      execFile(binaryPath, [tmpPath], { timeout: 30000 }, (err, stdout, stderr) => {
+      // maxBuffer bumped from Node's 1 MB default: a dense 4K screenshot's
+      // JSON stdout (one entry per recognised word) can easily exceed 1 MB
+      // and would otherwise abort with ERR_CHILD_PROCESS_STDIO_MAXBUFFER.
+      execFile(binaryPath, [tmpPath], { timeout: 30000, maxBuffer: 32 * 1024 * 1024 }, (err, stdout, stderr) => {
         if (err) reject(new Error(stderr || err.message))
         else resolve(stdout)
       })
@@ -60,8 +63,51 @@ async function ocrMacOS(imageBuffer: Buffer): Promise<OcrWord[]> {
 
 // ── Windows: WinRT OCR ──────────────────────────────────────────
 
+// Thrown when the native OCR backend can't be loaded at all (module/binary
+// missing). Distinct from a per-image runtime failure: a load-time error
+// means native OCR is permanently unavailable for this process, whereas a
+// runtime error should only fall back for the one call that failed.
+class NativeOcrUnavailableError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'NativeOcrUnavailableError'
+  }
+}
+
+// `node-windows-ocr` is an OPTIONAL, UNBUNDLED dependency — it is not in
+// package.json and won't be present in most installs (it's marked `external`
+// in the main rollup config, so the build never tries to bundle it). Load it
+// through this helper so a missing module is reported once as a load-time
+// unavailability (NativeOcrUnavailableError) rather than crashing the OCR
+// path; the caller then latches native OCR off and uses the Tesseract.js
+// fallback. Typed loosely on purpose — the module ships no types and isn't
+// installed, so we describe only the `recognize` shape we actually use.
+interface WindowsOcrModule {
+  recognize(path: string): Promise<{
+    lines?: Array<{
+      words: Array<{
+        text: string
+        rect: { x: number; y: number; width: number; height: number }
+        confidence?: number
+      }>
+    }>
+  }>
+}
+let _winOcrModule: WindowsOcrModule | null = null
+async function loadWindowsOcr(): Promise<WindowsOcrModule> {
+  if (_winOcrModule) return _winOcrModule
+  try {
+    _winOcrModule = (await import('node-windows-ocr')) as unknown as WindowsOcrModule
+    return _winOcrModule
+  } catch (err) {
+    throw new NativeOcrUnavailableError(
+      `node-windows-ocr unavailable (optional dependency not installed): ${(err as Error)?.message ?? err}`
+    )
+  }
+}
+
 async function ocrWindows(imageBuffer: Buffer): Promise<OcrWord[]> {
-  const { recognize } = await import('node-windows-ocr')
+  const { recognize } = await loadWindowsOcr()
 
   const tmpPath = join(tmpdir(), `lumia-ocr-${randomUUID()}.png`)
   writeFileSync(tmpPath, imageBuffer)
@@ -96,9 +142,67 @@ async function ocrWindows(imageBuffer: Buffer): Promise<OcrWord[]> {
 
 // ── Tesseract.js fallback ───────────────────────────────────────
 
+// `eng.traineddata` is shipped locally so the fallback works OFFLINE — without
+// langPath/cachePath set, tesseract.js fetches the ~12 MB model from a CDN and
+// fails when there's no network. In production the file is copied to
+// process.resourcesPath via electron-builder's extraResources; in dev it sits
+// at the repo root next to package.json.
+//   - langPath:  dir that CONTAINS eng.traineddata (loaded from disk, not CDN)
+//   - cachePath: writable dir for tesseract's runtime cache
+//   - gzip:false: the shipped eng.traineddata is a raw (un-gzipped) model
+function getTraineddataDir(): string {
+  // Dev: repo root is two levels up from the built out/main dir.
+  return app.isPackaged ? process.resourcesPath : resolve(__dirname, '..', '..')
+}
+
+// A fresh Tesseract worker costs a worker_threads spawn + WASM init +
+// traineddata load (~hundreds of ms) — far too much to pay on every scan.
+// We keep a lazily-created singleton, reuse it across calls, recreate it on
+// error, and terminate it on app quit. A single in-flight init promise guards
+// against concurrent createWorker races.
+type TesseractWorker = Awaited<ReturnType<typeof import('tesseract.js').createWorker>>
+let _tessWorker: TesseractWorker | null = null
+let _tessWorkerInit: Promise<TesseractWorker> | null = null
+
+async function getTesseractWorker(): Promise<TesseractWorker> {
+  if (_tessWorker) return _tessWorker
+  if (_tessWorkerInit) return _tessWorkerInit
+
+  _tessWorkerInit = (async () => {
+    const Tesseract = await import('tesseract.js')
+    const worker = await Tesseract.createWorker('eng', undefined, {
+      langPath: getTraineddataDir(),
+      cachePath: app.getPath('userData'),
+      gzip: false,
+    })
+    _tessWorker = worker
+    return worker
+  })()
+
+  try {
+    return await _tessWorkerInit
+  } catch (err) {
+    // Init failed — clear the cached worker so the next call retries cleanly.
+    _tessWorker = null
+    throw err
+  } finally {
+    _tessWorkerInit = null
+  }
+}
+
+async function terminateTesseractWorker(): Promise<void> {
+  const worker = _tessWorker
+  _tessWorker = null
+  if (worker) {
+    try { await worker.terminate() } catch { /* ignore */ }
+  }
+}
+
+// Tear the singleton worker down on quit so we don't leak the worker thread.
+app.on('will-quit', () => { void terminateTesseractWorker() })
+
 async function ocrTesseract(imageBuffer: Buffer): Promise<OcrWord[]> {
-  const Tesseract = await import('tesseract.js')
-  const worker = await Tesseract.createWorker('eng')
+  const worker = await getTesseractWorker()
 
   try {
     // v7: must pass { blocks: true } as 3rd arg to get word-level bboxes
@@ -131,8 +235,11 @@ async function ocrTesseract(imageBuffer: Buffer): Promise<OcrWord[]> {
     }
 
     return words
-  } finally {
-    await worker.terminate()
+  } catch (err) {
+    // A worker can wedge after an internal error — drop it so the next scan
+    // spins up a fresh one instead of reusing the broken instance.
+    await terminateTesseractWorker()
+    throw err
   }
 }
 
@@ -148,12 +255,17 @@ async function checkNativeOcr(): Promise<boolean> {
       getVisionBinaryPath() // throws if binary not found
       nativeAvailable = true
     } else if (process.platform === 'win32') {
-      await import('node-windows-ocr')
+      // node-windows-ocr is optional/unbundled — loadWindowsOcr throws a
+      // NativeOcrUnavailableError (caught below, logged once) when absent.
+      await loadWindowsOcr()
       nativeAvailable = true
     } else {
       nativeAvailable = false
     }
-  } catch {
+  } catch (err) {
+    // Logged once: this is the single load-time check, gated by the
+    // `nativeAvailable !== null` short-circuit above, so it won't spam.
+    console.warn('[OCR] Native OCR unavailable, using Tesseract.js fallback:', (err as Error)?.message ?? err)
     nativeAvailable = false
   }
   return nativeAvailable
@@ -171,8 +283,16 @@ export async function runOcr(imageBuffer: Buffer): Promise<OcrWord[]> {
       if (process.platform === 'darwin') return await ocrMacOS(imageBuffer)
       if (process.platform === 'win32') return await ocrWindows(imageBuffer)
     } catch (err) {
-      console.warn('[OCR] Native OCR failed, falling back to Tesseract.js:', err)
-      nativeAvailable = false
+      // Only LOAD-TIME failures (module/binary missing) permanently disable
+      // native OCR. A per-image RUNTIME failure (timeout on a huge image,
+      // maxBuffer overflow, one malformed JSON line) falls back to Tesseract
+      // for THIS call but keeps native OCR enabled for the next one.
+      if (err instanceof NativeOcrUnavailableError) {
+        console.warn('[OCR] Native OCR unavailable, switching to Tesseract.js:', err.message)
+        nativeAvailable = false
+      } else {
+        console.warn('[OCR] Native OCR failed for this image, falling back to Tesseract.js for this call:', err)
+      }
     }
   }
 

@@ -28,6 +28,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // History
   getHistory: () => ipcRenderer.invoke('history:get'),
   deleteHistoryItem: (id: string) => ipcRenderer.invoke('history:delete', id),
+  deleteHistoryItems: (ids: string[]) => ipcRenderer.invoke('history:deleteMany', ids),
   openHistoryFile: (filePath: string) => ipcRenderer.invoke('history:openFile', filePath),
   addHistoryItem: (item: unknown) => ipcRenderer.invoke('history:addCapture', item),
   readHistoryFile: (filePath: string) => ipcRenderer.invoke('history:readAsDataUrl', filePath),
@@ -165,12 +166,18 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Video recording — RecorderHost & Toolbar
   recorderGetTarget: () => ipcRenderer.invoke('recorder:get-target'),
   recorderGetWatermark: () => ipcRenderer.invoke('recorder:get-watermark'),
-  recorderReady: (ok: boolean, error?: string) => ipcRenderer.invoke('recorder:ready', ok, error),
+  recorderReady: (ok: boolean, error?: string, micAvailable?: boolean) =>
+    ipcRenderer.invoke('recorder:ready', ok, error, micAvailable),
   recorderStateChange: (state: string, payload?: unknown) =>
     ipcRenderer.invoke('recorder:state', state, payload),
   recorderTick: (elapsedMs: number) => ipcRenderer.invoke('recorder:tick', elapsedMs),
-  recorderSaveBlob: (buffer: ArrayBuffer, thumbnailDataUrl: string, durationMs: number) =>
-    ipcRenderer.invoke('recorder:save-blob', buffer, thumbnailDataUrl, durationMs),
+  // Streamed save — the finished webm is forwarded to disk in bounded slices
+  // (begin → chunk* → end) so a long recording never materializes one
+  // contiguous ArrayBuffer or blows the structured-clone limit over IPC.
+  recorderSaveBegin: () => ipcRenderer.invoke('recorder:save-begin'),
+  recorderSaveChunk: (chunk: ArrayBuffer) => ipcRenderer.invoke('recorder:save-chunk', chunk),
+  recorderSaveEnd: (thumbnailDataUrl: string, durationMs: number) =>
+    ipcRenderer.invoke('recorder:save-end', thumbnailDataUrl, durationMs),
   onRecorderBegin: (cb: () => void) => ipcRenderer.on('recorder:begin', cb),
   onRecorderPause: (cb: () => void) => ipcRenderer.on('recorder:pause', cb),
   onRecorderResume: (cb: () => void) => ipcRenderer.on('recorder:resume', cb),

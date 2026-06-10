@@ -1,25 +1,16 @@
-import { useState, useEffect } from 'react'
+import { useMemo } from 'react'
 
 /**
- * Reads a local file via IPC and returns a blob URL that supports Range requests
- * (required by <video> for seeking/buffering). Revokes the blob URL on cleanup.
+ * Returns a `lumia-media://` URL that streams the given local file into a
+ * <video> element with Range support (required for seeking/buffering). The
+ * main-process protocol handler proxies the request to the file via net.fetch,
+ * so the renderer never reads the whole recording into memory as a Blob (a
+ * multi-hundred-MB recording would otherwise OOM both processes) — and there's
+ * no object URL to leak.
  */
 export function useLocalVideoUrl(filePath: string | undefined | null): string {
-  const [blobUrl, setBlobUrl] = useState('')
-
-  useEffect(() => {
-    if (!filePath) return
-    let url = ''
-    window.electronAPI?.readLocalFile(filePath).then(buffer => {
-      const blob = new Blob([buffer], { type: 'video/webm' })
-      url = URL.createObjectURL(blob)
-      setBlobUrl(url)
-    })
-    return () => {
-      if (url) URL.revokeObjectURL(url)
-      setBlobUrl('')
-    }
-  }, [filePath])
-
-  return blobUrl
+  return useMemo(
+    () => (filePath ? `lumia-media://stream/?path=${encodeURIComponent(filePath)}` : ''),
+    [filePath],
+  )
 }

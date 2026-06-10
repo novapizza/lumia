@@ -63,6 +63,9 @@ const PRINT_SCREEN_DEFAULT = process.platform === 'darwin'
 
 const store = new Store<AppSettings>({
   name: 'settings',
+  // A corrupted settings.json must not crash the app at module-import time
+  // (this store is read on import below) — reset to defaults instead.
+  clearInvalidConfig: true,
   defaults: {
     defaultSavePath: join(homedir(), 'Downloads'),
     theme: 'system',

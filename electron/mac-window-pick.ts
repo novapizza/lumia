@@ -71,7 +71,14 @@ function startHelper(): boolean {
     console.warn('[mac-window-pick] stderr:', chunk.toString().trim())
   })
 
+  // Capture the child this handler belongs to. The write-failure path in
+  // pump() can synchronously kill + null `proc` and a fresh helper may spawn
+  // before this child's 'exit' fires; without the identity guard, cleanup
+  // would then null the NEW proc, orphaning the live child and triggering a
+  // respawn. Bail unless the module-level proc is still the one we registered.
+  const p = proc
   const cleanup = () => {
+    if (proc !== p) return
     proc = null
     // Resolve any outstanding handlers as null so callers don't hang.
     for (const h of lineQueue) h('null')
@@ -82,8 +89,8 @@ function startHelper(): boolean {
       pendingRequest = null
     }
   }
-  proc.on('exit', cleanup)
-  proc.on('error', err => {
+  p.on('exit', cleanup)
+  p.on('error', err => {
     console.error('[mac-window-pick] helper error:', err)
     cleanup()
   })

@@ -14,10 +14,13 @@ const PATTERNS: PatternDef[] = [
     category: 'email',
     pattern: /[a-zA-Z0-9._%+\-]+\s*@\s*[a-zA-Z0-9\-]+(?:\s*\.\s*[a-zA-Z0-9\-]+)+/g
   },
-  // US phone: (xxx) xxx-xxxx, +1 xxx-xxx-xxxx
+  // US phone: (xxx) xxx-xxxx, +1 xxx-xxx-xxxx. Word boundaries + a required
+  // separator/paren in the bare 10-digit form keep this from matching inside
+  // long digit runs (timestamps, IDs, hashes), which the old all-separators-
+  // optional pattern did.
   {
     category: 'phone',
-    pattern: /(?:\+?1[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)\d{3}[-.\s]?\d{4}/g
+    pattern: /(?:\+?1[-.\s])?(?:\(\d{3}\)[-.\s]?|\d{3}[-.\s])\d{3}[-.\s]?\d{4}\b/g
   },
   // Vietnamese phone: 0xxx xxx xxx, +84 xxx xxx xxx
   {
@@ -147,10 +150,47 @@ interface WordSpan {
 }
 
 /**
- * Join OCR words into a single string while maintaining a mapping
- * from character positions back to word indices + bboxes.
- * Always separates words with a space — individual regex patterns
- * use \s* to tolerate OCR-introduced splits within tokens.
+ * Decide whether two consecutive OCR words are halves of a single token that
+ * the engine split mid-line, rather than two genuinely separate words. OCR
+ * routinely chops a long opaque token (JWT, API key) at an internal visual
+ * gap into two "words" sitting on the same baseline almost touching. The
+ * long-token patterns use `\b...\b` with no whitespace tolerance, so a token
+ * split this way would never match — the headline auto-blur false negative.
+ *
+ * Heuristic (intentionally conservative to avoid gluing real prose, where
+ * word spaces are wide):
+ *   - same line: vertical ranges overlap by most of the smaller height, and
+ *   - horizontally adjacent: the gap between them is a small fraction of the
+ *     line height (a real inter-word space is far wider than a token's
+ *     internal split).
+ * When both hold we concatenate the two words with NO separator so the strict
+ * pattern sees the reassembled token; otherwise we fall back to a space.
+ * resolveBbox keys off per-word char ranges, so omitting the separator keeps
+ * the offset→bbox mapping correct (the spans simply become contiguous).
+ */
+function isSplitToken(a: OcrWord, b: OcrWord): boolean {
+  const ab = a.bbox, bb = b.bbox
+  if (ab.height <= 0 || bb.height <= 0) return false
+  // Same line: vertical overlap covers most of the shorter word's height.
+  const overlapTop = Math.max(ab.y, bb.y)
+  const overlapBottom = Math.min(ab.y + ab.height, bb.y + bb.height)
+  const vOverlap = overlapBottom - overlapTop
+  if (vOverlap < 0.6 * Math.min(ab.height, bb.height)) return false
+  // b must follow a horizontally (reading order). Allow a tiny negative gap
+  // for bboxes that slightly overlap.
+  const gap = bb.x - (ab.x + ab.width)
+  if (gap < -0.25 * ab.height) return false
+  // Glue only when the gap is far narrower than a real word space (~half the
+  // line height). A genuine space leaves a much wider gap.
+  return gap <= 0.35 * Math.min(ab.height, bb.height)
+}
+
+/**
+ * Join OCR words into a single string while maintaining a mapping from
+ * character positions back to word indices + bboxes. Words are space-separated
+ * by default, EXCEPT consecutive halves of an engine-split token (see
+ * isSplitToken) which are concatenated with no separator so reassembled tokens
+ * match the strict long-token patterns.
  */
 function buildTextWithMapping(words: OcrWord[]): { text: string; spans: WordSpan[] } {
   const spans: WordSpan[] = []
@@ -161,7 +201,11 @@ function buildTextWithMapping(words: OcrWord[]): { text: string; spans: WordSpan
     text += words[i].text
     const charEnd = text.length
     spans.push({ wordIndex: i, charStart, charEnd })
-    text += ' ' // space separator
+    // Separator before the NEXT word: none if it's a split-token continuation
+    // on the same line, otherwise a space.
+    if (i < words.length - 1) {
+      text += isSplitToken(words[i], words[i + 1]) ? '' : ' '
+    }
   }
 
   return { text, spans }

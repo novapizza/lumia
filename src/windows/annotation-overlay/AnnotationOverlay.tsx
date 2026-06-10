@@ -142,16 +142,21 @@ export default function AnnotationOverlay() {
     return { ...s, x2: x, y2: y }
   }
 
-  /** Bake a (dx, dy) offset into a shape's underlying coordinates so the
-   *  next React render of the data alone reproduces the dragged position
-   *  without relying on the Konva node's transient x/y. */
-  const translateShape = (s: Shape, dx: number, dy: number): Shape => {
+  /** Bake a Konva node's transient transform — drag offset (dx, dy) plus
+   *  resize scale (sx, sy) — into a shape's underlying coordinates so the next
+   *  React render of the data alone reproduces both the moved AND resized
+   *  geometry without relying on the node's transient x/y/scale. The group has
+   *  no x/y prop (its children carry absolute coords), so node.x()/y() is a
+   *  pure offset and node.scaleX()/Y() multiplies the geometry about the group
+   *  origin: absolute = offset + coord * scale. With sx=sy=1 this degenerates
+   *  to a plain translate. */
+  const bakeShape = (s: Shape, dx: number, dy: number, sx = 1, sy = 1): Shape => {
     if (s.kind === 'free') {
-      return { ...s, points: s.points.map((p, i) => i % 2 === 0 ? p + dx : p + dy) }
+      return { ...s, points: s.points.map((p, i) => i % 2 === 0 ? dx + p * sx : dy + p * sy) }
     }
-    if (s.kind === 'rect') return { ...s, x: s.x + dx, y: s.y + dy }
-    if (s.kind === 'ellipse') return { ...s, x: s.x + dx, y: s.y + dy }
-    return { ...s, x1: s.x1 + dx, y1: s.y1 + dy, x2: s.x2 + dx, y2: s.y2 + dy }
+    if (s.kind === 'rect') return { ...s, x: dx + s.x * sx, y: dy + s.y * sy, w: s.w * sx, h: s.h * sy }
+    if (s.kind === 'ellipse') return { ...s, x: dx + s.x * sx, y: dy + s.y * sy, rx: s.rx * sx, ry: s.ry * sy }
+    return { ...s, x1: dx + s.x1 * sx, y1: dy + s.y1 * sy, x2: dx + s.x2 * sx, y2: dy + s.y2 * sy }
   }
 
   const onPointerDown = (e: Konva.KonvaEventObject<MouseEvent | TouchEvent>) => {
@@ -309,11 +314,31 @@ export default function AnnotationOverlay() {
           const node = e.target
           const dx = node.x()
           const dy = node.y()
-          if (dx === 0 && dy === 0) return
-          setShapes(prev => prev.map(p => p.id === s.id ? translateShape(p, dx, dy) : p))
-          // Reset the Group's position so the next render (which already
-          // bakes the offset into the data) doesn't double-apply it.
+          const sx = node.scaleX()
+          const sy = node.scaleY()
+          if (dx === 0 && dy === 0 && sx === 1 && sy === 1) return
+          // Pass the scale through (rather than assuming 1) so a drag that
+          // follows a resize doesn't bake the wrong size.
+          setShapes(prev => prev.map(p => p.id === s.id ? bakeShape(p, dx, dy, sx, sy) : p))
+          // Reset the Group's transform so the next render (which already bakes
+          // offset + scale into the data) doesn't double-apply it.
           node.position({ x: 0, y: 0 })
+          node.scale({ x: 1, y: 1 })
+        }}
+        onTransformEnd={(e) => {
+          // Transformer mutates the group's scaleX/scaleY (and may shift its
+          // position from a non-origin anchor). Bake both into the shape data
+          // and reset the node, otherwise the next onDragEnd would read a
+          // position that includes the transform offset and apply it to
+          // unscaled coords, making the shape jump.
+          const node = e.target
+          const dx = node.x()
+          const dy = node.y()
+          const sx = node.scaleX()
+          const sy = node.scaleY()
+          setShapes(prev => prev.map(p => p.id === s.id ? bakeShape(p, dx, dy, sx, sy) : p))
+          node.position({ x: 0, y: 0 })
+          node.scale({ x: 1, y: 1 })
         }}
       >
         {inner}
@@ -376,7 +401,15 @@ export default function AnnotationOverlay() {
           <Group
             x={deleteHandle.x + 12}
             y={deleteHandle.y - 12}
-            onClick={(e) => { e.cancelBubble = true; deleteSelected() }}
+            onClick={(e) => {
+              e.cancelBubble = true
+              // Reset the cursor here — clicking the X destroys the group
+              // before Konva fires mouseLeave, so 'pointer' would otherwise
+              // stick. (Overlay pass-through reverts via the selection effect
+              // once deleteSelected clears selectedId.)
+              document.body.style.cursor = 'default'
+              deleteSelected()
+            }}
             onMouseEnter={() => {
               document.body.style.cursor = 'pointer'
               // X handle floats above-right of the shape — outside the

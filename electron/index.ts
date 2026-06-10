@@ -1,17 +1,16 @@
-import { app, BrowserWindow, ipcMain, shell, dialog, nativeImage, clipboard, screen, Menu, nativeTheme } from 'electron'
+import { app, BrowserWindow, ipcMain, shell, dialog, nativeImage, clipboard, screen, Menu, nativeTheme, protocol, net, powerMonitor } from 'electron'
 import { join, dirname } from 'path'
 import fs from 'fs/promises'
-import { constants as fsConstants } from 'fs'
 import { setupCapture, ORIGINALS_DIR, getFrozenBgrForDisplay, prewarmDesktopCapturer } from './capture'
 import { getIccFromPng, tagPngWithIcc } from './png-icc'
-import { setupVideo } from './video'
+import { setupVideo, isRecordingActive } from './video'
 import { uploadToR2 } from './uploaders/r2'
 import {
-  uploadToGoogleDrive,
   refreshGoogleToken,
   revokeGoogleToken,
   exchangeGoogleAuthCode,
 } from './uploaders/googledrive'
+import { uploadFileBufferToDrive } from './google-drive-service'
 import { localTimestamp } from './utils'
 import { registerOverlayHwnd, unregisterOverlayHwnd, disableDwmTransitions } from './native-input'
 import { setupHotkeys, teardownHotkeys, getHotkeys, saveHotkeys, resetHotkeys, defaultHotkeys, type HotkeyConfig } from './hotkeys'
@@ -52,6 +51,18 @@ if (process.platform === 'win32') {
 // them via HTTP. When the cap fills, Chromium evicts LRU; recently-viewed
 // wallpapers stay warm, ancient ones get reclaimed automatically.
 app.commandLine.appendSwitch('disk-cache-size', String(80 * 1024 * 1024))
+
+// Privileged scheme for streaming local recordings into <video> without
+// reading the whole file into renderer memory as a Blob. Chromium's media
+// stack issues HTTP Range requests against this scheme; the handler (wired in
+// whenReady) proxies them to the file via net.fetch, which supports ranges.
+// Must be registered before app 'ready', i.e. here at module top level.
+protocol.registerSchemesAsPrivileged([
+  {
+    scheme: 'lumia-media',
+    privileges: { standard: true, secure: true, stream: true, supportFetchAPI: true, bypassCSP: true },
+  },
+])
 
 const isDev = !app.isPackaged
 
@@ -119,16 +130,29 @@ export function markQuitting() { isQuitting = true }
 /** Schedule a quit-and-install for an already-downloaded update, but only if
  *  the window stays hidden for the full grace window. Called from
  *  `update-downloaded` and from the main window's 'hide' event. */
+/** True when restarting now would destroy in-progress work the user can't get
+ *  back. The main window is hidden for the entire duration of a recording and
+ *  while the capture overlay is up, so visibility alone is not enough — a
+ *  quit-and-install here would silently drop a recording mid-capture. */
+function isAppBusy(): boolean {
+  if (isRecordingActive()) return true
+  if (overlayWindows.size > 0) return true
+  return false
+}
+
 function scheduleAutoInstall() {
   if (autoInstallTimer) clearTimeout(autoInstallTimer)
   autoInstallTimer = null
   if (!updateDownloaded) return
   if (mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible()) return
+  if (isAppBusy()) return
   autoInstallTimer = setTimeout(() => {
     autoInstallTimer = null
-    // Re-check: user may have surfaced the window during the grace window.
+    // Re-check: user may have surfaced the window or started a recording /
+    // capture during the grace window.
     if (!updateDownloaded) return
     if (mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible()) return
+    if (isAppBusy()) return
     console.log('[autoUpdater] grace period elapsed with window hidden — installing update')
     updateDownloaded = false
     isQuitting = true
@@ -683,7 +707,11 @@ export function createOverlayWindows(): Map<number, BrowserWindow> {
     }
   }
 
-  // Poll cursor position to switch active overlay when mouse moves between displays
+  // Poll cursor position to switch active overlay when mouse moves between
+  // displays. Pointless with a single display — the active overlay is already
+  // pinned at creation and can never change — so skip the 10/s wakeups on the
+  // most common hardware config.
+  if (allDisplays.length <= 1) return overlayWindows
   overlayPollTimer = setInterval(() => {
     if (overlayDrawingInProgress) return // don't switch while user is drawing
 
@@ -929,7 +957,13 @@ app.whenReady().then(async () => {
   // state must update manually by running the new installer with admin.
   let canWriteInstallDir = false
   try {
-    await fs.access(dirname(app.getPath('exe')), fsConstants.W_OK)
+    // fs.access(W_OK) does NOT consult Windows ACLs — it only checks the
+    // read-only attribute, so it reports a Program Files dir as writable for a
+    // non-admin user (exactly the case this guard exists for). Probe by
+    // actually creating and deleting a temp file in the install dir.
+    const probe = join(dirname(app.getPath('exe')), `.lumia-write-probe-${process.pid}`)
+    await fs.writeFile(probe, '')
+    await fs.unlink(probe).catch(() => { /* best-effort cleanup */ })
     canWriteInstallDir = true
   } catch { /* not writable — auto-update disabled */ }
 
@@ -1031,9 +1065,16 @@ app.whenReady().then(async () => {
   // Prune unlinks the associated files on disk too (shared with the manual
   // delete path in HistoryStore), so old captures don't sit around orphaned.
   const runHistoryPrune = async () => {
-    const days = getSettings().historyRetentionDays
-    const removed = await historyStore.pruneOlderThan(days)
-    if (removed > 0) console.log(`[history] pruned ${removed} item(s) older than ${days} day(s)`)
+    try {
+      const days = getSettings().historyRetentionDays
+      const removed = await historyStore.pruneOlderThan(days)
+      if (removed > 0) console.log(`[history] pruned ${removed} item(s) older than ${days} day(s)`)
+    } catch (err) {
+      // Fire-and-forget from boot, an hourly timer, and settings:set — a sync
+      // electron-store write can throw (EPERM from AV file-locking on Windows),
+      // which would otherwise surface as a recurring unhandled rejection.
+      console.error('[history] prune failed', err)
+    }
   }
   runHistoryPrune()
   const HISTORY_PRUNE_INTERVAL_MS = 60 * 60 * 1000
@@ -1059,6 +1100,14 @@ app.whenReady().then(async () => {
     // ENOENT ignored) and then mutates history.json.
     return historyStore.delete(id)
   })
+  // Bulk delete in a single read-filter-write. The renderer previously fired
+  // N concurrent history:delete calls, which all snapshotted the same array
+  // and clobbered each other (last-writer-wins) — deleted rows resurrected as
+  // "Missing" orphans on the next refetch. deleteMany closes that race.
+  ipcMain.handle('history:deleteMany', async (_e, ids: string[]) => {
+    if (!Array.isArray(ids) || ids.length === 0) return 0
+    return historyStore.deleteMany(ids)
+  })
   ipcMain.handle('history:cleanupMissing', async () => {
     const items = historyStore.getAll()
     const { access } = await import('fs/promises')
@@ -1067,7 +1116,9 @@ app.whenReady().then(async () => {
       if (!item.filePath) return
       try { await access(item.filePath) } catch { orphanIds.push(item.id) }
     }))
-    await Promise.all(orphanIds.map(id => historyStore.delete(id)))
+    // Single read-filter-write — the old Promise.all(map(delete)) raced and
+    // left orphans behind.
+    if (orphanIds.length > 0) await historyStore.deleteMany(orphanIds)
     return orphanIds.length
   })
   // Persist the current annotation shapes (and optionally a flattened PNG
@@ -1228,7 +1279,6 @@ app.whenReady().then(async () => {
     }
 
     const settings = getSettings()
-    let token = settings.googleDriveAccessToken
     if (!settings.googleDriveRefreshToken) {
       return { destination: 'google-drive', success: false, error: 'Not connected to Google Drive' }
     }
@@ -1236,36 +1286,22 @@ app.whenReady().then(async () => {
       return { destination: 'google-drive', success: false, error: 'No Drive folder selected — choose one in Settings → Google Drive.' }
     }
 
-    if (Date.now() >= settings.googleDriveTokenExpiresAt - 60_000) {
-      try {
-        const refreshed = await refreshGoogleToken(
-          import.meta.env.MAIN_VITE_GDRIVE_CLIENT_ID,
-          import.meta.env.MAIN_VITE_GDRIVE_CLIENT_SECRET,
-          settings.googleDriveRefreshToken
-        )
-        token = refreshed.accessToken
-        setSetting('googleDriveAccessToken', refreshed.accessToken)
-        setSetting('googleDriveTokenExpiresAt', refreshed.expiresAt)
-      } catch (err) {
-        return { destination: 'google-drive', success: false, error: `Token refresh failed: ${err instanceof Error ? err.message : String(err)}` }
-      }
-    }
-
     const { readFile } = await import('fs/promises')
     const { extname, basename } = await import('path')
     const sourcePath = item.annotatedFilePath ?? item.filePath
-    const buffer = await readFile(sourcePath)
     const ext = extname(sourcePath).replace(/^\./, '').toLowerCase()
     const isVideo = item.type === 'recording'
     const mimeType = isVideo
       ? (ext === 'mp4' ? 'video/mp4' : 'video/webm')
       : (ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : 'image/png')
-    const dataUrl = `data:${mimeType};base64,${buffer.toString('base64')}`
 
-    const res = await uploadToGoogleDrive(dataUrl, token, settings.googleDriveFolderId, {
-      filename: basename(sourcePath),
-      mimeType,
-    })
+    // Pass the raw buffer straight to the resumable uploader — no base64
+    // data-URL intermediary. For a recording that round-trip held the whole
+    // file plus a ~1.33× base64 string in memory and blocked the main thread
+    // on the sync toString('base64'). The service wrapper handles token
+    // refresh (with in-flight dedup + 401 retry) and the default folder.
+    const buffer = await readFile(sourcePath)
+    const res = await uploadFileBufferToDrive(buffer, mimeType, basename(sourcePath))
 
     if (res.success && res.url) {
       clipboard.writeText(res.url)
@@ -1359,7 +1395,18 @@ app.whenReady().then(async () => {
     if (recording) teardownHotkeys()
     else setupHotkeys()
   })
-  ipcMain.handle('settings:get', () => getSettings())
+  ipcMain.handle('settings:get', () => {
+    // Never ship the Google OAuth tokens to the renderer — a renderer
+    // compromise (XSS via rendered content) could exfiltrate the long-lived
+    // refresh token. The renderer only ever needs a connected boolean.
+    const s = getSettings()
+    return {
+      ...s,
+      googleDriveRefreshToken: '',
+      googleDriveAccessToken: '',
+      googleDriveConnected: !!s.googleDriveRefreshToken,
+    }
+  })
   ipcMain.handle('settings:set', (_e, key: keyof AppSettings, value: unknown) => {
     // 'screen' on a single-display system is equivalent to an all-monitors
     // grab, so don't pin it — same one-shot policy as 'all-screen'. Lets
@@ -2070,7 +2117,8 @@ app.whenReady().then(async () => {
     })
   })
 
-  // IPC: Read local file as buffer (for video blob URL playback in renderer)
+  // IPC: Read local file as buffer (legacy fallback; <video> now streams via
+  // the lumia-media:// protocol below instead of buffering the whole file).
   ipcMain.handle('file:read', async (_e, filePath: string) => {
     const { readFile } = await import('fs/promises')
     const { resolve, normalize } = await import('path')
@@ -2078,6 +2126,29 @@ app.whenReady().then(async () => {
     const normalized = resolve(normalize(filePath))
     if (!normalized.startsWith(homedir())) throw new Error('Access denied — path outside home directory')
     return readFile(normalized)
+  })
+
+  // Stream a local recording into <video> with Range support, instead of the
+  // renderer reading the entire file over IPC and holding it as a Blob (a
+  // multi-hundred-MB recording would OOM both processes). The URL shape is
+  // `lumia-media://stream/?path=<encodeURIComponent(absPath)>`. net.fetch of a
+  // file:// URL natively honors the Range header Chromium sends for seeking.
+  protocol.handle('lumia-media', async (request) => {
+    try {
+      const reqUrl = new URL(request.url)
+      const filePath = reqUrl.searchParams.get('path')
+      if (!filePath) return new Response('Missing path', { status: 400 })
+      const { resolve, normalize } = await import('path')
+      const { homedir } = await import('os')
+      const { pathToFileURL } = await import('url')
+      const normalized = resolve(normalize(filePath))
+      // Same homedir sandbox as file:read — never serve arbitrary disk paths.
+      if (!normalized.startsWith(homedir())) return new Response('Forbidden', { status: 403 })
+      return net.fetch(pathToFileURL(normalized).toString())
+    } catch (err) {
+      console.error('[lumia-media] stream failed', err)
+      return new Response('Error', { status: 500 })
+    }
   })
 
   // IPC: Recording state — hide main window before recording starts
@@ -2122,6 +2193,15 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit()
 })
 
+// OS-initiated logout / shutdown / restart. Without this, the before-quit
+// handler above would preventDefault() the Quit Apple Event (macOS) / session
+// end (Windows) and the OS reports "Lumia interrupted shutdown". Mark the quit
+// as ours so before-quit lets it through, then quit for real.
+powerMonitor.on('shutdown', () => {
+  isQuitting = true
+  app.quit()
+})
+
 app.on('will-quit', () => {
   teardownHotkeys()
   destroyTray()
@@ -2144,18 +2224,43 @@ app.on('second-instance', (_e, argv) => {
   // `activationType="protocol"` — the click opens our scheme, spawns
   // electron, and lands on second-instance.
   //
-  // If a notification click is pending, defer the window surfacing to
-  // `openHistoryItemInEditor`. Calling `mainWindow.show()` here would
-  // fire the 'show' listener which clears `mainDismissedByUser`, and the
-  // pending callback would then snapshot `wasDismissed=false` and skip
-  // setting `surfacedFromTray` — making the X-close-to-tray behavior
-  // never trigger.
-  const pending = consumePendingNotificationClick()
-  if (pending) {
+  // Only treat this as a toast click when the relaunch args actually carry our
+  // protocol URL (`activationType="protocol"` → lumia:/lumia-dev:). A plain
+  // duplicate launch (double-clicking the shortcut, a stray --hidden re-fire)
+  // must NOT replay the last toast's callback — otherwise it opens the editor
+  // on the most recent capture as if the toast had been clicked.
+  const toastArg = argv.find(a => a.startsWith('lumia:') || a.startsWith('lumia-dev:'))
+  if (toastArg) {
+    // Deferring the window surfacing to `openHistoryItemInEditor` matters:
+    // calling `mainWindow.show()` here would fire the 'show' listener which
+    // clears `mainDismissedByUser`, so the callback would snapshot
+    // `wasDismissed=false` and skip `surfacedFromTray` — breaking the
+    // X-close-to-tray behavior.
+    //
+    // Prefer the per-toast id baked into the launch URI so clicking an OLDER
+    // Action Center toast opens ITS history item, not whatever the most-recent
+    // toast latched. Fall back to the single latched callback for toasts with
+    // no id.
+    let routedById = false
     try {
-      pending()
-      return
-    } catch { /* fall through to plain show */ }
+      const id = new URL(toastArg).searchParams.get('id')
+      if (id) {
+        routedById = true
+        void openHistoryItemInEditor(id, mainDismissedByUser)
+        // Drop any stale latch so a later plain activation can't replay it.
+        consumePendingNotificationClick()
+        return
+      }
+    } catch { /* not a parseable URL — fall through to the latched callback */ }
+    if (!routedById) {
+      const pending = consumePendingNotificationClick()
+      if (pending) {
+        try {
+          pending()
+          return
+        } catch { /* fall through to plain show */ }
+      }
+    }
   }
   // Plain second-instance (e.g. user double-clicked the .lnk directly,
   // or any non-notification activation) — just surface the window.

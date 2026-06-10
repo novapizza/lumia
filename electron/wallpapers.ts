@@ -91,20 +91,85 @@ function getAccessKey(): string {
   return key
 }
 
+// Network guards: a 30 s abort timeout so a stalled connection can't hang the
+// UI forever, and a 50 MB accumulated-bytes cap so a runaway response can't
+// blow up memory.
+const NET_TIMEOUT_MS = 30_000
+const MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
+
+// The Unsplash API host. Renderer-supplied URLs (download_location is echoed
+// back verbatim from the API and could in principle be tampered with) MUST be
+// verified against this host before we attach the `Client-ID <key>` header —
+// otherwise a crafted URL would exfiltrate the build-time access key to an
+// attacker-chosen origin.
+const UNSPLASH_API_HOST = 'api.unsplash.com'
+
+function isUnsplashApiUrl(url: string): boolean {
+  try {
+    const u = new URL(url)
+    return u.protocol === 'https:' && u.hostname === UNSPLASH_API_HOST
+  } catch {
+    return false
+  }
+}
+
+// Image CDN hosts Unsplash serves photo bytes from. The download path must
+// only fetch from these (no auth header is sent, but we still don't want the
+// renderer steering downloads to arbitrary hosts).
+function isUnsplashImageUrl(url: string): boolean {
+  try {
+    const u = new URL(url)
+    if (u.protocol !== 'https:') return false
+    return u.hostname === 'images.unsplash.com' ||
+      u.hostname === 'plus.unsplash.com' ||
+      u.hostname.endsWith('.unsplash.com')
+  } catch {
+    return false
+  }
+}
+
 function netGetJson(url: string, accessKey: string): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
+    // Only attach the access key to genuine Unsplash API requests — never to a
+    // renderer-influenced host (key-exfiltration guard).
+    if (!isUnsplashApiUrl(url)) {
+      reject(new UnsplashError(0, 'Refusing to attach Unsplash credentials to non-API URL'))
+      return
+    }
     const req = net.request({ url, method: 'GET', useSessionCookies: false })
     req.setHeader('Authorization', `Client-ID ${accessKey}`)
     req.setHeader('Accept-Version', 'v1')
+    let settled = false
+    const timer = setTimeout(() => {
+      if (settled) return
+      settled = true
+      try { req.abort() } catch { /* ignore */ }
+      reject(new UnsplashError(0, 'Unsplash request timed out'))
+    }, NET_TIMEOUT_MS)
     req.on('response', res => {
       const chunks: Buffer[] = []
-      res.on('data', (chunk: Buffer) => chunks.push(chunk))
+      let total = 0
+      res.on('data', (chunk: Buffer) => {
+        total += chunk.length
+        if (total > MAX_DOWNLOAD_BYTES) {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          try { req.abort() } catch { /* ignore */ }
+          reject(new UnsplashError(0, 'Unsplash response exceeded size cap'))
+          return
+        }
+        chunks.push(chunk)
+      })
       res.on('end', () => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
         resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') })
       })
-      res.on('error', reject)
+      res.on('error', err => { clearTimeout(timer); if (!settled) { settled = true; reject(err) } })
     })
-    req.on('error', reject)
+    req.on('error', err => { clearTimeout(timer); if (!settled) { settled = true; reject(err) } })
     req.end()
   })
 }
@@ -243,7 +308,12 @@ async function ensureWallpapersDir(): Promise<string> {
  */
 export async function downloadWallpaper(photo: UnsplashPhoto): Promise<string> {
   const dir = await ensureWallpapersDir()
-  const filePath = join(dir, `${photo.id}.jpg`)
+  // photo.id is renderer-supplied — sanitize before using it as a filename so
+  // a crafted id (e.g. "../../foo") can't escape the wallpapers dir. Unsplash
+  // ids are alphanumeric with - and _, so anything outside that set is dropped.
+  const safeId = String(photo.id).replace(/[^A-Za-z0-9_-]/g, '')
+  if (!safeId) throw new Error('Invalid photo id')
+  const filePath = join(dir, `${safeId}.jpg`)
 
   try {
     const stat = await fs.stat(filePath)
@@ -252,19 +322,46 @@ export async function downloadWallpaper(photo: UnsplashPhoto): Promise<string> {
     // missing — fall through to download
   }
 
+  // Only download from Unsplash's own image CDNs — don't let a renderer-
+  // supplied URL steer the fetch to an arbitrary host.
+  if (!isUnsplashImageUrl(photo.urls.full)) {
+    throw new Error('Refusing to download wallpaper from non-Unsplash host')
+  }
+
   const buffer = await new Promise<Buffer>((resolve, reject) => {
     const req = net.request({ url: photo.urls.full, method: 'GET', useSessionCookies: false, redirect: 'follow' })
+    let settled = false
+    const timer = setTimeout(() => {
+      if (settled) return
+      settled = true
+      try { req.abort() } catch { /* ignore */ }
+      reject(new Error('Wallpaper download timed out'))
+    }, NET_TIMEOUT_MS)
     req.on('response', res => {
       if (res.statusCode < 200 || res.statusCode >= 300) {
+        settled = true
+        clearTimeout(timer)
         reject(new Error(`Wallpaper download failed (HTTP ${res.statusCode})`))
         return
       }
       const chunks: Buffer[] = []
-      res.on('data', (chunk: Buffer) => chunks.push(chunk))
-      res.on('end', () => resolve(Buffer.concat(chunks)))
-      res.on('error', reject)
+      let total = 0
+      res.on('data', (chunk: Buffer) => {
+        total += chunk.length
+        if (total > MAX_DOWNLOAD_BYTES) {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          try { req.abort() } catch { /* ignore */ }
+          reject(new Error('Wallpaper download exceeded size cap'))
+          return
+        }
+        chunks.push(chunk)
+      })
+      res.on('end', () => { if (settled) return; settled = true; clearTimeout(timer); resolve(Buffer.concat(chunks)) })
+      res.on('error', err => { clearTimeout(timer); if (!settled) { settled = true; reject(err) } })
     })
-    req.on('error', reject)
+    req.on('error', err => { clearTimeout(timer); if (!settled) { settled = true; reject(err) } })
     req.end()
   })
 
@@ -304,8 +401,11 @@ async function setWallpaperWindows(filePath: string): Promise<void> {
 }
 
 async function setWallpaperMac(filePath: string): Promise<void> {
-  // POSIX path is what `set picture` expects on macOS.
-  const script = `tell application "System Events" to set picture of every desktop to "${filePath.replace(/"/g, '\\"')}"`
+  // POSIX path is what `set picture` expects on macOS. Escape backslash FIRST
+  // then the double-quote — escaping the quote first would then double-escape
+  // the backslashes it introduced, corrupting paths that contain a literal \.
+  const escaped = filePath.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+  const script = `tell application "System Events" to set picture of every desktop to "${escaped}"`
   await new Promise<void>((resolve, reject) => {
     execFile('osascript', ['-e', script], (err, _stdout, stderr) => {
       if (err) {

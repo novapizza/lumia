@@ -36,6 +36,15 @@ const AUDIO_BITRATE = 192_000
 // Trade-off: small-region recordings now produce noticeably bigger files.
 const MIN_OUTPUT_LONG_SIDE = 1280
 
+// fix-webm-duration reads the entire blob into memory to rewrite the EBML
+// header, so for very large recordings it's itself an OOM hazard. Above this
+// size we skip the duration patch (the file stays playable, just without a
+// seekbar duration) rather than risk crashing the finalize.
+const DURATION_PATCH_MAX_BYTES = 1_500_000_000
+// Slice size for streaming the finished blob to disk over IPC. Bounded so peak
+// transfer memory is one slice regardless of total recording length.
+const SAVE_SLICE_BYTES = 16 * 1024 * 1024
+
 function pickMimeType(): string {
   const candidates = [
     'video/webm;codecs=vp9,opus',
@@ -77,6 +86,11 @@ export default function RecorderHost() {
   const runStartRef      = useRef<number>(0)
   const accumulatedMsRef = useRef<number>(0)
   const tickTimerRef     = useRef<ReturnType<typeof setInterval> | null>(null)
+  // Set while paused so the canvas draw loop can skip the expensive
+  // composite (and the watermark blend) for the entire pause duration —
+  // otherwise it keeps compositing every source frame the paused recorder
+  // just discards.
+  const pausedRef        = useRef(false)
 
   useEffect(() => {
     let mounted = true
@@ -154,6 +168,7 @@ export default function RecorderHost() {
           videoElRef,
           canvasElRef,
           drawLoopRef,
+          pausedRef,
         )
         outStreamRef.current = outStream
 
@@ -172,7 +187,10 @@ export default function RecorderHost() {
           // No mic — continue without audio track at all.
         }
 
-        window.electronAPI?.recorderReady?.(true)
+        // Report whether a mic track was actually acquired so the toolbar can
+        // disable the mic toggle — otherwise it shows a "live" mic while no
+        // audio is being captured.
+        window.electronAPI?.recorderReady?.(true, undefined, micStreamRef.current != null)
       } catch (err: any) {
         console.error('[recorder-host] acquire failed', err)
         window.electronAPI?.recorderReady?.(false, err?.message ?? String(err))
@@ -207,16 +225,25 @@ export default function RecorderHost() {
       recorder.onstop = finalizeRecording
       recorder.start(1000)
       recorderRef.current = recorder
+      pausedRef.current = false
 
       runStartRef.current = Date.now()
       accumulatedMsRef.current = 0
       if (tickTimerRef.current) clearInterval(tickTimerRef.current)
+      // The toolbar timer only renders whole seconds, so only emit a tick when
+      // the displayed second changes — a quarter of the IPC/re-render traffic
+      // of ticking every 250ms unconditionally, while staying responsive.
+      let lastSentSec = -1
       tickTimerRef.current = setInterval(() => {
         const r = recorderRef.current
         if (!r) return
         if (r.state === 'recording') {
           const ms = accumulatedMsRef.current + (Date.now() - runStartRef.current)
-          window.electronAPI?.recorderTick?.(ms)
+          const sec = Math.floor(ms / 1000)
+          if (sec !== lastSentSec) {
+            lastSentSec = sec
+            window.electronAPI?.recorderTick?.(ms)
+          }
         }
       }, 250)
     }
@@ -224,6 +251,7 @@ export default function RecorderHost() {
     const onPause = () => {
       const r = recorderRef.current
       if (!r || r.state !== 'recording') return
+      pausedRef.current = true
       r.pause()
       accumulatedMsRef.current += Date.now() - runStartRef.current
     }
@@ -231,6 +259,7 @@ export default function RecorderHost() {
     const onResume = () => {
       const r = recorderRef.current
       if (!r || r.state !== 'paused') return
+      pausedRef.current = false
       runStartRef.current = Date.now()
       r.resume()
     }
@@ -305,8 +334,10 @@ export default function RecorderHost() {
     // MediaRecorder streams WebM progressively and never writes the duration
     // cue, so without this patch `<video>.duration` is Infinity and no player
     // (Lumia, VLC, browsers) can show a correct timeline. Inject the real
-    // duration into the EBML header before the file touches disk.
-    if (durationMs > 0) {
+    // duration into the EBML header before the file touches disk. Skip for
+    // huge recordings — fix-webm-duration buffers the whole blob and would
+    // itself OOM (the file is still playable, just without a seekbar length).
+    if (durationMs > 0 && blob.size <= DURATION_PATCH_MAX_BYTES) {
       try { blob = await fixWebmDuration(blob, durationMs, { logger: false }) }
       catch { /* fall back to unpatched blob — still playable, just no duration */ }
     }
@@ -314,10 +345,19 @@ export default function RecorderHost() {
     let thumbnail = ''
     try { thumbnail = await extractThumbnail(blob) } catch { /* ignore */ }
 
-    const buffer = await blob.arrayBuffer()
     window.electronAPI?.recorderStateChange?.('saving')
     try {
-      await window.electronAPI?.recorderSaveBlob?.(buffer, thumbnail, durationMs)
+      // Stream the blob to disk in bounded slices. Materializing the whole
+      // recording as one contiguous ArrayBuffer (and structured-cloning it
+      // across IPC) OOM'd the renderer / blew the clone limit on long
+      // recordings; slicing keeps peak transfer memory at one slice.
+      await window.electronAPI?.recorderSaveBegin?.()
+      for (let offset = 0; offset < blob.size; offset += SAVE_SLICE_BYTES) {
+        const slice = blob.slice(offset, Math.min(offset + SAVE_SLICE_BYTES, blob.size))
+        const buf = await slice.arrayBuffer()
+        await window.electronAPI?.recorderSaveChunk?.(buf)
+      }
+      await window.electronAPI?.recorderSaveEnd?.(thumbnail, durationMs)
     } catch (err: any) {
       window.electronAPI?.recorderStateChange?.('error', { error: err?.message ?? String(err) })
     }
@@ -365,6 +405,7 @@ function buildOutputStream(
   videoRef: React.MutableRefObject<HTMLVideoElement | null>,
   canvasRef: React.MutableRefObject<HTMLCanvasElement | null>,
   loopRef: React.MutableRefObject<(() => void) | null>,
+  pausedRef: React.MutableRefObject<boolean>,
 ): MediaStream {
   const video = videoRef.current!
   const canvas = canvasRef.current!
@@ -422,6 +463,9 @@ function buildOutputStream(
   const logoY = outH - logoH - logoMargin
 
   const drawFrame = () => {
+    // While paused, skip the composite entirely — the recorder discards these
+    // frames anyway, so compositing + watermarking them is pure waste.
+    if (pausedRef.current) return
     const vw = video.videoWidth
     const vh = video.videoHeight
     if (vw <= 0 || vh <= 0) return
@@ -486,8 +530,22 @@ function extractThumbnail(blob: Blob): Promise<string> {
     video.muted = true
     video.preload = 'metadata'
     let durationKnown = false
+    let settled = false
 
     const cleanup = () => { URL.revokeObjectURL(url); video.src = '' }
+
+    // Single settle path: clears the watchdog and resolves exactly once. A
+    // malformed/stalled webm can fire neither onseeked nor onerror, which
+    // would otherwise hang finalize forever (the toolbar sticks at
+    // 'stopping') — the watchdog bails with no thumbnail after a few seconds.
+    const done = (val: string) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      cleanup()
+      resolve(val)
+    }
+    const timer = setTimeout(() => done(''), 5000)
 
     const drawFrame = () => {
       try {
@@ -498,11 +556,9 @@ function extractThumbnail(blob: Blob): Promise<string> {
         const canvas = document.createElement('canvas')
         canvas.width = w; canvas.height = h
         canvas.getContext('2d')!.drawImage(video, 0, 0, w, h)
-        cleanup()
-        resolve(canvas.toDataURL('image/jpeg', 0.75))
+        done(canvas.toDataURL('image/jpeg', 0.75))
       } catch {
-        cleanup()
-        resolve('')
+        done('')
       }
     }
 
@@ -523,7 +579,7 @@ function extractThumbnail(blob: Blob): Promise<string> {
       }
       drawFrame()
     }
-    video.onerror = () => { cleanup(); resolve('') }
+    video.onerror = () => done('')
     video.src = url
   })
 }

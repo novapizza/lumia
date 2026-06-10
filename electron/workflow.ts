@@ -113,6 +113,7 @@ export class WorkflowEngine {
           body: parts.join(' · ') || 'Capture complete',
           thumbnailDataUrl: imageData,
           onClick: () => { void openHistoryItemInEditor(clickHistoryId, fromTray) },
+          launchId: clickHistoryId || undefined,
         })
       }
     }
@@ -125,12 +126,18 @@ export class WorkflowEngine {
     if (historyId) {
       const existing = this.historyStore.getAll().find(i => i.id === historyId)
       if (existing) {
-        const nextByDest = new Map(result.uploads.map(u => [u.destination, u]))
-        const mergedUploads: UploadResult[] = [
-          ...(existing.uploads ?? []).filter(u => !nextByDest.has(u.destination)),
-          ...result.uploads,
-        ]
-        this.historyStore.update(historyId, { uploads: mergedUploads })
+        // Merge per destination, but only let a NEW result replace an existing
+        // entry when the new one succeeded. A failed re-upload (e.g. offline)
+        // must not clobber a previously-successful {success:true,url} entry —
+        // the user would lose their working link.
+        const merged = new Map<string, UploadResult>(
+          (existing.uploads ?? []).map(u => [u.destination, u])
+        )
+        for (const next of result.uploads) {
+          const prior = merged.get(next.destination)
+          if (next.success || !prior?.success) merged.set(next.destination, next)
+        }
+        this.historyStore.update(historyId, { uploads: [...merged.values()] })
       }
     } else {
       this.historyStore.add({

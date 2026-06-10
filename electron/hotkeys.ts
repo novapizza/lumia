@@ -59,11 +59,30 @@ export const ALL_ACTIONS = [
 // should retake control from users who never hand-customized. On load, if the
 // stored version is stale we rewrite the capture/recorder bindings to the new
 // defaults while leaving app-level hotkeys alone (those have stable defaults).
+// NOTE: CLAUDE.md documents this as 5, but it's been bumped to 6.
 const HOTKEY_SCHEMA_VERSION = 6
 const CAPTURE_ACTIONS = [
   'RectangleRegion', 'ActiveWindow', 'ActiveMonitor', 'PrintScreen', 'ScrollingCapture',
   'ScreenRecorder', 'ScreenRecorderWindow', 'ScreenRecorderScreen',
 ] as const
+
+// Capture/recorder defaults as they shipped in PRIOR schema versions. Used by
+// the migration to decide whether a stored binding is "untouched" (still equal
+// to whatever default it was last given) and therefore safe to retake, vs.
+// hand-customized and therefore left alone. The capture-mode keys have been on
+// the stable Ctrl+Shift+1..8 scheme throughout, so this currently mirrors the
+// current defaults; if a future bump changes a default key, add the old value
+// here so users who never customized still get migrated forward.
+const PREVIOUS_CAPTURE_DEFAULTS: Record<string, readonly string[]> = {
+  RectangleRegion:      ['Ctrl+Shift+1'],
+  ActiveWindow:         ['Ctrl+Shift+2'],
+  ActiveMonitor:        ['Ctrl+Shift+3'],
+  PrintScreen:          ['Ctrl+Shift+4'],
+  ScrollingCapture:     ['Ctrl+Shift+5'],
+  ScreenRecorder:       ['Ctrl+Shift+6'],
+  ScreenRecorderWindow: ['Ctrl+Shift+7'],
+  ScreenRecorderScreen: ['Ctrl+Shift+8'],
+}
 // Actions that were removed (or renamed) in a migration — stripped from the
 // saved config so stale bindings don't linger and accidentally block new keys
 // (e.g. S was `StopScreenRecording` and is now `ScreenRecorderScreen`).
@@ -72,7 +91,9 @@ const REMOVED_ACTIONS = ['StopScreenRecording', 'OpenMainWindow', 'WorkflowPicke
 
 const store = new Store<{ hotkeys: HotkeyConfig; schemaVersion?: number }>({
   name: 'hotkeys',
-  defaults: { hotkeys: defaultHotkeys }
+  defaults: { hotkeys: defaultHotkeys },
+  // A corrupted hotkeys.json should reset to defaults rather than crash.
+  clearInvalidConfig: true
 })
 
 export function getHotkeys(): HotkeyConfig {
@@ -81,11 +102,20 @@ export function getHotkeys(): HotkeyConfig {
   const storedVersion = store.has('schemaVersion') ? store.get('schemaVersion') ?? 1 : 1
   const saved = store.get('hotkeys')
   if (storedVersion < HOTKEY_SCHEMA_VERSION) {
-    // Migrate: overwrite the capture/recorder bindings with the new defaults,
-    // drop actions that no longer exist, keep any app-level customizations.
+    // Migrate: retake ONLY the capture/recorder bindings the user never
+    // hand-customized (missing, or still equal to a previously-shipped
+    // default for that action). Any binding the user changed is preserved —
+    // the old code clobbered all of them on every bump. Drop removed actions
+    // and keep app-level customizations either way.
     const migrated: HotkeyConfig = { ...saved }
     for (const action of REMOVED_ACTIONS) delete migrated[action]
-    for (const action of CAPTURE_ACTIONS) migrated[action] = defaultHotkeys[action]
+    for (const action of CAPTURE_ACTIONS) {
+      const current = migrated[action]
+      const wasDefault = current === undefined
+        || current === defaultHotkeys[action]
+        || (PREVIOUS_CAPTURE_DEFAULTS[action]?.includes(current) ?? false)
+      if (wasDefault) migrated[action] = defaultHotkeys[action]
+    }
     store.set('hotkeys', migrated)
     store.set('schemaVersion', HOTKEY_SCHEMA_VERSION)
     return { ...defaultHotkeys, ...migrated }
@@ -173,7 +203,11 @@ export function setupHotkeys() {
     const handler = handlers[action]
     if (!handler) continue
     try {
-      globalShortcut.register(shortcut, handler)
+      // register() returns false (without throwing) when another app already
+      // owns the accelerator — distinct from the catch below, which fires only
+      // on an invalid/unparseable accelerator string.
+      const ok = globalShortcut.register(shortcut, handler)
+      if (!ok) console.warn(`Hotkey ${shortcut} for ${action} not registered (already in use by another app?)`)
     } catch {
       console.warn(`Failed to register hotkey ${shortcut} for ${action}`)
     }

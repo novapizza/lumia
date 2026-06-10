@@ -13,24 +13,47 @@ import {
 
 type Resolved<T> = { value: T } | { error: string }
 
-async function ensureAccessToken(): Promise<Resolved<string>> {
-  const settings = getSettings()
-  let { googleDriveAccessToken } = settings
-  const { googleDriveRefreshToken, googleDriveTokenExpiresAt } = settings
-  const clientId = import.meta.env.MAIN_VITE_GDRIVE_CLIENT_ID
-  const clientSecret = import.meta.env.MAIN_VITE_GDRIVE_CLIENT_SECRET
+// Shared in-flight refresh so concurrent uploads don't each fire a token
+// refresh (Google rate-limits and the extra requests are wasteful). The first
+// caller to need a refresh kicks it off; others await the same promise.
+let inFlightRefresh: Promise<{ accessToken: string; expiresAt: number }> | null = null
 
-  if (googleDriveRefreshToken && Date.now() >= googleDriveTokenExpiresAt - 60_000) {
+function refreshAccessToken(refreshToken: string): Promise<{ accessToken: string; expiresAt: number }> {
+  if (!inFlightRefresh) {
+    const clientId = import.meta.env.MAIN_VITE_GDRIVE_CLIENT_ID
+    const clientSecret = import.meta.env.MAIN_VITE_GDRIVE_CLIENT_SECRET
+    inFlightRefresh = refreshGoogleToken(clientId, clientSecret, refreshToken)
+      .then(refreshed => {
+        setSetting('googleDriveAccessToken', refreshed.accessToken)
+        setSetting('googleDriveTokenExpiresAt', refreshed.expiresAt)
+        return refreshed
+      })
+      .finally(() => { inFlightRefresh = null })
+  }
+  return inFlightRefresh
+}
+
+// `force` bypasses the expiry check to refresh a token the server has revoked
+// out from under us (surfaces as a 401 before the local expiry lapses).
+async function ensureAccessToken(force = false): Promise<Resolved<string>> {
+  const settings = getSettings()
+  const { googleDriveAccessToken, googleDriveRefreshToken, googleDriveTokenExpiresAt } = settings
+
+  if (googleDriveRefreshToken && (force || Date.now() >= googleDriveTokenExpiresAt - 60_000)) {
     try {
-      const refreshed = await refreshGoogleToken(clientId, clientSecret, googleDriveRefreshToken)
-      googleDriveAccessToken = refreshed.accessToken
-      setSetting('googleDriveAccessToken', refreshed.accessToken)
-      setSetting('googleDriveTokenExpiresAt', refreshed.expiresAt)
+      const refreshed = await refreshAccessToken(googleDriveRefreshToken)
+      return { value: refreshed.accessToken }
     } catch (err) {
       return { error: `Token refresh failed: ${err instanceof Error ? err.message : String(err)}` }
     }
   }
   return { value: googleDriveAccessToken }
+}
+
+// True when an UploadResult failed specifically because the access token was
+// rejected (401) — the cue to force a single refresh-and-retry.
+function isAuthError(result: UploadResult): boolean {
+  return !result.success && /HTTP 401\b/.test(result.error ?? '')
 }
 
 function resolveFolder(folderId?: string): Resolved<string> {
@@ -49,7 +72,12 @@ export async function uploadImageDataUrlToDrive(imageData: string, folderId?: st
   if ('error' in token) return fail(token.error)
   const folder = resolveFolder(folderId)
   if ('error' in folder) return fail(folder.error)
-  return uploadToGoogleDrive(imageData, token.value, folder.value)
+  const result = await uploadToGoogleDrive(imageData, token.value, folder.value)
+  if (!isAuthError(result)) return result
+  // Server-revoked token — force one refresh and retry before giving up.
+  const retryToken = await ensureAccessToken(true)
+  if ('error' in retryToken) return fail(retryToken.error)
+  return uploadToGoogleDrive(imageData, retryToken.value, folder.value)
 }
 
 /** Upload an arbitrary file buffer (used for video recordings) via the
@@ -64,5 +92,10 @@ export async function uploadFileBufferToDrive(
   if ('error' in token) return fail(token.error)
   const folder = resolveFolder(folderId)
   if ('error' in folder) return fail(folder.error)
-  return uploadFileToGoogleDrive(buffer, contentType, filename, token.value, folder.value)
+  const result = await uploadFileToGoogleDrive(buffer, contentType, filename, token.value, folder.value)
+  if (!isAuthError(result)) return result
+  // Server-revoked token — force one refresh and retry before giving up.
+  const retryToken = await ensureAccessToken(true)
+  if ('error' in retryToken) return fail(retryToken.error)
+  return uploadFileToGoogleDrive(buffer, contentType, filename, retryToken.value, folder.value)
 }

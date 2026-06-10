@@ -239,17 +239,21 @@ export default function Overlay() {
     const ctx = canvas.getContext('2d')
     if (!ctx) return
 
-    // BGRA → RGBA in place. Treat the buffer as a Uint32Array; for each px
-    // (little-endian byte order BB GG RR AA → uint32 0xAARRGGBB), swap the
-    // bytes at positions 0 and 2 (B and R).
-    const buf = frozenBgr.buffer
-    const u32 = new Uint32Array(buf.buffer, buf.byteOffset, buf.byteLength >>> 2)
-    for (let i = 0; i < u32.length; i++) {
-      const v = u32[i]
-      u32[i] = (v & 0xFF00FF00) | ((v & 0x00FF0000) >>> 16) | ((v & 0x000000FF) << 16)
+    // BGRA → RGBA into a FRESH buffer — never mutate the IPC buffer in place.
+    // This effect re-runs on `mode` changes, and the swap is an involution, so
+    // an in-place swizzle would re-corrupt (red/blue swapped) on every other
+    // mode switch. Reading from the untouched source each time keeps it
+    // correct. For each px (little-endian BB GG RR AA → uint32 0xAARRGGBB),
+    // swap the B and R bytes.
+    const src = frozenBgr.buffer
+    const srcU32 = new Uint32Array(src.buffer, src.byteOffset, src.byteLength >>> 2)
+    const out = new Uint8ClampedArray(src.byteLength)
+    const outU32 = new Uint32Array(out.buffer)
+    for (let i = 0; i < srcU32.length; i++) {
+      const v = srcU32[i]
+      outU32[i] = (v & 0xFF00FF00) | ((v & 0x00FF0000) >>> 16) | ((v & 0x000000FF) << 16)
     }
-    const clamped = new Uint8ClampedArray(buf.buffer, buf.byteOffset, buf.byteLength)
-    ctx.putImageData(new ImageData(clamped, frozenBgr.width, frozenBgr.height), 0, 0)
+    ctx.putImageData(new ImageData(out, frozenBgr.width, frozenBgr.height), 0, 0)
 
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
@@ -311,7 +315,7 @@ export default function Overlay() {
     }
   }
 
-  const handleMouseDown = (e: React.MouseEvent) => {
+  const handleMouseDown = (e: React.PointerEvent) => {
     if (!isActive) return
     if (base === 'window') {
       const x = e.clientX
@@ -325,13 +329,17 @@ export default function Overlay() {
       })
       return
     }
+    // Capture the pointer so a drag that ends past the display edge (onto an
+    // adjacent monitor) still delivers pointerup here — otherwise the drag
+    // would wedge isDrawing=true and hold the overlay:drawing lock until ESC.
+    try { e.currentTarget.setPointerCapture(e.pointerId) } catch { /* ignore */ }
     setStartPos({ x: e.clientX, y: e.clientY })
     setCurrentPos({ x: e.clientX, y: e.clientY })
     setIsDrawing(true)
     window.electronAPI?.overlayDrawing(true)
   }
 
-  const handleMouseMove = (e: React.MouseEvent) => {
+  const handleMouseMove = (e: React.PointerEvent) => {
     if (base === 'window') {
       const x = e.clientX
       const y = e.clientY
@@ -341,6 +349,15 @@ export default function Overlay() {
     }
     if (!isDrawing) return
     setCurrentPos({ x: e.clientX, y: e.clientY })
+  }
+
+  // Pointer drag interrupted (e.g. OS took the pointer, display unplugged):
+  // unwind cleanly so the overlay:drawing lock is released.
+  const handlePointerCancel = () => {
+    if (base === 'window' || !isDrawing) return
+    setIsDrawing(false)
+    window.electronAPI?.overlayDrawing(false)
+    resetDrawState()
   }
 
   const handleMouseUp = async () => {
@@ -434,8 +451,8 @@ export default function Overlay() {
           cursor: isActive ? 'crosshair' : 'default',
           background: !frozenBgReady && isActive ? 'rgba(0,0,0,0.03)' : 'transparent',
         }}
-        onMouseMove={handleMouseMove}
-        onMouseDown={handleMouseDown}
+        onPointerMove={handleMouseMove}
+        onPointerDown={handleMouseDown}
       >
         {FrozenBgLayer}
 
@@ -491,9 +508,10 @@ export default function Overlay() {
         cursor: isActive ? 'crosshair' : 'default',
         background: !frozenBgReady && isActive ? 'rgba(0,0,0,0.08)' : 'transparent',
       }}
-      onMouseDown={handleMouseDown}
-      onMouseMove={handleMouseMove}
-      onMouseUp={handleMouseUp}
+      onPointerDown={handleMouseDown}
+      onPointerMove={handleMouseMove}
+      onPointerUp={handleMouseUp}
+      onPointerCancel={handlePointerCancel}
     >
       {FrozenBgLayer}
       <style>{`

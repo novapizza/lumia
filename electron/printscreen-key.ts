@@ -26,7 +26,7 @@ export function setSnippingHijack(enabled: boolean): Promise<SnippingHijackResul
       '/t', 'REG_DWORD',
       '/d', enabled ? '1' : '0',
       '/f',
-    ], (err) => {
+    ], { windowsHide: true }, (err) => {
       if (err) {
         resolve({
           warning: 'Could not update Windows registry — Snipping Tool may still capture PrintScreen. ' + (err.message || ''),

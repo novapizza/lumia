@@ -85,7 +85,10 @@ interface Props {
    *  composite PNG here. Video callers should prefer the `toDataURL` ref method. */
   onExport?: (dataUrl: string) => void
   exportTrigger?: number
-  onHistoryChange?: (canUndo: boolean, canRedo: boolean) => void
+  /** `userEdited` is true once a genuine user edit has landed (false during
+   *  the mount-time replay of `initialObjects`) so the parent can tell real
+   *  edits from rehydration without comparing object counts. */
+  onHistoryChange?: (canUndo: boolean, canRedo: boolean, userEdited?: boolean) => void
   onZoomChange?: (zoom: number) => void
   /** Disable pointer-driven drawing (used by video mode while the video is
    *  actively playing — lets users watch without accidental strokes). */
@@ -105,6 +108,13 @@ const uid = () => `obj-${++idCounter}-${Date.now()}`
 // pixels of the stage edge visible inside the container so the canvas never
 // disappears entirely.
 const PAN_MIN_VISIBLE = 80
+
+// Each cached blur is a full-resolution canvas (~33 MB at 4K). Dragging the
+// stroke slider would otherwise materialise one per radius (~20 steps) and
+// never release them. Cap the cache and evict the least-recently-used radius
+// so memory stays bounded; in-use radii (committed blur shapes) are protected
+// from eviction in the populate effect below.
+const BLUR_CACHE_MAX = 3
 
 // Stroke-width slider doubles as the blur-intensity control when the blur
 // tool is selected. Map slider value (1–20) to a CSS blur radius in px.
@@ -175,6 +185,12 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
     const layerRef     = useRef<Konva.Layer>(null)
     const containerRef = useRef<HTMLDivElement>(null)
     const [isDrawing, setIsDrawing] = useState(false)
+    // Mirrors `isDrawing` but drives the commit guard. Both the Stage's
+    // onMouseUp and the window-level mouseup fallback fire for the same
+    // gesture with no re-render between them, so the React `isDrawing` state
+    // is still `true` for both — gating the commit on this ref (flipped
+    // synchronously) ensures the shape lands exactly once.
+    const isDrawingRef = useRef(false)
     const [currentObj, setCurrentObj] = useState<DrawObject | null>(null)
     const drawStart = useRef({ x: 0, y: 0 })
     const [selectedId, setSelectedId] = useState<string | null>(null)
@@ -183,6 +199,9 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
     // shape live during drag/transform without going through the React
     // commit cycle on every mousemove.
     const [deleteHandle, setDeleteHandle] = useState<{ x: number; y: number } | null>(null)
+    // Konva node ref for the delete handle so drag/transform can reposition it
+    // imperatively without a React re-render of the whole canvas per mousemove.
+    const deleteHandleRef = useRef<Konva.Group>(null)
     const [textInput, setTextInput] = useState<{
       x: number; y: number; screenX: number; screenY: number
     } | null>(null)
@@ -230,6 +249,12 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
     // the session that created them. Guarded by a ref so StrictMode's double
     // effect invocation doesn't double-push the stack.
     const replayedRef = useRef(false)
+    // Flipped true the first time a genuine user edit lands (draw, drag,
+    // transform, text, delete, clear, programmatic add, undo/redo). Stays false
+    // during the mount-time replay of `initialObjects` so the Editor can tell a
+    // real edit apart from rehydration without relying on object-count diffs
+    // (which miss same-length edits like dragging a single Text).
+    const userEditedRef = useRef(false)
     useEffect(() => {
       if (replayedRef.current) return
       replayedRef.current = true
@@ -262,9 +287,16 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
         if (obj.type === 'blur') needed.add(blurRadiusFromStrokeWidth(obj.strokeWidth))
       }
       if (tool === 'blur') needed.add(blurRadiusFromStrokeWidth(strokeWidth))
+      const cache = blurCacheRef.current
       let added = false
       for (const r of needed) {
-        if (blurCacheRef.current.has(r)) continue
+        if (cache.has(r)) {
+          // Touch: re-insert so Map iteration order tracks recency (LRU tail).
+          const existing = cache.get(r)!
+          cache.delete(r)
+          cache.set(r, existing)
+          continue
+        }
         const c = document.createElement('canvas')
         c.width  = bgImage.width
         c.height = bgImage.height
@@ -272,8 +304,19 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
         if (!ctx) continue
         ctx.filter = `blur(${r}px)`
         ctx.drawImage(bgImage, 0, 0)
-        blurCacheRef.current.set(r, c)
+        cache.set(r, c)
         added = true
+      }
+      // Evict least-recently-used radii once over the cap, but never drop a
+      // radius that's currently in use by a committed blur shape or the live
+      // preview — those are guaranteed to be re-created on the next render
+      // anyway, so evicting them just thrashes.
+      if (cache.size > BLUR_CACHE_MAX) {
+        for (const r of cache.keys()) {
+          if (cache.size <= BLUR_CACHE_MAX) break
+          if (needed.has(r)) continue
+          cache.delete(r)
+        }
       }
       if (added) setBlurCacheVersion(v => v + 1)
     }, [bgImage, background.kind, objects, tool, strokeWidth])
@@ -284,7 +327,7 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
     // would be invisible to the parent and the Editor's debounced save would
     // never be scheduled.
     useEffect(() => {
-      onHistoryChange?.(canUndo, canRedo)
+      onHistoryChange?.(canUndo, canRedo, userEditedRef.current)
     }, [objects, canUndo, canRedo, onHistoryChange])
 
     // ── Container sizing ──────────────────────────────────────────────────────
@@ -443,7 +486,11 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
         e.stopPropagation()
         isPanning.current = true
         setIsPanningState(true)
-        panStart.current = { x: e.clientX - panOffset.x, y: e.clientY - panOffset.y }
+        // Read the latest pan from the ref so this effect doesn't need
+        // panOffset in its deps — otherwise it re-binds all window listeners
+        // on every pan mousemove (panOffset updates per frame).
+        const pan = panOffsetRef.current
+        panStart.current = { x: e.clientX - pan.x, y: e.clientY - pan.y }
       }
       const onMouseMove = (e: MouseEvent) => {
         if (!isPanning.current) return
@@ -472,7 +519,7 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
         window.removeEventListener('mouseup', onMouseUp)
         el.removeEventListener('contextmenu', onContextMenu)
       }
-    }, [panOffset, naturalW, naturalH, baseScale])
+    }, [naturalW, naturalH, baseScale])
 
     // Re-clamp panOffset whenever the stage or container resizes (zoom button,
     // window resize, image swap). Without this, zooming out leaves the stage
@@ -513,38 +560,106 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
     const stageWidth  = Math.round(naturalW * scale)
     const stageHeight = Math.round(naturalH * scale)
 
+    // Prepare the stage for a natural-resolution export and return a restore
+    // fn. Two concerns handled here:
+    //   1. Selection chrome — detach the purple Transformer frame and hide the
+    //      red X delete handle so neither bakes into the PNG. (Previously only
+    //      toAnnotationsCanvas did this, so Copy/Save/Upload captured the UI.)
+    //   2. Zoom independence — strokeScaleEnabled=false renders strokes in
+    //      screen px, so at zoom != 1 exporting with pixelRatio=1/scale would
+    //      leak the current zoom into stroke / arrowhead thickness. Temporarily
+    //      reset the stage scale to baseScale (zoom = 1) so exports always
+    //      rasterise strokes at the fit-to-container scale. Geometry is
+    //      unaffected because pixelRatio compensates 1:1 (see below).
+    const prepareExport = useCallback((stage: Konva.Stage): (() => void) => {
+      const tr = trRef.current
+      const handle = stage.findOne('#__delete_handle__')
+      const prevTrNodes = tr?.nodes() ?? []
+      const prevHandle = handle?.visible() ?? true
+      const prevScaleX = stage.scaleX()
+      const prevScaleY = stage.scaleY()
+      tr?.nodes([])
+      handle?.visible(false)
+      stage.scale({ x: baseScale, y: baseScale })
+      // Arrowhead size is rendered as `base/scale` image units so it reads as
+      // constant screen px while editing. That ties it to the live zoom, so
+      // re-derive each arrow's pointer size against baseScale during export to
+      // keep the rasterised arrowhead zoom-independent. Restored afterwards.
+      const arrowRestores: Array<() => void> = []
+      const denom = baseScale > 0 ? baseScale : 1
+      for (const obj of objectsRef.current) {
+        if (obj.type !== 'arrow') continue
+        const node = stage.findOne('#' + obj.id) as Konva.Arrow | undefined
+        if (!node) continue
+        const prevLen = node.pointerLength()
+        const prevWid = node.pointerWidth()
+        const size = Math.max(8, obj.strokeWidth * 3) / denom
+        node.pointerLength(size)
+        node.pointerWidth(size)
+        arrowRestores.push(() => { node.pointerLength(prevLen); node.pointerWidth(prevWid) })
+      }
+      stage.batchDraw()
+      return () => {
+        if (tr && prevTrNodes.length > 0) tr.nodes(prevTrNodes)
+        handle?.visible(prevHandle)
+        for (const r of arrowRestores) r()
+        stage.scale({ x: prevScaleX, y: prevScaleY })
+        stage.batchDraw()
+      }
+    }, [baseScale])
+
+    // With the stage neutralised to baseScale, the export must capture the
+    // baseScale-sized region (naturalW*baseScale × naturalH*baseScale) — NOT
+    // the stage's zoomed width/height props, which Konva would use by default.
+    // pixelRatio=1/baseScale then maps that region back to the image's natural
+    // pixel dimensions. The explicit rect makes the output zoom-independent in
+    // both resolution AND stroke thickness.
+    const exportRect = useCallback(() => {
+      const r = baseScale > 0 ? baseScale : scale
+      return {
+        x: 0,
+        y: 0,
+        width: Math.round(naturalW * r),
+        height: Math.round(naturalH * r),
+        pixelRatio: 1 / r,
+      }
+    }, [baseScale, scale, naturalW, naturalH])
+
     // ── Composite snapshot (current background + annotations at natural res) ──
     const toDataURL = useCallback((): string => {
       const stage = stageRef.current
-      if (!stage) return ''
-      return stage.toDataURL({ mimeType: 'image/png', pixelRatio: 1 / scale })
-    }, [scale])
+      if (!stage || !bgImage) return ''
+      const restore = prepareExport(stage)
+      const out = stage.toDataURL({ mimeType: 'image/png', ...exportRect() })
+      restore()
+      return out
+    }, [bgImage, exportRect, prepareExport])
 
     const toCanvas = useCallback((): HTMLCanvasElement | null => {
       const stage = stageRef.current
-      if (!stage) return null
-      return stage.toCanvas({ pixelRatio: 1 / scale })
-    }, [scale])
+      if (!stage || !bgImage) return null
+      const restore = prepareExport(stage)
+      const out = stage.toCanvas(exportRect())
+      restore()
+      return out
+    }, [bgImage, exportRect, prepareExport])
 
     const toAnnotationsCanvas = useCallback((): HTMLCanvasElement | null => {
       const stage = stageRef.current
       if (!stage) return null
       // Temporarily hide the background node so the export contains only the
-      // annotation shapes. Transformer stays hidden via `nodes([])` when idle,
-      // so it rarely shows up in snapshots — but hide it too to be safe.
+      // annotation shapes. Selection chrome + zoom are neutralised via the
+      // shared helper.
       const bg = stage.findOne('#__bg__')
-      const tr = trRef.current
       const prevBg = bg?.visible() ?? true
-      const prevTrNodes = tr?.nodes() ?? []
+      const restore = prepareExport(stage)
       bg?.visible(false)
-      tr?.nodes([])
       stage.batchDraw()
-      const out = stage.toCanvas({ pixelRatio: 1 / scale })
+      const out = stage.toCanvas(exportRect())
       bg?.visible(prevBg)
-      if (tr && prevTrNodes.length > 0) tr.nodes(prevTrNodes)
-      stage.batchDraw()
+      restore()
       return out
-    }, [scale])
+    }, [exportRect, prepareExport])
 
     const getObjects = useCallback((): DrawObject[] => objectsRef.current, [])
 
@@ -554,6 +669,7 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
     // PNG + thumbnail get regenerated from the original image), and the user
     // can undo the clear to recover the shapes if it was accidental.
     const clearViaCommit = useCallback(() => {
+      userEditedRef.current = true
       commitObjects([])
     }, [commitObjects])
 
@@ -562,16 +678,23 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
     // detected regions as Konva blur shapes).
     const addObjects = useCallback((objs: Omit<DrawObject, 'id'>[]) => {
       if (objs.length === 0) return
+      userEditedRef.current = true
       const stamped: DrawObject[] = objs.map(o => ({ ...o, id: uid() }))
       commitObjects([...objectsRef.current, ...stamped])
     }, [commitObjects])
 
+    // Undo/redo are user actions too — flip the edit latch so the parent's
+    // debounced save fires for them (otherwise undoing the only edit back to
+    // the baseline length would look like rehydration and skip the save).
+    const undoUser = useCallback(() => { userEditedRef.current = true; undo() }, [undo])
+    const redoUser = useCallback(() => { userEditedRef.current = true; redo() }, [redo])
+
     // Expose imperative handle to parent
     useImperativeHandle(ref, () => ({
-      undo, redo, clear: clearViaCommit, canUndo, canRedo,
+      undo: undoUser, redo: redoUser, clear: clearViaCommit, canUndo, canRedo,
       zoomIn, zoomOut, zoomReset, zoomLevel: userZoom,
       toDataURL, toCanvas, toAnnotationsCanvas, getObjects, addObjects,
-    }), [undo, redo, clearViaCommit, canUndo, canRedo, zoomIn, zoomOut, zoomReset, userZoom, toDataURL, toCanvas, toAnnotationsCanvas, getObjects, addObjects])
+    }), [undoUser, redoUser, clearViaCommit, canUndo, canRedo, zoomIn, zoomOut, zoomReset, userZoom, toDataURL, toCanvas, toAnnotationsCanvas, getObjects, addObjects])
 
     // ── Export trigger (legacy path — kept for Editor's workflow buttons) ────
     useEffect(() => {
@@ -598,7 +721,10 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
 
     // Track the top-right corner of the selected shape so the delete handle
     // (small red X next to the Transformer) follows the shape during drag /
-    // transform without needing to wait for the next React render.
+    // transform without needing to wait for the next React render. The initial
+    // placement seeds React state (so the handle mounts); subsequent live
+    // updates during drag/transform move the Konva node directly via its ref,
+    // avoiding a full canvas re-render on every mousemove.
     useEffect(() => {
       if (!selectedId) { setDeleteHandle(null); return }
       const stage = stageRef.current
@@ -606,16 +732,29 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
       const node = stage.findOne('#' + selectedId)
       const layer = node?.getLayer() ?? null
       if (!node || !layer) { setDeleteHandle(null); return }
-      const update = () => {
+      const compute = () => {
         const box = node.getClientRect({ relativeTo: layer as any })
-        setDeleteHandle({ x: box.x + box.width, y: box.y })
+        return { x: box.x + box.width, y: box.y }
       }
-      update()
+      setDeleteHandle(compute())
+      const update = () => {
+        const p = compute()
+        const handle = deleteHandleRef.current
+        if (handle) {
+          // The 12/scale offset mirrors the React-rendered placement below
+          // (x={deleteHandle.x + 12/scale}) so the imperative move lands the
+          // handle in exactly the same spot, just without a React re-render.
+          handle.position({ x: p.x + 12 / scale, y: p.y - 12 / scale })
+          handle.getLayer()?.batchDraw()
+        } else {
+          setDeleteHandle(p)
+        }
+      }
       node.on('dragmove.deletehandle transform.deletehandle', update)
       return () => {
         node.off('dragmove.deletehandle transform.deletehandle')
       }
-    }, [selectedId, objects])
+    }, [selectedId, objects, baseScale, scale])
 
     // ── Keyboard: Delete / Backspace removes the selected shape ──────────────
     useEffect(() => {
@@ -624,6 +763,7 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
         if (tag === 'INPUT' || tag === 'TEXTAREA') return
         if ((e.key === 'Delete' || e.key === 'Backspace') && selectedId) {
           e.preventDefault()
+          userEditedRef.current = true
           commitObjects(prev => prev.filter(o => o.id !== selectedId))
           setSelectedId(null)
         }
@@ -643,6 +783,7 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
         const raw = e.target.getStage()!.getPointerPosition()!
         const pos = { x: raw.x / scale, y: raw.y / scale }
         setIsDrawing(true)
+        isDrawingRef.current = true
         drawStart.current = pos
 
         const base: DrawObject = { id: uid(), type: tool, color, strokeWidth }
@@ -659,6 +800,7 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
           setTextInput({ x: pos.x, y: pos.y, screenX: raw.x, screenY: raw.y })
           setTextValue('')
           setIsDrawing(false)
+          isDrawingRef.current = false
           return
         }
       },
@@ -724,9 +866,16 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
     }
 
     const handleMouseUp = useCallback(() => {
+      // Guard against the double-fire: the Stage's onMouseUp and the
+      // window-level mouseup fallback both call this for one gesture with no
+      // re-render in between. The ref is flipped synchronously here so the
+      // second call bails before committing the shape a second time.
+      if (!isDrawingRef.current) return
+      isDrawingRef.current = false
       if (!isDrawing || !currentObj) return
       setIsDrawing(false)
       if (isTrivialShape(currentObj)) { setCurrentObj(null); return }
+      userEditedRef.current = true
       commitObjects(prev => [...prev, currentObj])
       setCurrentObj(null)
     }, [isDrawing, currentObj, commitObjects])
@@ -742,6 +891,89 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
       return () => window.removeEventListener('mouseup', onUp)
     }, [isDrawing, handleMouseUp])
 
+    // Bake a Konva node's transient transform (drag offset + resize scale)
+    // back into the persisted DrawObject geometry, then zero the node so the
+    // next render — driven purely by the data — reproduces the same result
+    // without double-applying. Without this, drag/resize of non-Text shapes
+    // lived only on the node and was lost when the canvas re-rendered or the
+    // annotations were re-serialized.
+    const bakeNodeIntoObject = useCallback((id: string, node: Konva.Node) => {
+      // node.x()/y() is the node's full position. For shapes rendered WITHOUT
+      // an x/y prop (pen, arrow — points are absolute and the node sits at the
+      // origin) this is purely the drag offset. For shapes rendered WITH an
+      // x/y prop (rect, blur, ellipse, text) node.x() already encodes the new
+      // absolute position, so it replaces the stored x/y directly.
+      const nx = node.x()
+      const ny = node.y()
+      const sx = node.scaleX()
+      const sy = node.scaleY()
+      userEditedRef.current = true
+      const obj = objectsRef.current.find(o => o.id === id)
+      // Origin-anchored shapes render their geometry in group-local coords with
+      // the node at (0,0), so node.x()/y() is a pure drag offset that must be
+      // ADDED to the stored geometry: pen/arrow (absolute points) and the blur
+      // GROUP (it carries clipX/clipY locally). x/y-prop shapes (rect, ellipse,
+      // text, and the blur PLACEHOLDER Rect) render `x={obj.x}` so node.x()
+      // already IS the new absolute x. The blur object can render either way,
+      // so disambiguate by node class — only the Group is origin-anchored.
+      const isBlurGroup = obj?.type === 'blur' && node.getClassName() === 'Group'
+      const isOriginAnchored = obj?.type === 'pen' || obj?.type === 'arrow' || isBlurGroup
+      commitObjects(prev => prev.map(o => {
+        if (o.id !== id) return o
+        if (o.type === 'pen' || o.type === 'arrow') {
+          const pts = o.points ?? []
+          const next = pts.map((p, i) => i % 2 === 0 ? nx + p * sx : ny + p * sy)
+          return { ...o, points: next }
+        }
+        if (o.type === 'blur') {
+          // Group: clipX/clipY are local, so add the drag offset. Placeholder
+          // Rect: node.x() is already absolute.
+          return {
+            ...o,
+            x: isBlurGroup ? nx + (o.x ?? 0) * sx : nx,
+            y: isBlurGroup ? ny + (o.y ?? 0) * sy : ny,
+            width: (o.width ?? 0) * sx,
+            height: (o.height ?? 0) * sy,
+          }
+        }
+        if (o.type === 'rect') {
+          return {
+            ...o,
+            x: nx,
+            y: ny,
+            width: (o.width ?? 0) * sx,
+            height: (o.height ?? 0) * sy,
+          }
+        }
+        if (o.type === 'ellipse') {
+          return {
+            ...o,
+            x: nx,
+            y: ny,
+            radiusX: (o.radiusX ?? 0) * sx,
+            radiusY: (o.radiusY ?? 0) * sy,
+          }
+        }
+        if (o.type === 'text') {
+          return { ...o, x: nx, y: ny }
+        }
+        return o
+      }))
+      // Reset the node transform — the committed data already encodes it. Scale
+      // must always be cleared (Rect/Ellipse/etc. don't pass a scale prop, so
+      // react-konva won't reset it for us). Origin-anchored nodes (pen, arrow,
+      // blur) have no x/y prop either, so reset their position to the origin or
+      // the baked-in offset would be double-applied on the next render. The
+      // blur's inner image (counter-offset during drag) also returns to local
+      // (0,0) on the data-driven re-render.
+      node.scale({ x: 1, y: 1 })
+      if (isOriginAnchored) {
+        node.position({ x: 0, y: 0 })
+        const inner = (node as Konva.Group).findOne?.('Image')
+        inner?.position({ x: 0, y: 0 })
+      }
+    }, [commitObjects])
+
     // ── Per-object shape renderer ─────────────────────────────────────────────
     const selectable = tool === 'none'
     const renderObj = (obj: DrawObject, isPreview = false) => {
@@ -751,6 +983,8 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
       const commonInteractive = !isPreview && {
         onClick: () => { if (selectable) setSelectedId(obj.id) },
         onTap:   () => { if (selectable) setSelectedId(obj.id) },
+        onDragEnd: (e: Konva.KonvaEventObject<DragEvent>) => bakeNodeIntoObject(obj.id, e.target),
+        onTransformEnd: (e: Konva.KonvaEventObject<Event>) => bakeNodeIntoObject(obj.id, e.target),
       }
 
       if (obj.type === 'pen') {
@@ -831,6 +1065,19 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
             clipX={bx} clipY={by} clipWidth={bw} clipHeight={bh}
             draggable={selectable}
             {...commonInteractive}
+            // The inner pre-blurred image sits at group-local (0,0) and is the
+            // size of the whole background. As the group moves, counter-offset
+            // the inner image by (-x, -y) so it stays pinned to the layer
+            // origin — that way the clip window reveals the blurred pixels
+            // NOW under the region, not those from the drag-start location.
+            // bakeNodeIntoObject (onDragEnd, via commonInteractive) then writes
+            // the new clip coords and the re-render restores the inner image
+            // to local (0,0).
+            onDragMove={e => {
+              const g = e.target as Konva.Group
+              const inner = g.findOne('Image')
+              inner?.position({ x: -g.x(), y: -g.y() })
+            }}
           >
             <KonvaImage
               image={blurredBg}
@@ -898,16 +1145,6 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
             fill={obj.color}
             draggable={!isPreview}
             {...commonInteractive}
-            onDragEnd={e => {
-              if (!isPreview) {
-                const node = e.target
-                commitObjects(prev =>
-                  prev.map(o =>
-                    o.id === obj.id ? { ...o, x: node.x(), y: node.y() } : o,
-                  ),
-                )
-              }
-            }}
           />
         )
       }
@@ -917,6 +1154,7 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
     const commitText = useCallback(
       (pos: { x: number; y: number }, value: string) => {
         if (!value.trim()) return
+        userEditedRef.current = true
         commitObjects(prev => [
           ...prev,
           { id: uid(), type: 'text' as Tool, x: pos.x, y: pos.y, text: value, color, strokeWidth },
@@ -994,17 +1232,25 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
                 // too — without that, the gap would compress as the image
                 // was scaled down.
                 <Group
+                  id="__delete_handle__"
+                  ref={deleteHandleRef}
                   x={deleteHandle.x + 12 / scale}
                   y={deleteHandle.y - 12 / scale}
                   scaleX={1 / scale}
                   scaleY={1 / scale}
                   onClick={(e) => {
                     e.cancelBubble = true
+                    // Reset the cursor here — clicking the X destroys the group
+                    // before Konva fires mouseLeave, so 'pointer' would stick.
+                    document.body.style.cursor = ''
+                    userEditedRef.current = true
                     commitObjects(prev => prev.filter(o => o.id !== selectedId))
                     setSelectedId(null)
                   }}
                   onTap={(e) => {
                     e.cancelBubble = true
+                    document.body.style.cursor = ''
+                    userEditedRef.current = true
                     commitObjects(prev => prev.filter(o => o.id !== selectedId))
                     setSelectedId(null)
                   }}
@@ -1018,45 +1264,51 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
               )}
             </Layer>
           </Stage>
-        </div>
 
-        {textInput && (
-          <div
-            className="absolute z-10"
-            style={{ left: textInput.screenX, top: textInput.screenY }}
-            onMouseDown={e => e.stopPropagation()}
-          >
-            <input
-              ref={textInputRef}
-              value={textValue}
-              onChange={e => setTextValue(e.target.value)}
-              onKeyDown={e => {
-                if (e.key === 'Enter') {
-                  commitText(textInput, textValue)
-                  setTextInput(null)
-                  setTextValue('')
-                } else if (e.key === 'Escape') {
-                  setTextInput(null)
-                  setTextValue('')
-                }
-              }}
-              onBlur={() => {
-                setTimeout(() => {
-                  setTextInput(prev => {
-                    if (!prev) return null
-                    const val = textInputRef.current?.value ?? ''
-                    commitText(prev, val)
-                    return null
-                  })
-                  setTextValue('')
-                }, 150)
-              }}
-              className="bg-slate-900/90 border border-primary/50 text-white text-sm px-3 py-2 rounded-xl outline-none min-w-[160px] backdrop-blur-sm shadow-lg"
-              style={{ fontFamily: 'Manrope, sans-serif' }}
-              placeholder="Type text, Enter to confirm..."
-            />
-          </div>
-        )}
+          {/* Text-entry overlay. Rendered INSIDE the stage wrapper (the
+              centered + panned absolute div) so screenX/screenY — which come
+              from stage.getPointerPosition() and are stage-content-relative —
+              map straight to the input's position. Placing it in the outer
+              container instead would shift it by the centering offset and pan,
+              landing the input away from where the user clicked. */}
+          {textInput && (
+            <div
+              className="absolute z-10"
+              style={{ left: textInput.screenX, top: textInput.screenY }}
+              onMouseDown={e => e.stopPropagation()}
+            >
+              <input
+                ref={textInputRef}
+                value={textValue}
+                onChange={e => setTextValue(e.target.value)}
+                onKeyDown={e => {
+                  if (e.key === 'Enter') {
+                    commitText(textInput, textValue)
+                    setTextInput(null)
+                    setTextValue('')
+                  } else if (e.key === 'Escape') {
+                    setTextInput(null)
+                    setTextValue('')
+                  }
+                }}
+                onBlur={() => {
+                  setTimeout(() => {
+                    setTextInput(prev => {
+                      if (!prev) return null
+                      const val = textInputRef.current?.value ?? ''
+                      commitText(prev, val)
+                      return null
+                    })
+                    setTextValue('')
+                  }, 150)
+                }}
+                className="bg-slate-900/90 border border-primary/50 text-white text-sm px-3 py-2 rounded-xl outline-none min-w-[160px] backdrop-blur-sm shadow-lg"
+                style={{ fontFamily: 'Manrope, sans-serif' }}
+                placeholder="Type text, Enter to confirm..."
+              />
+            </div>
+          )}
+        </div>
       </div>
     )
   },

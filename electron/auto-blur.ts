@@ -29,7 +29,14 @@ export async function scanForSensitiveData(
   dataUrl: string,
   settings?: Partial<AutoBlurSettings>
 ): Promise<AutoBlurResult> {
-  const config = { ...DEFAULT_SETTINGS, ...settings }
+  // Deep-merge `categories` — a plain shallow `{...DEFAULT, ...settings}` would
+  // let a partial `categories` object replace the whole map and silently wipe
+  // any category the caller didn't name, disabling its detection.
+  const config: AutoBlurSettings = {
+    ...DEFAULT_SETTINGS,
+    ...settings,
+    categories: { ...DEFAULT_SETTINGS.categories, ...(settings?.categories ?? {}) },
+  }
   const enabledCategories = new Set(
     (Object.entries(config.categories) as [SensitiveCategory, boolean][])
       .filter(([, enabled]) => enabled)
