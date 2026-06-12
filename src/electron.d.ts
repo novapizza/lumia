@@ -4,6 +4,7 @@ interface AppSettings {
   defaultSavePath: string
   theme: 'dark' | 'light' | 'system'
   activeWorkflowId: string
+  lastSeenReleaseVersion: string
   googleDriveRefreshToken: string
   googleDriveAccessToken: string
   // Derived flag sent by settings:get in place of the raw tokens (which are

@@ -8,6 +8,15 @@ interface ReleaseNote {
 
 const RELEASE_NOTES: ReleaseNote[] = [
   {
+    version: '2.1.0',
+    highlights: [
+      { icon: 'fast_forward', title: 'Seekable recordings', description: 'Screen recordings now scrub correctly in Lumia, VLC, and browsers — the timeline finally works.' },
+      { icon: 'memory', title: 'Long recordings, low memory', description: 'Long captures stream to disk instead of piling up in memory, so they no longer fail or balloon RAM when saving.' },
+      { icon: 'visibility_off', title: 'Offline auto-blur', description: 'Auto-blur of sensitive content (emails, keys, cards) now works fully offline.' },
+      { icon: 'verified', title: 'Stability & security', description: 'Dozens of fixes across capture, recording, the editor, and uploads, plus hardened token and local-file handling.' },
+    ],
+  },
+  {
     version: '1.0.2',
     highlights: [
       { icon: 'undo', title: 'Undo & Redo', description: 'Full undo/redo support in the annotation editor with cross-platform hotkeys (Cmd/Ctrl+Z, Cmd/Ctrl+Shift+Z, Ctrl+Y)' },

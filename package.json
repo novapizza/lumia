@@ -1,6 +1,6 @@
 {
   "name": "lumia",
-  "version": "2.0.3",
+  "version": "2.1.0",
   "author": "emtyty",
   "description": "A cross-platform screen capture, annotation, and sharing tool for Windows and macOS",
   "main": "out/main/index.js",
