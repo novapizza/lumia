@@ -40,7 +40,14 @@ module.exports = {
   productName: 'Lumia',
   publish,
 
-  files: ['out/**/*'],
+  files: [
+    'out/**/*',
+    // ffmpeg-static ships an ~80 MB host-arch binary used only in dev. Packaged
+    // builds get the correct per-arch ffmpeg placed in Resources by the
+    // afterPack hook (build/embed-ffmpeg.cjs), so drop the bundled one.
+    '!**/ffmpeg-static/ffmpeg',
+    '!**/ffmpeg-static/ffmpeg.exe',
+  ],
 
   extraResources: [
     {
@@ -69,10 +76,10 @@ module.exports = {
     output: 'release'
   },
 
-  // koffi: native FFI .node binaries. ffmpeg-static: the ffmpeg executable —
-  // must live outside the asar to be spawnable (the runtime path is remapped
-  // from app.asar → app.asar.unpacked in electron/ffmpeg-remux.ts).
-  asarUnpack: ['node_modules/koffi/**', 'node_modules/ffmpeg-static/**'],
+  // koffi: native FFI .node binaries must live outside the asar to load.
+  // (ffmpeg is shipped as a per-arch binary in Resources by the afterPack hook,
+  // not from node_modules, so it doesn't need asarUnpack.)
+  asarUnpack: ['node_modules/koffi/**'],
 
   // ── Windows ────────────────────────────────────────────────────────────────
   // Code signing in CI uses Azure Trusted Signing — auth (tenant/client/
@@ -122,6 +129,10 @@ module.exports = {
   // afterSign runs after code-signing; build/notarize.cjs skips gracefully
   // when APPLE_* vars are absent.
   afterSign: 'build/notarize.cjs',
+
+  // Embeds the correct per-arch ffmpeg into each build's Resources. Runs once
+  // per packed arch, before code-signing (so the binary gets signed on macOS).
+  afterPack: 'build/embed-ffmpeg.cjs',
 
   mac: {
     icon: 'resources/icons/mac/icon.icns',

@@ -16,16 +16,19 @@ import { rename, unlink } from 'fs/promises'
 import { dirname, join, basename } from 'path'
 import { app } from 'electron'
 
-/** Resolve the bundled ffmpeg binary. In a packaged app the module path lands
- *  inside app.asar (not executable), so remap to the unpacked copy — which
- *  electron-builder's asarUnpack puts at app.asar.unpacked. */
+/** Resolve the ffmpeg binary.
+ *  - Packaged: the afterPack hook (build/embed-ffmpeg.cjs) places a per-arch
+ *    binary in Resources. ffmpeg-static can't be used here because it only
+ *    ships the build-host's arch, which would be wrong for the cross-arch
+ *    installers.
+ *  - Dev: ffmpeg-static's host-arch binary is exactly right. */
 function resolveFfmpegPath(): string | null {
+  if (app.isPackaged) {
+    return join(process.resourcesPath, process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg')
+  }
   try {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
-    let ffmpegPath = require('ffmpeg-static') as string | null
-    if (!ffmpegPath) return null
-    if (app.isPackaged) ffmpegPath = ffmpegPath.replace('app.asar', 'app.asar.unpacked')
-    return ffmpegPath
+    return (require('ffmpeg-static') as string | null) ?? null
   } catch {
     return null
   }
