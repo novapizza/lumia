@@ -24,16 +24,10 @@ import { makeThumbnail } from './thumbnail'
 import { openAnnotation, closeAnnotation, destroyAnnotation, isAnnotationOpen, setupAnnotation } from './annotation'
 import { forceWindowsExcludeFromCapture } from './native-input'
 import { getWatermarkLogoDataUrl } from './watermark'
-import { makeWebmSeekable } from './webm-seekable'
+import { remuxWebmInPlace } from './ffmpeg-remux'
 
 const HIDE_DELAY_MS = process.platform === 'darwin' ? 250 : 200
 const OVERLAY_GONE_DELAY_MS = 120
-
-// Above this size, skip the seekable-remux: ts-ebml reads the whole file into
-// memory (a few × its size in transient buffers), so for multi-GB recordings
-// it would OOM. Such files stay non-seekable but are saved intact. Normal
-// recordings are comfortably under this.
-const REMUX_MAX_BYTES = 600 * 1024 * 1024
 
 const isDev = !app.isPackaged
 
@@ -718,21 +712,11 @@ export function setupVideo() {
 
       // Make the recording seekable. MediaRecorder writes a streaming WebM with
       // no Cues/Duration, so the scrubber is dead in every player until we
-      // inject them. Lossless (container-only) rewrite via ts-ebml. Skipped for
-      // very large files (would OOM) and on any failure — the recording is
-      // never lost, it just stays non-seekable.
-      if (bytes <= REMUX_MAX_BYTES) {
-        try {
-          const { readFile, writeFile } = await import('fs/promises')
-          const original = await readFile(filePath)
-          const seekable = makeWebmSeekable(original)
-          await writeFile(filePath, seekable)
-        } catch (err) {
-          console.error('[video] seekable remux failed — saving original (non-seekable)', err)
-        }
-      } else {
-        console.warn(`[video] recording is ${Math.round(bytes / 1e6)}MB — skipping seekable remux to avoid OOM`)
-      }
+      // rebuild the container. ffmpeg -c copy does this losslessly and streams
+      // from disk (flat memory at any file size). On failure the original is
+      // kept — it still plays, just may not seek.
+      const seekable = await remuxWebmInPlace(filePath)
+      if (!seekable) console.warn('[video] seekable remux skipped/failed — recording saved as-is')
 
       const { historyId } = await recordHistoryAndNotify(filePath, thumbnailDataUrl, durationMs)
       sendToToolbar('toolbar:state', { phase: 'done' })

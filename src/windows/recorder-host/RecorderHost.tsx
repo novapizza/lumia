@@ -1,5 +1,4 @@
 import { useEffect, useRef } from 'react'
-import fixWebmDuration from 'fix-webm-duration'
 
 interface RecordingTarget {
   kind: 'region' | 'window' | 'screen'
@@ -36,11 +35,6 @@ const AUDIO_BITRATE = 192_000
 // Trade-off: small-region recordings now produce noticeably bigger files.
 const MIN_OUTPUT_LONG_SIDE = 1280
 
-// fix-webm-duration reads the entire blob into memory to rewrite the EBML
-// header, so for very large recordings it's itself an OOM hazard. Above this
-// size we skip the duration patch (the file stays playable, just without a
-// seekbar duration) rather than risk crashing the finalize.
-const DURATION_PATCH_MAX_BYTES = 1_500_000_000
 // Slice size for streaming the finished blob to disk over IPC. Bounded so peak
 // transfer memory is one slice regardless of total recording length.
 const SAVE_SLICE_BYTES = 16 * 1024 * 1024
@@ -328,19 +322,14 @@ export default function RecorderHost() {
     const chunks = chunksRef.current
     chunksRef.current = []
     const durationMs = accumulatedMsRef.current
-    let blob = new Blob(chunks, { type: 'video/webm' })
+    const blob = new Blob(chunks, { type: 'video/webm' })
     teardownStreams()
 
-    // MediaRecorder streams WebM progressively and never writes the duration
-    // cue, so without this patch `<video>.duration` is Infinity and no player
-    // (Lumia, VLC, browsers) can show a correct timeline. Inject the real
-    // duration into the EBML header before the file touches disk. Skip for
-    // huge recordings — fix-webm-duration buffers the whole blob and would
-    // itself OOM (the file is still playable, just without a seekbar length).
-    if (durationMs > 0 && blob.size <= DURATION_PATCH_MAX_BYTES) {
-      try { blob = await fixWebmDuration(blob, durationMs, { logger: false }) }
-      catch { /* fall back to unpatched blob — still playable, just no duration */ }
-    }
+    // No duration patch here: MediaRecorder omits the duration AND the Cues
+    // seek index, and the main process now rebuilds both in one pass with
+    // `ffmpeg -c copy` after the file lands on disk (streams from disk, flat
+    // memory) — far cheaper than the old in-renderer fix-webm-duration, which
+    // read the whole blob into memory.
 
     let thumbnail = ''
     try { thumbnail = await extractThumbnail(blob) } catch { /* ignore */ }

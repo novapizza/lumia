@@ -69,7 +69,10 @@ module.exports = {
     output: 'release'
   },
 
-  asarUnpack: ['node_modules/koffi/**'],
+  // koffi: native FFI .node binaries. ffmpeg-static: the ffmpeg executable —
+  // must live outside the asar to be spawnable (the runtime path is remapped
+  // from app.asar → app.asar.unpacked in electron/ffmpeg-remux.ts).
+  asarUnpack: ['node_modules/koffi/**', 'node_modules/ffmpeg-static/**'],
 
   // ── Windows ────────────────────────────────────────────────────────────────
   // Code signing in CI uses Azure Trusted Signing — auth (tenant/client/
