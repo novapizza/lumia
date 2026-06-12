@@ -4,13 +4,13 @@ import fs from 'fs/promises'
 import { setupCapture, ORIGINALS_DIR, getFrozenBgrForDisplay, prewarmDesktopCapturer } from './capture'
 import { getIccFromPng, tagPngWithIcc } from './png-icc'
 import { setupVideo, isRecordingActive } from './video'
-import { uploadToR2 } from './uploaders/r2'
+import { uploadFileToR2 } from './uploaders/r2'
 import {
   refreshGoogleToken,
   revokeGoogleToken,
   exchangeGoogleAuthCode,
 } from './uploaders/googledrive'
-import { uploadFileBufferToDrive } from './google-drive-service'
+import { uploadFilePathToDrive } from './google-drive-service'
 import { localTimestamp } from './utils'
 import { registerOverlayHwnd, unregisterOverlayHwnd, disableDwmTransitions } from './native-input'
 import { setupHotkeys, teardownHotkeys, getHotkeys, saveHotkeys, resetHotkeys, defaultHotkeys, type HotkeyConfig } from './hotkeys'
@@ -1223,13 +1223,11 @@ app.whenReady().then(async () => {
       return existing
     }
 
-    const { readFile } = await import('fs/promises')
     const { extname } = await import('path')
 
     // Prefer the annotated sidecar when present so shared links carry the
     // user's final edited version rather than the untouched original.
     const sourcePath = item.annotatedFilePath ?? item.filePath
-    const buffer = await readFile(sourcePath)
     const ext = extname(sourcePath).replace(/^\./, '').toLowerCase() || (item.type === 'recording' ? 'webm' : 'png')
     const isVideo = item.type === 'recording'
     const contentType = isVideo
@@ -1237,8 +1235,9 @@ app.whenReady().then(async () => {
       : (ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : 'image/png')
     const keyPrefix = isVideo ? 'recordings' : 'captures'
 
-    const res = await uploadToR2(
-      { buffer, contentType, ext, keyPrefix },
+    const res = await uploadFileToR2(
+      sourcePath,
+      { contentType, ext, keyPrefix },
       import.meta.env.MAIN_VITE_R2_ACCOUNT_ID,
       import.meta.env.MAIN_VITE_R2_ACCESS_KEY_ID,
       import.meta.env.MAIN_VITE_R2_SECRET_ACCESS_KEY,
@@ -1286,7 +1285,6 @@ app.whenReady().then(async () => {
       return { destination: 'google-drive', success: false, error: 'No Drive folder selected — choose one in Settings → Google Drive.' }
     }
 
-    const { readFile } = await import('fs/promises')
     const { extname, basename } = await import('path')
     const sourcePath = item.annotatedFilePath ?? item.filePath
     const ext = extname(sourcePath).replace(/^\./, '').toLowerCase()
@@ -1295,13 +1293,13 @@ app.whenReady().then(async () => {
       ? (ext === 'mp4' ? 'video/mp4' : 'video/webm')
       : (ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : 'image/png')
 
-    // Pass the raw buffer straight to the resumable uploader — no base64
-    // data-URL intermediary. For a recording that round-trip held the whole
-    // file plus a ~1.33× base64 string in memory and blocked the main thread
-    // on the sync toString('base64'). The service wrapper handles token
-    // refresh (with in-flight dedup + 401 retry) and the default folder.
-    const buffer = await readFile(sourcePath)
-    const res = await uploadFileBufferToDrive(buffer, mimeType, basename(sourcePath))
+    // Stream the file straight from disk to the resumable uploader — no
+    // whole-file buffer and no base64 data-URL intermediary. For a recording
+    // that round-trip held the whole file plus a ~1.33× base64 string in
+    // memory and blocked the main thread on the sync toString('base64'). The
+    // service wrapper handles token refresh (with in-flight dedup + 401 retry)
+    // and the default folder.
+    const res = await uploadFilePathToDrive(sourcePath, mimeType, basename(sourcePath))
 
     if (res.success && res.url) {
       clipboard.writeText(res.url)

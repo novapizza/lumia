@@ -14,8 +14,8 @@ import {
   isMainDismissed,
 } from './index'
 import { ORIGINALS_DIR } from './capture'
-import { uploadToR2 } from './uploaders/r2'
-import { uploadFileBufferToDrive } from './google-drive-service'
+import { uploadFileToR2 } from './uploaders/r2'
+import { uploadFilePathToDrive } from './google-drive-service'
 import { resetOverlayMode, setOverlayMode } from './scroll-capture'
 import { showNotification } from './notify'
 import { resolveSaveStartDir, rememberSaveDir } from './settings'
@@ -831,13 +831,12 @@ export function setupVideoActions() {
    *  idempotent (same bytes → same URL). */
   ipcMain.handle('video:upload-r2', async (_e, filePath: string) => {
     if (!filePath) throw new Error('No video file path')
-    const { readFile } = await import('fs/promises')
     try {
-      const buffer = await readFile(filePath)
       const ext = extname(filePath).replace(/^\./, '').toLowerCase() || 'webm'
       const contentType = ext === 'mp4' ? 'video/mp4' : 'video/webm'
-      const res = await uploadToR2(
-        { buffer, contentType, ext, keyPrefix: 'recordings' },
+      const res = await uploadFileToR2(
+        filePath,
+        { contentType, ext, keyPrefix: 'recordings' },
         import.meta.env.MAIN_VITE_R2_ACCOUNT_ID,
         import.meta.env.MAIN_VITE_R2_ACCESS_KEY_ID,
         import.meta.env.MAIN_VITE_R2_SECRET_ACCESS_KEY,
@@ -857,13 +856,11 @@ export function setupVideoActions() {
    *  shape as the R2 handler so the editor can dispatch generically. */
   ipcMain.handle('video:upload-google-drive', async (_e, filePath: string) => {
     if (!filePath) throw new Error('No video file path')
-    const { readFile } = await import('fs/promises')
     try {
-      const buffer = await readFile(filePath)
       const ext = extname(filePath).replace(/^\./, '').toLowerCase() || 'webm'
       const contentType = ext === 'mp4' ? 'video/mp4' : 'video/webm'
       const filename = basename(filePath)
-      const res = await uploadFileBufferToDrive(buffer, contentType, filename)
+      const res = await uploadFilePathToDrive(filePath, contentType, filename)
       if (res.success && res.url) {
         clipboard.writeText(res.url)
       }

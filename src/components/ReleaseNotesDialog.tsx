@@ -8,6 +8,13 @@ interface ReleaseNote {
 
 const RELEASE_NOTES: ReleaseNote[] = [
   {
+    version: '2.1.1',
+    highlights: [
+      { icon: 'speed', title: 'Faster uploads', description: 'Recordings now upload to Cloudflare R2 over several parallel connections, making far better use of your internet speed.' },
+      { icon: 'memory', title: 'Lean upload memory', description: 'Uploads stream straight from disk instead of loading the whole file into memory — a 150 MB recording no longer spikes RAM to over a gigabyte.' },
+    ],
+  },
+  {
     version: '2.1.0',
     highlights: [
       { icon: 'fast_forward', title: 'Seekable recordings', description: 'Screen recordings now scrub correctly in Lumia, VLC, and browsers — the timeline finally works.' },

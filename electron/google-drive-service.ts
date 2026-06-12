@@ -80,10 +80,11 @@ export async function uploadImageDataUrlToDrive(imageData: string, folderId?: st
   return uploadToGoogleDrive(imageData, retryToken.value, folder.value)
 }
 
-/** Upload an arbitrary file buffer (used for video recordings) via the
- *  resumable upload protocol so it isn't capped at 5 MB. */
-export async function uploadFileBufferToDrive(
-  buffer: Buffer,
+/** Upload an on-disk file (used for video recordings) via the resumable upload
+ *  protocol so it isn't capped at 5 MB. Streams from disk — no whole-file
+ *  buffer in memory. */
+export async function uploadFilePathToDrive(
+  filePath: string,
   contentType: string,
   filename: string,
   folderId?: string
@@ -92,10 +93,10 @@ export async function uploadFileBufferToDrive(
   if ('error' in token) return fail(token.error)
   const folder = resolveFolder(folderId)
   if ('error' in folder) return fail(folder.error)
-  const result = await uploadFileToGoogleDrive(buffer, contentType, filename, token.value, folder.value)
+  const result = await uploadFileToGoogleDrive(filePath, contentType, filename, token.value, folder.value)
   if (!isAuthError(result)) return result
   // Server-revoked token — force one refresh and retry before giving up.
   const retryToken = await ensureAccessToken(true)
   if ('error' in retryToken) return fail(retryToken.error)
-  return uploadFileToGoogleDrive(buffer, contentType, filename, retryToken.value, folder.value)
+  return uploadFileToGoogleDrive(filePath, contentType, filename, retryToken.value, folder.value)
 }
