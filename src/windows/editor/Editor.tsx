@@ -9,6 +9,7 @@ import { matchToolShortcut } from '../../components/AnnotationCanvas/tools'
 import type { WorkflowTemplate, HistoryItem, SensitiveRegion, AnnotationObject } from '../../types'
 import type { DrawObject } from '../../components/AnnotationCanvas/Canvas'
 import { AutoBlurPanel } from '../../components/AutoBlurPanel'
+import StickerPicker, { type PickedSticker } from '../../components/StickerPicker'
 import { deriveActions, type ActionBtn } from '../../lib/workflow-actions'
 import { useLocalVideoUrl } from '../../hooks/useLocalVideoUrl'
 
@@ -519,6 +520,14 @@ export default function Editor() {
     showToast(`Blurred ${selected.length} region${selected.length > 1 ? 's' : ''}`, 'blur_on')
   }, [autoBlurRegions, autoBlurSelected, showToast])
 
+  const handlePickSticker = useCallback((s: PickedSticker) => {
+    const aspect = s.natural.h > 0 ? s.natural.w / s.natural.h : 1
+    canvasRef.current?.addSticker({ src: s.path, aspect })
+    // Drop back to cursor so the freshly-placed sticker is selected and
+    // draggable, and the picker (gated on tool === 'sticker') closes.
+    setTool('none')
+  }, [])
+
   /* ── Empty state (no source at all — covers both image and video modes) ── */
   const hasSource = isVideo ? !!videoFilePath : !!imageDataUrl
   if (!hasSource) {
@@ -795,6 +804,13 @@ export default function Editor() {
            build; to annotate, extract a frame via the History page or rebuild
            the dedicated video annotator. */}
       {!isVideo && (
+        <div className="relative flex-shrink-0">
+        {tool === 'sticker' && (
+          <StickerPicker
+            onSelect={handlePickSticker}
+            onClose={() => setTool('none')}
+          />
+        )}
         <AnnotationToolBar
           tool={tool} setTool={setTool}
           color={color} setColor={setColor}
@@ -817,6 +833,7 @@ export default function Editor() {
             </button>
           }
         />
+        </div>
       )}
 
       {/* No playback bar — the native HTML5 <video controls> provides

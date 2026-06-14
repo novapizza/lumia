@@ -255,6 +255,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   wallpapersSetAsWallpaper: (photo: unknown) =>
     ipcRenderer.invoke('wallpapers:setAsWallpaper', photo),
 
+  // Stickers (R2-hosted, manifest-driven)
+  stickersManifest: (opts?: { force?: boolean }) => ipcRenderer.invoke('stickers:manifest', opts),
+  stickersFetch: (relPath: string) => ipcRenderer.invoke('stickers:fetch', relPath),
+
   // Clipboard
   writeClipboardText: (text: string) => ipcRenderer.invoke('clipboard:writeText', text),
 

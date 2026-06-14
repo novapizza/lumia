@@ -43,6 +43,68 @@ export interface DrawObject {
   strokeWidth: number
   fill?: string
   isBlur?: boolean
+  /** Sticker only: relative R2 path (e.g. "cat-stickers/01-love.png"). Resolved
+   *  to a same-origin data URL via the main process so the canvas can be
+   *  exported without cross-origin tainting. */
+  src?: string
+}
+
+// ── Sticker image resolution ────────────────────────────────────────────────
+// Sticker bytes are fetched + disk-cached in the main process and returned as
+// data URLs (loading remote URLs straight into Konva would taint the canvas and
+// break toDataURL on Save/Copy/Upload). Memoise the per-path promise so the same
+// sticker placed twice, or replayed from history, only crosses IPC once.
+const stickerUrlCache = new Map<string, Promise<string>>()
+function resolveStickerUrl(relPath: string): Promise<string> {
+  let p = stickerUrlCache.get(relPath)
+  if (!p) {
+    p = window.electronAPI.stickersFetch(relPath).then(r => {
+      if (r.ok) return r.dataUrl
+      throw new Error(r.error)
+    })
+    // Drop a rejected entry so a later render can retry instead of caching the
+    // failure forever.
+    p.catch(() => { stickerUrlCache.delete(relPath) })
+    stickerUrlCache.set(relPath, p)
+  }
+  return p
+}
+
+/** Renders one sticker as a draggable/resizable Konva image. Split into its own
+ *  component because resolving the src → data URL needs hooks (useState/useImage)
+ *  that can't run inside the renderObj loop. */
+function StickerImage({
+  obj, selectable, interactive, onLoaded,
+}: {
+  obj: DrawObject
+  selectable: boolean
+  interactive: Record<string, unknown>
+  onLoaded?: () => void
+}) {
+  const [src, setSrc] = useState<string | undefined>(undefined)
+  useEffect(() => {
+    if (!obj.src) return
+    let alive = true
+    resolveStickerUrl(obj.src).then(url => { if (alive) setSrc(url) }).catch(() => {})
+    return () => { alive = false }
+  }, [obj.src])
+  const [img] = useImage(src ?? '')
+  // Notify once the bitmap is ready so the parent can (re)attach the Transformer
+  // to a node that didn't exist when the sticker was first placed/selected.
+  useEffect(() => { if (img) onLoaded?.() }, [img, onLoaded])
+  if (!img) return null
+  return (
+    <KonvaImage
+      id={obj.id}
+      image={img}
+      x={obj.x}
+      y={obj.y}
+      width={obj.width}
+      height={obj.height}
+      draggable={selectable}
+      {...interactive}
+    />
+  )
 }
 
 /** Imperative handle exposed to parent via ref. */
@@ -74,6 +136,10 @@ export interface CanvasHandle {
    *  ids are replaced with fresh canvas-namespaced ones so Konva node lookup
    *  stays consistent. */
   addObjects: (objs: Omit<DrawObject, 'id'>[]) => void
+  /** Place a sticker centred on the image (sized to ~30% of natural width,
+   *  aspect preserved) and select it. `src` is the manifest-relative path;
+   *  `aspect` is naturalWidth/naturalHeight of the sticker artwork. */
+  addSticker: (opts: { src: string; aspect: number }) => void
 }
 
 interface Props {
@@ -185,6 +251,11 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
     const layerRef     = useRef<Konva.Layer>(null)
     const containerRef = useRef<HTMLDivElement>(null)
     const [isDrawing, setIsDrawing] = useState(false)
+    // Bumped each time a sticker bitmap finishes loading — used as a Transformer
+    // effect dependency so selection handles attach to stickers that mount
+    // asynchronously (after their data URL resolves over IPC).
+    const [stickerLoadTick, setStickerLoadTick] = useState(0)
+    const bumpStickerTick = useCallback(() => setStickerLoadTick(t => t + 1), [])
     // Mirrors `isDrawing` but drives the commit guard. Both the Stage's
     // onMouseUp and the window-level mouseup fallback fire for the same
     // gesture with no re-render between them, so the React `isDrawing` state
@@ -683,6 +754,25 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
       commitObjects([...objectsRef.current, ...stamped])
     }, [commitObjects])
 
+    // Place a sticker centred on the image, sized to ~30% of the image's
+    // natural width with its own aspect preserved, then select it so the user
+    // can immediately drag/resize. Lives here (not the Editor) because the
+    // natural dimensions and selection state are local to the canvas.
+    const addSticker = useCallback((opts: { src: string; aspect: number }) => {
+      const aspect = opts.aspect > 0 ? opts.aspect : 1
+      const w = Math.max(48, Math.round(naturalW * 0.3))
+      const h = Math.round(w / aspect)
+      const x = Math.round((naturalW - w) / 2)
+      const y = Math.round((naturalH - h) / 2)
+      const id = uid()
+      userEditedRef.current = true
+      commitObjects([
+        ...objectsRef.current,
+        { id, type: 'sticker', src: opts.src, x, y, width: w, height: h, color: '#000000', strokeWidth: 0 },
+      ])
+      setSelectedId(id)
+    }, [commitObjects, naturalW, naturalH])
+
     // Undo/redo are user actions too — flip the edit latch so the parent's
     // debounced save fires for them (otherwise undoing the only edit back to
     // the baseline length would look like rehydration and skip the save).
@@ -693,8 +783,8 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
     useImperativeHandle(ref, () => ({
       undo: undoUser, redo: redoUser, clear: clearViaCommit, canUndo, canRedo,
       zoomIn, zoomOut, zoomReset, zoomLevel: userZoom,
-      toDataURL, toCanvas, toAnnotationsCanvas, getObjects, addObjects,
-    }), [undoUser, redoUser, clearViaCommit, canUndo, canRedo, zoomIn, zoomOut, zoomReset, userZoom, toDataURL, toCanvas, toAnnotationsCanvas, getObjects, addObjects])
+      toDataURL, toCanvas, toAnnotationsCanvas, getObjects, addObjects, addSticker,
+    }), [undoUser, redoUser, clearViaCommit, canUndo, canRedo, zoomIn, zoomOut, zoomReset, userZoom, toDataURL, toCanvas, toAnnotationsCanvas, getObjects, addObjects, addSticker])
 
     // ── Export trigger (legacy path — kept for Editor's workflow buttons) ────
     useEffect(() => {
@@ -713,7 +803,7 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
       const node = stage.findOne('#' + selectedId)
       if (node) { tr.nodes([node]); tr.getLayer()?.batchDraw() }
       else tr.nodes([])
-    }, [selectedId, objects])
+    }, [selectedId, objects, stickerLoadTick])
 
     // Deselect when switching to a drawing tool. The cursor tool ('none')
     // is the only mode where selection is valid.
@@ -957,6 +1047,16 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
         if (o.type === 'text') {
           return { ...o, x: nx, y: ny }
         }
+        if (o.type === 'sticker') {
+          // Same as rect: x/y are absolute, scale bakes into width/height.
+          return {
+            ...o,
+            x: nx,
+            y: ny,
+            width: (o.width ?? 0) * sx,
+            height: (o.height ?? 0) * sy,
+          }
+        }
         return o
       }))
       // Reset the node transform — the committed data already encodes it. Scale
@@ -1148,6 +1248,19 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
           />
         )
       }
+      if (obj.type === 'sticker') {
+        // Previews never apply to stickers (they're placed via addObjects, not
+        // dragged out), so commonInteractive is always the real handler set.
+        return (
+          <StickerImage
+            key={key}
+            obj={obj}
+            selectable={selectable}
+            interactive={commonInteractive || {}}
+            onLoaded={bumpStickerTick}
+          />
+        )
+      }
       return null
     }
 
@@ -1216,6 +1329,14 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
               <Transformer
                 ref={trRef}
                 rotateEnabled={false}
+                // Stickers resize from the corners with locked aspect ratio so
+                // the artwork never distorts; other shapes keep free resize.
+                keepRatio={objects.find(o => o.id === selectedId)?.type === 'sticker'}
+                enabledAnchors={
+                  objects.find(o => o.id === selectedId)?.type === 'sticker'
+                    ? ['top-left', 'top-right', 'bottom-left', 'bottom-right']
+                    : undefined
+                }
                 borderStroke="#a78bfa"
                 anchorStroke="#a78bfa"
                 anchorFill="#ffffff"

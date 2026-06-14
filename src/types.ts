@@ -105,6 +105,27 @@ export interface AutoBlurResult {
   detectTimeMs: number
 }
 
+/** One sticker within a category. `path` is relative to the stickers base URL
+ *  and doubles as the cache key + the argument passed to `stickersFetch`. */
+export interface StickerEntry {
+  id: string
+  name: string
+  path: string
+}
+
+export interface StickerCategory {
+  id: string
+  name: string
+  /** Relative path to the category's tab icon (the WhatsApp-style top tab). */
+  icon: string
+  stickers: StickerEntry[]
+}
+
+export interface StickerManifest {
+  version: number
+  categories: StickerCategory[]
+}
+
 export interface UnsplashPhoto {
   id: string
   description: string | null

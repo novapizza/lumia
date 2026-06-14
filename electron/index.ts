@@ -16,6 +16,7 @@ import { registerOverlayHwnd, unregisterOverlayHwnd, disableDwmTransitions } fro
 import { setupHotkeys, teardownHotkeys, getHotkeys, saveHotkeys, resetHotkeys, defaultHotkeys, type HotkeyConfig } from './hotkeys'
 import { setupTray, destroyTray } from './tray'
 import { setupScrollCapture, getOverlayMode } from './scroll-capture'
+import { setupStickers } from './stickers'
 import { WorkflowEngine } from './workflow'
 import { TemplateStore } from './templates'
 import { HistoryStore } from './history'
@@ -870,6 +871,7 @@ app.whenReady().then(async () => {
 
   setupCapture()
   setupVideo()
+  setupStickers()
   setupHotkeys()
   setupTray()
   setupScrollCapture(mainWindow, createOverlayWindows, closeAllOverlays, getOverlayDisplayId, restoreFromOverlayCancel)
