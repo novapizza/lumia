@@ -2,6 +2,7 @@ import { app, BrowserWindow, ipcMain, shell, dialog, nativeImage, clipboard, scr
 import { join, dirname } from 'path'
 import fs from 'fs/promises'
 import { setupCapture, ORIGINALS_DIR, getFrozenBgrForDisplay, prewarmDesktopCapturer } from './capture'
+import { prewarmNativeCapture } from './native-screen'
 import { getIccFromPng, tagPngWithIcc } from './png-icc'
 import { setupVideo, isRecordingActive } from './video'
 import { uploadFileToR2 } from './uploaders/r2'
@@ -517,6 +518,16 @@ function addOverlayToPool(display: Electron.Display): BrowserWindow {
       preload: join(__dirname, '../preload/index.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      // Pool overlays live hidden (opacity 0, showInactive) between captures.
+      // With the default backgroundThrottling, Chromium throttles a non-visible
+      // renderer's timers and — critically — its requestAnimationFrame loop
+      // after it's been idle. That stalls the double-rAF in Overlay.tsx that
+      // gates `overlay:bg-ready`, so on the first capture (or one after a long
+      // idle) the ack arrives late and the overlay surfaces slowly — worst case
+      // not until the 1500ms BG_READY_TIMEOUT_MS fallback. Disabling throttling
+      // keeps the pre-warmed renderer at full frame rate so the snapshot paints
+      // and acks immediately. Matches the recording windows in video.ts.
+      backgroundThrottling: false,
     }
   })
 
@@ -877,6 +888,11 @@ app.whenReady().then(async () => {
   // Init the desktopCapturer pipeline now so the first hotkey press doesn't
   // pay the ~300-500ms cold-start. Fire-and-forget — no consumer waits on it.
   void prewarmDesktopCapturer()
+
+  // Warm the GDI capture path too — it's the primary screenshot route on
+  // Windows now, and its first call does the koffi/user32/gdi32 binding. Warm
+  // it here so the first hotkey doesn't pay that load. No-op off Windows.
+  prewarmNativeCapture()
 
   // Pre-warm the overlay pool: one hidden BrowserWindow per display, with
   // the renderer already loaded. The first capture after boot drops from

@@ -11,7 +11,6 @@ export interface AppSettings {
   defaultSavePath: string
   theme: 'dark' | 'light' | 'system'
   activeWorkflowId: string
-  lastSeenReleaseVersion: string
   googleDriveRefreshToken: string
   googleDriveAccessToken: string
   googleDriveTokenExpiresAt: number
@@ -70,7 +69,6 @@ const store = new Store<AppSettings>({
     defaultSavePath: join(homedir(), 'Downloads'),
     theme: 'system',
     activeWorkflowId: 'builtin-r2',
-    lastSeenReleaseVersion: '',
     googleDriveRefreshToken: '',
     googleDriveAccessToken: '',
     googleDriveTokenExpiresAt: 0,
@@ -103,7 +101,6 @@ export function getSettings(): AppSettings {
     defaultSavePath: store.get('defaultSavePath'),
     theme: store.get('theme'),
     activeWorkflowId: store.get('activeWorkflowId'),
-    lastSeenReleaseVersion: store.get('lastSeenReleaseVersion'),
     googleDriveRefreshToken: store.get('googleDriveRefreshToken'),
     googleDriveAccessToken: store.get('googleDriveAccessToken'),
     googleDriveTokenExpiresAt: store.get('googleDriveTokenExpiresAt'),

@@ -174,7 +174,7 @@ lumia/
 │   │   ├── ShareDialog.tsx · WorkflowSelector.tsx
 │   │   ├── AutoBlurPanel.tsx · BackgroundPanel.tsx
 │   │   ├── HistoryListRow.tsx · DateGroupedGrid.tsx
-│   │   ├── UpdateNotification.tsx · AboutDialog.tsx · ReleaseNotesDialog.tsx
+│   │   ├── UpdateNotification.tsx · AboutDialog.tsx
 │   │   ├── ScrollCaptureDialog.tsx
 │   │   └── AnnotationCanvas/
 │   │       ├── Canvas.tsx          # Konva stage — all drawing tools

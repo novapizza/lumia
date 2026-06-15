@@ -175,3 +175,15 @@ export async function captureDisplayNative(
   if (process.platform === 'win32') return captureDisplayGdi(display)
   return null
 }
+
+/**
+ * One-shot warm-up of the GDI capture path. The first call does koffi.load +
+ * user32/gdi32 binding (~tens of ms) inside ensureLoaded(), which would
+ * otherwise land on the critical path of the user's first hotkey capture.
+ * Fire-and-forget from app.whenReady(). A 1×1 BitBlt is enough to force the
+ * bindings without grabbing a full display. No-op off Windows.
+ */
+export function prewarmNativeCapture(): void {
+  if (process.platform !== 'win32') return
+  try { captureRectGdi(0, 0, 1, 1) } catch { /* silent — best-effort */ }
+}

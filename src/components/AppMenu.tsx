@@ -88,7 +88,6 @@ export function AppMenu({ open, onClose, anchorRef }: AppMenuProps) {
   if (import.meta.env.DEV) {
     items.push(
       { type: 'separator' },
-      { type: 'item', label: 'Release Notes', icon: 'new_releases', action: () => window.dispatchEvent(new Event('app:show-release-notes')) },
       { type: 'item', label: 'Toggle DevTools', icon: 'code', shortcut: shortcut(isMac ? 'Alt+CmdOrCtrl+I' : 'Ctrl+Shift+I'), action: () => window.electronAPI?.toggleDevTools() },
       { type: 'item', label: 'Reload', icon: 'refresh', shortcut: shortcut('CmdOrCtrl+R'), action: () => window.electronAPI?.reloadWindow() },
       { type: 'item', label: 'Force Reload', icon: 'sync', shortcut: shortcut('CmdOrCtrl+Shift+R'), action: () => window.electronAPI?.forceReloadWindow() },
