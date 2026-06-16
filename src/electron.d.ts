@@ -199,6 +199,16 @@ declare global {
         | { ok: false; error: string }
       >
 
+      // Stickers (R2-hosted, manifest-driven)
+      stickersManifest: (opts?: { force?: boolean }) => Promise<
+        | { ok: true; manifest: import('@/types').StickerManifest }
+        | { ok: false; error: string }
+      >
+      stickersFetch: (relPath: string) => Promise<
+        | { ok: true; dataUrl: string }
+        | { ok: false; error: string }
+      >
+
       writeClipboardText: (text: string) => Promise<void>
       openExternal: (url: string) => Promise<void>
       openPath: (path: string) => Promise<void>

@@ -2,7 +2,7 @@
  *  annotator. Keep this file free of React imports so it can be consumed by
  *  pure render helpers too. */
 
-export type Tool = 'none' | 'pen' | 'rect' | 'ellipse' | 'arrow' | 'text' | 'blur'
+export type Tool = 'none' | 'pen' | 'rect' | 'ellipse' | 'arrow' | 'text' | 'blur' | 'sticker'
 
 export interface ToolDef {
   id: Tool
@@ -34,6 +34,7 @@ export const DRAW_TOOLS: ToolDef[] = [
 export const EXTRA_TOOLS: ToolDef[] = [
   { id: 'blur',    icon: 'blur_on',           label: 'Blur',      shortcut: 'B' },
   { id: 'text',    icon: 'title',             label: 'Text',      shortcut: 'T' },
+  { id: 'sticker', icon: 'add_reaction',      label: 'Sticker',   shortcut: 'S' },
 ]
 
 /** All tools in a single lookup — used for keyboard shortcut handling. */

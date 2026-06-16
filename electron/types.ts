@@ -51,6 +51,10 @@ export interface AnnotationObject {
   strokeWidth: number
   fill?: string
   isBlur?: boolean
+  /** Sticker only: manifest-relative R2 path (e.g. "cat-stickers/01-love.png").
+   *  Stored instead of the data URL so history.json stays small; the renderer
+   *  re-resolves it through the cached sticker fetch on reopen. */
+  src?: string
 }
 
 export interface HistoryItem {
