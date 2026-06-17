@@ -65,7 +65,12 @@ async function loadManifest(force = false): Promise<unknown> {
   if (!force && manifestCache && Date.now() - manifestCache.at < MANIFEST_TTL_MS) {
     return manifestCache.value
   }
-  const { status, buffer } = await netGet(`${STICKERS_BASE_URL}/stickers.json`)
+  // r2.dev sends no Cache-Control (only ETag/Last-Modified), so Chromium's net
+  // stack caches stickers.json heuristically and won't see new uploads for a
+  // long time — even across restarts. A per-fetch cache-busting query param
+  // forces a fresh copy. The in-memory TTL above still bounds how often we hit
+  // the network; per-sticker PNGs (immutable paths) stay disk-cached as before.
+  const { status, buffer } = await netGet(`${STICKERS_BASE_URL}/stickers.json?cb=${Date.now()}`)
   if (status !== 200) throw new Error(`Manifest fetch failed (HTTP ${status})`)
   const value = JSON.parse(buffer.toString('utf8'))
   manifestCache = { value, at: Date.now() }
