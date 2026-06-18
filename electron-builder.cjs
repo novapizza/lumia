@@ -47,6 +47,11 @@ module.exports = {
     // afterPack hook (build/embed-ffmpeg.cjs), so drop the bundled one.
     '!**/ffmpeg-static/ffmpeg',
     '!**/ffmpeg-static/ffmpeg.exe',
+    // koffi prebuilds a koffi.node for 18 platforms (~26 MB total). We only ever
+    // package Windows x64 and macOS x64/arm64, so the other ~15 are dead weight
+    // shipped in (and asarUnpacked from) every installer. Keep only the three
+    // we load at runtime; drop the rest (~18 MB).
+    '!**/koffi/build/koffi/{freebsd_arm64,freebsd_ia32,freebsd_x64,linux_arm64,linux_armhf,linux_ia32,linux_loong64,linux_riscv64d,linux_x64,musl_arm64,musl_x64,openbsd_ia32,openbsd_x64,win32_arm64,win32_ia32}/**',
   ],
 
   extraResources: [
@@ -90,7 +95,12 @@ module.exports = {
   // CSC_IDENTITY_AUTO_DISCOVERY=false then short-circuits to no signing.
   win: {
     icon: 'resources/icons/win/icon.ico',
-    target: [{ target: 'nsis', arch: ['x64', 'arm64'] }],
+    // x64-only. Listing x64 + arm64 in one nsis target produced a single
+    // installer carrying BOTH arch payloads (~2× size, ~300 MB). Windows-on-ARM
+    // runs the x64 build via built-in emulation — embed-ffmpeg.cjs already ships
+    // the x64 ffmpeg for arm64 on this assumption — so a dedicated arm64 build
+    // bought little. Dropping it ~halves the installer.
+    target: [{ target: 'nsis', arch: ['x64'] }],
     ...(['AZURE_PUBLISHER_NAME',
          'AZURE_TRUSTED_SIGNING_ENDPOINT',
          'AZURE_CODE_SIGNING_ACCOUNT_NAME',
