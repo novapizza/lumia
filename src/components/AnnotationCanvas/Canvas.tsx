@@ -759,8 +759,18 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
     // can immediately drag/resize. Lives here (not the Editor) because the
     // natural dimensions and selection state are local to the canvas.
     const addSticker = useCallback((opts: { src: string; aspect: number }) => {
-      const aspect = opts.aspect > 0 ? opts.aspect : 1
-      const w = Math.max(48, Math.round(naturalW * 0.3))
+      const aspect = opts.aspect > 0 ? opts.aspect : 1   // naturalWidth / naturalHeight
+      // Fit box = 80% of the image in each axis. `maxFitW` is the widest the
+      // sticker can be while honouring its aspect AND staying inside that box —
+      // capping width alone let tall stickers (or small/short images) spill
+      // past the top/bottom. Default to ~15% of the image width, then clamp to
+      // [floor, maxFitW]; the 48px floor is itself capped by the fit so it
+      // can't overflow a tiny image.
+      const fitW = naturalW * 0.8
+      const fitH = naturalH * 0.8
+      const maxFitW = Math.min(fitW, fitH * aspect)
+      const floorW = Math.min(48, maxFitW)
+      const w = Math.round(Math.min(maxFitW, Math.max(floorW, naturalW * 0.15)))
       const h = Math.round(w / aspect)
       const x = Math.round((naturalW - w) / 2)
       const y = Math.round((naturalH - h) / 2)
