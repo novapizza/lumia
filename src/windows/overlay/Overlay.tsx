@@ -136,6 +136,15 @@ function ModeBar({
     >
       <div
         className="flex items-center gap-3 glass-refractive rounded-full pl-1.5 pr-3 py-1.5"
+        // The overlay root drives region/window picking off POINTER events, so
+        // we must swallow pointer events here too — stopping only the mouse
+        // events lets `pointerdown` bubble through and start a drag (region) or
+        // confirm a window-pick (window) instead of switching modes, which also
+        // setPointerCapture-steals the tab's click. Keep the mouse handlers for
+        // screen mode, whose root listens on `onClick`.
+        onPointerDown={(e) => e.stopPropagation()}
+        onPointerMove={(e) => e.stopPropagation()}
+        onPointerUp={(e) => e.stopPropagation()}
         onMouseDown={(e) => e.stopPropagation()}
         onMouseMove={(e) => e.stopPropagation()}
         onMouseUp={(e) => e.stopPropagation()}
