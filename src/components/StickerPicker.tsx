@@ -76,6 +76,42 @@ function RemoteSticker({
   )
 }
 
+/** Click-and-drag horizontal scrolling for an overflow-x row. A plain click
+ *  still selects a tab; only a drag past a few px scrolls the row and then
+ *  swallows the trailing click so it doesn't fire on whatever tab the pointer
+ *  happened to land on. */
+function useDragScroll() {
+  const ref = useRef<HTMLDivElement>(null)
+  const drag = useRef({ down: false, startX: 0, startScroll: 0, moved: false })
+
+  const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    const el = ref.current
+    if (!el) return
+    drag.current = { down: true, startX: e.clientX, startScroll: el.scrollLeft, moved: false }
+  }
+  const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    const el = ref.current
+    const d = drag.current
+    if (!el || !d.down) return
+    const dx = e.clientX - d.startX
+    // Grab the pointer only once we're sure it's a drag (past the 4px slop) so
+    // a steady click still reaches the tab button underneath.
+    if (!d.moved && Math.abs(dx) > 4) {
+      d.moved = true
+      try { el.setPointerCapture(e.pointerId) } catch { /* ignore */ }
+    }
+    if (d.moved) el.scrollLeft = d.startScroll - dx
+  }
+  const end = () => { drag.current.down = false }
+  const onClickCapture = (e: React.MouseEvent) => {
+    if (drag.current.moved) { e.stopPropagation(); drag.current.moved = false }
+  }
+  return {
+    ref,
+    props: { onPointerDown, onPointerMove, onPointerUp: end, onPointerCancel: end, onClickCapture },
+  }
+}
+
 export default function StickerPicker({ onSelect, onClose }: Props) {
   const panelRef = useRef<HTMLDivElement>(null)
   const [manifest, setManifest] = useState<StickerManifest | null>(null)
@@ -83,6 +119,7 @@ export default function StickerPicker({ onSelect, onClose }: Props) {
   const [activeId, setActiveId] = useState<string>('')
   const [query, setQuery] = useState('')
   const [recents, setRecents] = useState<string[]>(() => loadRecents())
+  const tabsDrag = useDragScroll()
   // Data URL + natural size captured as each thumbnail loads, so a pick has
   // everything ready without a second fetch.
   const loadedRef = useRef<Map<string, { dataUrl: string; natural: { w: number; h: number } }>>(new Map())
@@ -216,7 +253,11 @@ export default function StickerPicker({ onSelect, onClose }: Props) {
 
       {/* Category tabs */}
       {manifest && !error && (
-        <div className="flex items-center gap-1 px-2 py-2 border-t border-white/5 flex-shrink-0 overflow-x-auto">
+        <div
+          ref={tabsDrag.ref}
+          {...tabsDrag.props}
+          className="flex items-center gap-1 px-2 py-2 border-t border-white/5 flex-shrink-0 overflow-x-auto cursor-grab active:cursor-grabbing select-none [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+        >
           {recents.length > 0 && (
             <TabButton active={activeId === RECENT_ID && !query} onClick={() => { setQuery(''); setActiveId(RECENT_ID) }} title="Recent">
               <span className="material-symbols-outlined text-[20px]">schedule</span>
