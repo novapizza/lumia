@@ -78,6 +78,23 @@ async function downloadWithRetry(url, dest, attempts = 3) {
   throw lastErr
 }
 
+// Resolve a pre-staged MINIMAL ffmpeg.exe for Windows (see
+// build/build-minimal-ffmpeg-win.sh). Lumia only does a `-c copy` webm remux,
+// so a ~2.5 MB matroska-only build replaces the ~82 MB full ffmpeg-static one.
+//   - CI sets LUMIA_FFMPEG_WIN_X64 to the downloaded artifact path.
+//   - Local `pnpm ffmpeg:min:win` drops it at build/minimal-ffmpeg/dist/.
+// Returns the path if a non-empty binary exists, else null (→ download full).
+function resolveMinimalWinFfmpeg() {
+  const candidates = [
+    process.env.LUMIA_FFMPEG_WIN_X64,
+    path.join(__dirname, 'minimal-ffmpeg', 'dist', 'ffmpeg.exe'),
+  ].filter(Boolean)
+  for (const p of candidates) {
+    try { if (fs.statSync(p).size > 0) return p } catch { /* missing */ }
+  }
+  return null
+}
+
 exports.default = async function embedFfmpeg(context) {
   const platform =
     context.electronPlatformName === 'darwin' ? 'darwin' :
@@ -85,6 +102,26 @@ exports.default = async function embedFfmpeg(context) {
   if (!platform) return // linux not targeted
 
   const archName = Arch[context.arch] // 'x64' | 'arm64' | 'ia32'
+
+  // Destination Resources dir inside the just-packed app.
+  const exeName = platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg'
+  const resourcesDir = platform === 'darwin'
+    ? path.join(context.appOutDir, `${context.packager.appInfo.productFilename}.app`, 'Contents', 'Resources')
+    : path.join(context.appOutDir, 'resources')
+  const dest = path.join(resourcesDir, exeName)
+
+  // ── Windows: prefer the slim matroska-only build (~2.5 MB) ────────────────
+  if (platform === 'win32') {
+    const minimal = resolveMinimalWinFfmpeg()
+    if (minimal) {
+      fs.copyFileSync(minimal, dest)
+      console.log(`[embed-ffmpeg] embedded MINIMAL ffmpeg → ${dest} (${(fs.statSync(dest).size / 1048576).toFixed(1)} MB)`)
+      return
+    }
+    console.warn('[embed-ffmpeg] minimal ffmpeg not staged — falling back to the full ~82 MB ffmpeg-static binary (run `pnpm ffmpeg:min:win` or set LUMIA_FFMPEG_WIN_X64 to slim the installer)')
+  }
+
+  // ── Full ffmpeg-static download (macOS per-arch, or Windows fallback) ─────
   // ffmpeg-static has no win32-arm64; x64 runs on Windows ARM via emulation.
   const dlArch = platform === 'win32' ? 'x64' : (archName === 'arm64' ? 'arm64' : 'x64')
 
@@ -99,13 +136,6 @@ exports.default = async function embedFfmpeg(context) {
     console.log(`[embed-ffmpeg] fetching ${url}`)
     await downloadWithRetry(url, cached)
   }
-
-  // Destination Resources dir inside the just-packed app.
-  const exeName = platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg'
-  const resourcesDir = platform === 'darwin'
-    ? path.join(context.appOutDir, `${context.packager.appInfo.productFilename}.app`, 'Contents', 'Resources')
-    : path.join(context.appOutDir, 'resources')
-  const dest = path.join(resourcesDir, exeName)
 
   fs.copyFileSync(cached, dest)
   if (platform !== 'win32') fs.chmodSync(dest, 0o755)

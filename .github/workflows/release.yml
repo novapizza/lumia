@@ -94,11 +94,40 @@ jobs:
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
 
+  # ── Minimal Windows ffmpeg (cross-compiled on Linux) ─────────────────────────
+  # Lumia only runs `ffmpeg -i in.webm -c copy -f webm out.webm`, so we ship a
+  # ~2.5 MB matroska-only build instead of ffmpeg-static's ~82 MB full one.
+  # mingw-w64 cross-compile is fast (~1 min) on Linux; the artifact is handed to
+  # release-win, where build/embed-ffmpeg.cjs picks it up over the full download.
+  ffmpeg-win:
+    name: Build minimal ffmpeg (win x64)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install mingw-w64 toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-mingw-w64-x86-64 make nasm pkg-config curl xz-utils
+
+      - name: Cross-compile minimal ffmpeg
+        run: bash build/build-minimal-ffmpeg-win.sh dist-ffmpeg
+
+      - name: Upload ffmpeg artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-win-x64
+          path: dist-ffmpeg/ffmpeg.exe
+          if-no-files-found: error
+
   # ── Windows ──────────────────────────────────────────────────────────────────
   release-win:
     environment: Production
     name: Release · Windows
     runs-on: windows-latest
+    needs: ffmpeg-win
 
     steps:
       - name: Checkout
@@ -115,6 +144,14 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      # embed-ffmpeg.cjs (afterPack) looks here before falling back to the full
+      # ffmpeg-static download — see resolveMinimalWinFfmpeg().
+      - name: Download minimal ffmpeg
+        uses: actions/download-artifact@v4
+        with:
+          name: ffmpeg-win-x64
+          path: build/minimal-ffmpeg/dist
 
       - name: Build (electron-vite)
         run: pnpm run build
