@@ -238,10 +238,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
   overlayDrawing: (drawing: boolean) => ipcRenderer.send('overlay:drawing', drawing),
   notifyRoute: (route: string) => ipcRenderer.send('app:route-changed', route),
 
-  // OCR & Auto-Blur
-  ocrScan: (dataUrl: string) =>
-    ipcRenderer.invoke('ocr:scan', dataUrl),
-
   // Wallpapers (Unsplash)
   wallpapersRandom: (opts: {
     picks: Array<{ id: string; topic?: string; query?: string }>

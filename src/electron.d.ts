@@ -179,9 +179,6 @@ declare global {
       onAnnotationClear: (cb: () => void) => void
       onAnnotationUndo: (cb: () => void) => void
 
-      // OCR & Auto-Blur
-      ocrScan: (dataUrl: string) => Promise<import('@/types').AutoBlurResult>
-
       // Wallpapers (Unsplash)
       wallpapersRandom: (opts: {
         picks: Array<{ id: string; topic?: string; query?: string }>

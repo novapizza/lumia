@@ -4,13 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What is Lumia?
 
-Lumia is a cross-platform Electron desktop app for screen capture, screen recording, annotation, and sharing (Windows + macOS). Built with Electron 33, React 18, TypeScript, Tailwind CSS 4, Konva, and Tesseract.
+Lumia is a cross-platform Electron desktop app for screen capture, screen recording, annotation, and sharing (Windows + macOS). Built with Electron 33, React 18, TypeScript, Tailwind CSS 4, and Konva.
 
 Headline features:
 - Image capture: region, active window, active monitor, fullscreen, scrolling capture. The screen is **frozen at hotkey time** (native GDI snapshot on Windows) so captures preserve transient UI like tooltips/popovers
 - Video recording: region / window / fullscreen with floating toolbar + visible region border, plus a live drawing overlay during recording; output WebM is remuxed seekable via bundled ffmpeg
 - Annotation canvas (Konva) with re-editable vector layers stored alongside originals, R2-hosted stickers, and Unsplash background/wallpaper images
-- Auto-blur of sensitive content (email, phone, credit-card, API key, JWT, etc.) via OCR
 - Workflow pipeline: after-capture → upload → after-upload, configurable per template
 - Built-in uploaders: Cloudflare R2 (baked credentials, streaming multipart) and Google Drive (OAuth, with a Google Picker folder browser)
 - System tray, global hotkeys, launch-at-startup, auto-update via Cloudflare R2
@@ -76,21 +75,17 @@ Releases are produced by **GitHub Actions** (`.github/workflows/release.yml`), n
 | `startup.ts` | Launch-at-startup OS integration; `wasLaunchedAtStartup()` for `--hidden` boot |
 | `thumbnail.ts` | Downscaled PNG thumbnail used by history rows + toast hero |
 | `watermark.ts` | Stamps the Lumia logo onto every screenshot (applied in `capture.ts`) |
-| `ocr.ts` | Tesseract.js OCR (`eng.traineddata` ships at repo root); on macOS the Swift `helpers/ocr-vision` binary is used when available |
-| `auto-blur.ts` | Combines OCR + sensitive-detect to return regions + apply pixelated blur |
-| `sensitive-detect.ts` | Regex/heuristic patterns for `SensitiveCategory` (email, phone, CC, SSN, API key, JWT, private-key, password, bearer-token, IP, URL credentials) |
 | `native-input.ts` | Win32 input via koffi FFI — `SetCursorPos`, `mouse_event`, `keybd_event`, `SendMessageW`. Replaces PowerShell-based scroll/key sim (~0 ms vs ~200–500 ms cold start). Windows-only |
 | `printscreen-key.ts` | Windows-only — toggles the `PrintScreenKeyForSnippingEnabled` registry value so PrintScreen reaches Lumia's global hotkey instead of the Snipping Tool (`setSnippingHijack()`) |
 | `mac-window-pick.ts` | macOS window picker — long-running Swift `window-at-point` helper queries CoreGraphics for the topmost non-Lumia window under the cursor to drive overlay hover highlighting |
 | `permissions.ts` | OS-level permission preflight (Screen Recording, Accessibility, Microphone); surfaces native prompts at startup and watches for grants |
 | `stickers.ts` | R2-hosted sticker catalog — fetches `stickers.json` manifest (1-hour in-memory TTL + cache-bust query param) and individual PNGs, disk-caches them under `userData/sticker-cache/`, returns same-origin data URLs. IPC: `stickers:manifest`, `stickers:fetch`. Base URL from `MAIN_VITE_STICKERS_BASE_URL` (public bucket, no creds) |
 | `wallpapers.ts` | Unsplash wallpaper browser — fetch random wallpapers, download to `userData/wallpapers/`, set as desktop wallpaper. IPC: `wallpapers:random`, `wallpapers:trackDownload`, `wallpapers:isConfigured`, `wallpapers:setAsWallpaper`. Needs `MAIN_VITE_UNSPLASH_ACCESS_KEY` |
-| `types.ts` | Shared interfaces: `WorkflowTemplate`, `HistoryItem`, `AnnotationObject`, `OcrWord`, `SensitiveRegion`, `AutoBlurSettings` |
+| `types.ts` | Shared interfaces: `WorkflowTemplate`, `HistoryItem`, `AnnotationObject` |
 | `utils.ts` | `localTimestamp()` formatter for filenames |
 | `uploaders/r2.ts` | Cloudflare R2 (S3-compatible) — credentials baked at build time via `MAIN_VITE_R2_*`. `uploadToR2()` single-PUTs buffered image data URLs; `uploadFileToR2()` streams on-disk files (recordings) — hashes for HEAD dedup, single-PUT below the 16 MB `MULTIPART_THRESHOLD`, else parallel multipart (8 MB parts × 6 workers → ~48 MB peak regardless of file size) |
 | `uploaders/googledrive.ts` | Pure Google Drive HTTP layer — folder lookup/create, multipart image upload, resumable file upload streamed in 1 MB chunks with backpressure, OAuth token exchange/refresh/revoke |
 | `google-drive-service.ts` | Drive orchestration over `uploaders/googledrive.ts` — token lifecycle (auto-refresh with 60 s margin, dedup concurrent refreshes, retry on 401), folder resolution, errors surfaced as `UploadResult`. Entry points: `uploadImageDataUrlToDrive()`, `uploadFilePathToDrive()` |
-| `helpers/ocr-vision` | Compiled Swift binary for macOS Vision-framework OCR (`.swift` source alongside) |
 | `helpers/scroll-helper.swift` | macOS scroll-event helper (counterpart to Win32 `native-input`) |
 | `helpers/get-display-icc.swift` | macOS helper returning a display's ICC profile bytes (used by `display-icc.ts`) |
 | `helpers/window-at-point.swift` | macOS helper returning the topmost non-Lumia window under the cursor (used by `mac-window-pick.ts`) |
@@ -103,14 +98,14 @@ Releases are produced by **GitHub Actions** (`.github/workflows/release.yml`), n
   - `/dashboard` — capture launcher + history grid (legacy `/history` redirects here)
   - `/editor` — annotation editor for both image and video (legacy `/video-annotator` redirects here)
   - `/workflow` — template manager
-  - `/settings` — preferences + Google Drive auth + auto-blur config
+  - `/settings` — preferences + Google Drive auth
   - **Standalone windows** (no sidebar/titlebar, transparent where applicable):
     - `/overlay` — region/window/monitor picker for both capture and recording
     - `/recording-toolbar` — floating Pause/Stop/Mic toolbar during a recording
     - `/recording-border` — border outline drawn around the recorded region
     - `/recorder-host` — hidden window that owns `MediaRecorder` and writes blobs
 - **Drawing**: `components/AnnotationCanvas/Canvas.tsx` — Konva stage; `tools.ts` defines the pen/shape/text/blur/sticker/select union; `ToolBar.tsx` is the in-canvas tool picker. Sticker objects store the manifest-relative path in `DrawObject.src` (not a data URL) so `history.json` stays small; the path resolves to a cached data URL at render time
-- **Shared components**: `Sidebar`, `TitleBar`, `AppMenu`, `ShareDialog`, `AutoBlurPanel`, `BackgroundPanel`, `StickerPicker`, `HistoryListRow`, `ScrollCaptureDialog`, `UpdateNotification`, `AboutDialog`, `WorkflowSelector`, `DateGroupedGrid` (the `ReleaseNotesDialog` / "What's New" dialog was removed)
+- **Shared components**: `Sidebar`, `TitleBar`, `AppMenu`, `ShareDialog`, `BackgroundPanel`, `StickerPicker`, `HistoryListRow`, `ScrollCaptureDialog`, `UpdateNotification`, `AboutDialog`, `WorkflowSelector`, `DateGroupedGrid` (the `ReleaseNotesDialog` / "What's New" dialog was removed)
 - **Hooks**: `hooks/useHistory.ts`, `hooks/useLocalVideoUrl.ts`
 - **Action helpers**: `lib/history-actions.ts`, `lib/workflow-actions.ts` — pure functions wrapping `electronAPI` calls so views stay slim
 - **State passing**: React Router `location.state` (e.g., captured `dataUrl` / `historyId` handed to the editor)
@@ -152,7 +147,6 @@ Custom CSS design tokens in `src/index.css`. Key utility classes: `.glass-refrac
 ### Build Tooling
 
 - **electron-vite** compiles three targets (main / preload / renderer) — see `electron.vite.config.ts`
-- `node-windows-ocr` is marked `external` in main rollup; loaded only on Windows
 - **Path alias**: `@/` → `src/` (renderer only)
 - **Tailwind CSS 4** via `@tailwindcss/vite` plugin
 - **electron-builder** packages to `release/`. Output: NSIS for Windows (x64 only — Windows-on-ARM runs it via emulation), DMG for macOS (x64 + arm64). `koffi` is `asarUnpack`ed so the FFI loader can read its native binaries at runtime; the `files` array drops koffi's prebuilt binaries for platforms we never package (keeps only win32_x64 + darwin_x64/arm64).
@@ -170,7 +164,6 @@ Custom CSS design tokens in `src/index.css`. Key utility classes: `.glass-refrac
 - **macOS**:
   - Hidden inset title bar, traffic lights at `(18, 20)`
   - Universal builds (arm64 + x64); Graphics/Design app category; hardened runtime + entitlements via `build/entitlements.mac.plist`
-  - OCR via the bundled Swift `ocr-vision` binary (Vision framework) when available, falling back to Tesseract
   - Notarization is gated on `APPLE_*` env vars; `notarize.cjs` skips gracefully when absent
 - **Capture timing**: `HIDE_DELAY_MS` is 250 ms on macOS / 200 ms on Windows after hiding overlay/main windows, plus a 120 ms `OVERLAY_GONE_DELAY_MS`, before requesting frames — ensures a clean screen capture.
 - **Auto-update**: `electron-updater` polls the Cloudflare R2 origin (`generic` provider, defaulting to `https://release.lumia.asia` — `latest.yml` / `latest-mac.yml`) every 4 hours in production builds; `autoDownload` and `autoInstallOnAppQuit` are on. Status events surface in the renderer via `update:status` and the `UpdateNotification` component.

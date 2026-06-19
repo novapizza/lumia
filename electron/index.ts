@@ -1456,14 +1456,6 @@ app.whenReady().then(async () => {
     return setSnippingHijack(!enabled)
   })
 
-  // IPC: OCR & Auto-Blur
-  // Pixel-level blur application is gone — auto-blur regions are injected as
-  // re-editable Konva annotations on the renderer side, not flattened here.
-  ipcMain.handle('ocr:scan', async (_e, dataUrl: string) => {
-    const { scanForSensitiveData } = await import('./auto-blur')
-    return scanForSensitiveData(dataUrl)
-  })
-
   // IPC: Wallpapers (Unsplash). Lazy-import keeps the access-key check off the
   // hot path — Unsplash failures shouldn't bubble through `ipcMain.handle`'s
   // generic error path, so we surface them as `{ ok: false, error }` shapes

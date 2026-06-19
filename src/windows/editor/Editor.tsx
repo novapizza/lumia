@@ -6,9 +6,8 @@ import AnnotationCanvas, {
 } from '../../components/AnnotationCanvas/Canvas'
 import AnnotationToolBar from '../../components/AnnotationCanvas/ToolBar'
 import { matchToolShortcut } from '../../components/AnnotationCanvas/tools'
-import type { WorkflowTemplate, HistoryItem, SensitiveRegion, AnnotationObject } from '../../types'
+import type { WorkflowTemplate, HistoryItem, AnnotationObject } from '../../types'
 import type { DrawObject } from '../../components/AnnotationCanvas/Canvas'
-import { AutoBlurPanel } from '../../components/AutoBlurPanel'
 import StickerPicker, { type PickedSticker } from '../../components/StickerPicker'
 import { deriveActions, type ActionBtn } from '../../lib/workflow-actions'
 import { useLocalVideoUrl } from '../../hooks/useLocalVideoUrl'
@@ -105,13 +104,7 @@ export default function Editor() {
     }[]
   >([])
   const [showClipPanel, setShowClipPanel] = useState(false)
-  const [showAutoBlur, setShowAutoBlur] = useState(false)
   // Color popover is now handled inside AnnotationToolBar.
-  const [autoBlurScanning, setAutoBlurScanning] = useState(false)
-  const [autoBlurRegions, setAutoBlurRegions] = useState<SensitiveRegion[]>([])
-  const [autoBlurSelected, setAutoBlurSelected] = useState<Set<string>>(new Set())
-  const [autoBlurOcrTime, setAutoBlurOcrTime] = useState<number>()
-  const [, setAutoBlurDetectTime] = useState<number>()
 
   // Video is view-only here — plain HTML5 <video controls> for playback. Save
   // / Copy / Upload R2 operate on the source file directly, not on frames.
@@ -166,12 +159,6 @@ export default function Editor() {
     // effect runs AFTER Canvas's mount effects.
     setImageDataUrl(dataUrl)
     setExportTrigger(0)
-    setAutoBlurRegions([])
-    setAutoBlurSelected(new Set())
-    setAutoBlurScanning(false)
-    setAutoBlurOcrTime(undefined)
-    setAutoBlurDetectTime(undefined)
-    setShowAutoBlur(false)
   }, [])
 
   const activeTemplate = useMemo(() => {
@@ -480,46 +467,6 @@ export default function Editor() {
     }
   }, [historyId, isVideo])
 
-  const handleAutoBlurScan = useCallback(async () => {
-    if (!imageDataUrl || autoBlurScanning) return
-    setAutoBlurScanning(true)
-    setShowAutoBlur(true)
-    try {
-      const result = await window.electronAPI?.ocrScan(imageDataUrl)
-      if (result) {
-        setAutoBlurRegions(result.regions)
-        setAutoBlurSelected(new Set(result.regions.map(r => r.id)))
-        setAutoBlurOcrTime(result.ocrTimeMs)
-        setAutoBlurDetectTime(result.detectTimeMs)
-        if (result.regions.length === 0) showToast('No sensitive info detected', 'verified_user')
-      }
-    } catch {
-      showToast('OCR scan failed', 'error', 'error')
-    } finally {
-      setAutoBlurScanning(false)
-    }
-  }, [imageDataUrl, autoBlurScanning, showToast])
-
-  const handleApplyAutoBlur = useCallback(() => {
-    const selected = autoBlurRegions.filter(r => autoBlurSelected.has(r.id))
-    if (selected.length === 0) return
-    // Inject detected regions as Konva blur annotations — non-destructive,
-    // re-editable, and merged into the canvas's undo stack as one entry.
-    const objs: Omit<DrawObject, 'id'>[] = selected.map(r => ({
-      type: 'blur',
-      x: r.bbox.x,
-      y: r.bbox.y,
-      width: r.bbox.width,
-      height: r.bbox.height,
-      color: '#000000',
-      strokeWidth: 6,
-    }))
-    canvasRef.current?.addObjects(objs)
-    setAutoBlurRegions([])
-    setAutoBlurSelected(new Set())
-    showToast(`Blurred ${selected.length} region${selected.length > 1 ? 's' : ''}`, 'blur_on')
-  }, [autoBlurRegions, autoBlurSelected, showToast])
-
   const handlePickSticker = useCallback((s: PickedSticker) => {
     const aspect = s.natural.h > 0 ? s.natural.w / s.natural.h : 1
     canvasRef.current?.addSticker({ src: s.path, aspect })
@@ -729,28 +676,6 @@ export default function Editor() {
           )}
         </div>
 
-        {/* ── Auto-blur panel ── */}
-        {showAutoBlur && (
-          <aside className="w-60 flex-shrink-0 glass-refractive border-l border-white/5 flex flex-col overflow-hidden">
-            <AutoBlurPanel
-              regions={autoBlurRegions}
-              selectedIds={autoBlurSelected}
-              scanning={autoBlurScanning}
-              ocrTimeMs={autoBlurOcrTime}
-              onToggleRegion={(id) => setAutoBlurSelected(prev => {
-                const next = new Set(prev)
-                next.has(id) ? next.delete(id) : next.add(id)
-                return next
-              })}
-              onSelectAll={() => setAutoBlurSelected(new Set(autoBlurRegions.map(r => r.id)))}
-              onDeselectAll={() => setAutoBlurSelected(new Set())}
-              onApplyBlur={handleApplyAutoBlur}
-              onScan={handleAutoBlurScan}
-              onClose={() => setShowAutoBlur(false)}
-            />
-          </aside>
-        )}
-
         {/* ── Clipboard history panel ── */}
         {showClipPanel && (
           <aside className="w-60 flex-shrink-0 glass-refractive border-l border-white/5 flex flex-col overflow-hidden">
@@ -819,19 +744,6 @@ export default function Editor() {
           onUndo={() => canvasRef.current?.undo()}
           onRedo={() => canvasRef.current?.redo()}
           onClear={() => canvasRef.current?.clear()}
-          extraLeft={
-            <button
-              title="AI blur sensitive info"
-              onClick={() => { setShowAutoBlur(p => !p); if (!showAutoBlur && autoBlurRegions.length === 0) setShowAutoBlur(true) }}
-              className={`flex items-center justify-center w-9 h-9 rounded-lg transition-all ${
-                showAutoBlur
-                  ? 'bg-orange-500/20 text-orange-400 shadow-[0_0_12px_rgba(251,146,60,0.15)]'
-                  : 'text-slate-400 hover:text-orange-400 hover:bg-orange-500/10'
-              }`}
-            >
-              <span className="material-symbols-outlined text-[18px]">security</span>
-            </button>
-          }
         />
         </div>
       )}

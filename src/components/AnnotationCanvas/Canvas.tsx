@@ -745,8 +745,7 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
     }, [commitObjects])
 
     // Programmatic append: one history entry covers the whole batch so a
-    // single Undo removes them all together (used by auto-blur to inject
-    // detected regions as Konva blur shapes).
+    // single Undo removes them all together.
     const addObjects = useCallback((objs: Omit<DrawObject, 'id'>[]) => {
       if (objs.length === 0) return
       userEditedRef.current = true
