@@ -5,7 +5,8 @@ import { resolve } from 'path'
 
 export default defineConfig({
   main: {
-    plugins: [externalizeDepsPlugin()],
+    // uuid is pure ESM (v14+) — bundle it instead of emitting a CJS require()
+    plugins: [externalizeDepsPlugin({ exclude: ['uuid'] })],
     build: {
       lib: {
         entry: resolve(__dirname, 'electron/index.ts')
@@ -13,7 +14,8 @@ export default defineConfig({
     }
   },
   preload: {
-    plugins: [externalizeDepsPlugin()],
+    // uuid is pure ESM (v14+) — bundle it instead of emitting a CJS require()
+    plugins: [externalizeDepsPlugin({ exclude: ['uuid'] })],
     build: {
       lib: {
         entry: resolve(__dirname, 'electron/preload/index.ts')

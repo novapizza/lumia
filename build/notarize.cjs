@@ -21,7 +21,7 @@
  * so local builds without notarization credentials are not blocked.
  */
 
-const { notarize } = require('@electron/notarize')
+// @electron/notarize is pure ESM (v3+); load it via dynamic import from this CJS hook.
 const { execFileSync } = require('child_process')
 
 exports.default = async function notarizing(context) {
@@ -56,6 +56,7 @@ exports.default = async function notarizing(context) {
 
   console.log(`[notarize] Submitting ${appPath} to Apple notary service…`)
 
+  const { notarize } = await import('@electron/notarize')
   await notarize({
     tool: 'notarytool',
     appPath,
