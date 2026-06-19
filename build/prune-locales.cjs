@@ -5,10 +5,12 @@
  * these paks), so keeping only en-US is safe and trims ~40 MB of unpacked
  * weight (~8-10 MB off the installer after LZMA).
  *
- * Windows/Linux keep the paks in <appOutDir>/locales. macOS uses a different
- * .lproj layout inside the bundle — left untouched here (out of scope; mac size
- * is a separate concern). Runs before code-signing; paks aren't signed, so
- * removing them here is safe.
+ * Windows keeps the paks in a flat <appOutDir>/locales dir, which we prune here.
+ * macOS stores them as .lproj inside the pre-signed Electron Framework, so it's
+ * pruned via electron-builder's `electronLanguages` option instead (see the mac
+ * config) — doing it by hand would break the framework's code signature. Hence
+ * this hook is Windows-only. Runs before code-signing; the flat paks aren't
+ * signed, so removing them here is safe.
  */
 const fs = require('fs')
 const path = require('path')

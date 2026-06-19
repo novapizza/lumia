@@ -143,6 +143,12 @@ module.exports = {
   mac: {
     icon: 'resources/icons/mac/icon.icns',
     category: 'public.app-category.graphics-design',
+    // Keep only the English Chromium locale (the rest are ~40 MB of .lproj
+    // locale.pak files Chromium falls back out of anyway). On macOS these live
+    // inside the pre-signed Electron Framework, so we let electron-builder prune
+    // them via this option (correct resealing) rather than an afterPack delete.
+    // Windows uses the flat locales/*.pak layout, pruned in build/prune-locales.cjs.
+    electronLanguages: ['en'],
     hardenedRuntime: true,
     gatekeeperAssess: false,
     entitlements: 'build/entitlements.mac.plist',
