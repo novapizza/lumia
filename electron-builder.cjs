@@ -140,9 +140,10 @@ module.exports = {
   // when APPLE_* vars are absent.
   afterSign: 'build/notarize.cjs',
 
-  // Embeds the correct per-arch ffmpeg into each build's Resources. Runs once
-  // per packed arch, before code-signing (so the binary gets signed on macOS).
-  afterPack: 'build/embed-ffmpeg.cjs',
+  // Runs once per packed arch, before code-signing (so embedded binaries get
+  // signed on macOS). Composes embed-ffmpeg (per-arch ffmpeg → Resources) and
+  // prune-locales (strip unused Chromium locale paks on Windows).
+  afterPack: 'build/after-pack.cjs',
 
   mac: {
     icon: 'resources/icons/mac/icon.icns',
