@@ -8,12 +8,6 @@ importers:
 
   .:
     dependencies:
-      '@fontsource/inter':
-        specifier: ^5.2.8
-        version: 5.2.8
-      '@fontsource/manrope':
-        specifier: ^5.2.8
-        version: 5.2.8
       electron-log:
         specifier: ^5.4.3
         version: 5.4.3
@@ -32,9 +26,6 @@ importers:
       koffi:
         specifier: ^2.16.0
         version: 2.16.0
-      material-symbols:
-        specifier: ^0.44.4
-        version: 0.44.4
       tesseract.js:
         specifier: ^7.0.0
         version: 7.0.0(encoding@0.1.13)
@@ -45,6 +36,12 @@ importers:
       '@electron/notarize':
         specifier: ^2.5.0
         version: 2.5.0
+      '@fontsource/inter':
+        specifier: ^5.2.8
+        version: 5.2.8
+      '@fontsource/manrope':
+        specifier: ^5.2.8
+        version: 5.2.8
       '@tailwindcss/vite':
         specifier: ^4.1.4
         version: 4.2.2(vite@5.4.21(@types/node@22.19.15)(lightningcss@1.32.0))
@@ -78,6 +75,9 @@ importers:
       konva:
         specifier: ^9.3.0
         version: 9.3.22
+      material-symbols:
+        specifier: ^0.44.4
+        version: 0.44.4
       png2icons:
         specifier: ^2.0.1
         version: 2.0.1
