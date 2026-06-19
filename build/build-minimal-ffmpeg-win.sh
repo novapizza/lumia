@@ -19,6 +19,10 @@ set -euo pipefail
 
 OUT_DIR="${1:?usage: build-minimal-ffmpeg-win.sh <output-dir>}"
 FFMPEG_VERSION="${FFMPEG_VERSION:-6.1.1}"
+# Resolve OUT_DIR to an absolute path NOW — we cd into a temp build dir below,
+# after which a relative OUT_DIR would land inside (and get cleaned up with) it.
+mkdir -p "$OUT_DIR"
+OUT_DIR="$(cd "$OUT_DIR" && pwd)"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
