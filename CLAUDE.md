@@ -151,7 +151,10 @@ Custom CSS design tokens in `src/index.css`. Key utility classes: `.glass-refrac
 - **Tailwind CSS 4** via `@tailwindcss/vite` plugin
 - **electron-builder** packages to `release/`. Output: NSIS for Windows (x64 only — Windows-on-ARM runs it via emulation), DMG for macOS (x64 + arm64). `koffi` is `asarUnpack`ed so the FFI loader can read its native binaries at runtime; the `files` array drops koffi's prebuilt binaries for platforms we never package (keeps only win32_x64 + darwin_x64/arm64).
 - `extraResources`: `resources/tray/*.{png,ico}` copied to `tray/` so the tray module finds icons in packaged builds.
-- **ffmpeg**: the afterPack hook (`build/embed-ffmpeg.cjs`) embeds a per-arch ffmpeg into Resources. On Windows it prefers a **minimal matroska-only build** (~2.5 MB vs ffmpeg-static's ~82 MB) — cross-compiled with mingw-w64 via `build/build-minimal-ffmpeg-win.sh` (locally: `pnpm ffmpeg:min:win` → Docker; in CI: the `ffmpeg-win` job uploads it as an artifact that `release-win` downloads to `build/minimal-ffmpeg/dist/`). Falls back to the full ffmpeg-static download when the minimal binary isn't staged. macOS still uses the full per-arch ffmpeg-static binary.
+- **ffmpeg**: the afterPack hook (`build/embed-ffmpeg.cjs`) embeds a per-arch ffmpeg into Resources. Lumia only runs `ffmpeg -i in.webm -c copy -f webm out.webm`, so both platforms prefer a **minimal matroska-only build** (~2.5 MB vs ffmpeg-static's ~78–82 MB):
+  - **Windows** — cross-compiled with mingw-w64 via `build/build-minimal-ffmpeg-win.sh` (locally: `pnpm ffmpeg:min:win` → Docker; in CI the `ffmpeg-win` job uploads it as an artifact `release-win` downloads to `build/minimal-ffmpeg/dist/`).
+  - **macOS** — compiled with clang via `build/build-minimal-ffmpeg-mac.sh` per arch (locally: `pnpm ffmpeg:min:mac`; in CI the `release-mac` job builds both arms — macos-latest is arm64, so x64 is cross-built via `clang -arch x86_64` — into `build/minimal-ffmpeg/dist/ffmpeg-darwin-<arch>`).
+  - Both fall back to the full ffmpeg-static download when no minimal binary is staged. Keep the `--disable-*/--enable-demuxer/muxer/protocol` component flags in sync across the two build scripts.
 
 ## Platform-Specific Notes
 

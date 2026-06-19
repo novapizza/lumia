@@ -57,6 +57,15 @@ jobs:
       - name: Compile macOS Swift helpers (universal)
         run: bash build/compile-mac-helpers.sh
 
+      # Minimal matroska-only ffmpeg for both arches (see
+      # build/build-minimal-ffmpeg-mac.sh) — embed-ffmpeg.cjs picks these up
+      # per-arch over the full ~78 MB ffmpeg-static download. macos-latest is
+      # arm64, so the x64 binary is cross-compiled via `clang -arch x86_64`.
+      - name: Build minimal ffmpeg (arm64 + x64)
+        run: |
+          bash build/build-minimal-ffmpeg-mac.sh arm64 build/minimal-ffmpeg/dist
+          bash build/build-minimal-ffmpeg-mac.sh x64 build/minimal-ffmpeg/dist
+
       - name: Verify R2 publish env
         run: |
           : "${R2_RELEASES_PUBLIC_URL:?missing R2_RELEASES_PUBLIC_URL secret}"

@@ -9,6 +9,7 @@
     "preinstall": "npx only-allow pnpm",
     "icons": "node build/generate-icons.cjs",
     "ffmpeg:min:win": "docker build -f build/minimal-ffmpeg/Dockerfile -o type=local,dest=build/minimal-ffmpeg/dist --target export build",
+    "ffmpeg:min:mac": "bash build/build-minimal-ffmpeg-mac.sh arm64 build/minimal-ffmpeg/dist && bash build/build-minimal-ffmpeg-mac.sh x64 build/minimal-ffmpeg/dist",
     "dev": "electron-vite dev",
     "build": "electron-vite build",
     "preview": "electron-vite preview",

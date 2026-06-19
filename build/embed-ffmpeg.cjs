@@ -95,6 +95,21 @@ function resolveMinimalWinFfmpeg() {
   return null
 }
 
+// Same idea for macOS (see build/build-minimal-ffmpeg-mac.sh). The DMG is built
+// per-arch, so each arch needs its own slim binary.
+//   - CI's release-mac builds both into build/minimal-ffmpeg/dist/.
+//   - Or LUMIA_FFMPEG_MAC_X64 / LUMIA_FFMPEG_MAC_ARM64 point at them explicitly.
+function resolveMinimalMacFfmpeg(archName) {
+  const candidates = [
+    process.env[`LUMIA_FFMPEG_MAC_${String(archName).toUpperCase()}`],
+    path.join(__dirname, 'minimal-ffmpeg', 'dist', `ffmpeg-darwin-${archName}`),
+  ].filter(Boolean)
+  for (const p of candidates) {
+    try { if (fs.statSync(p).size > 0) return p } catch { /* missing */ }
+  }
+  return null
+}
+
 exports.default = async function embedFfmpeg(context) {
   const platform =
     context.electronPlatformName === 'darwin' ? 'darwin' :
@@ -121,7 +136,19 @@ exports.default = async function embedFfmpeg(context) {
     console.warn('[embed-ffmpeg] minimal ffmpeg not staged — falling back to the full ~82 MB ffmpeg-static binary (run `pnpm ffmpeg:min:win` or set LUMIA_FFMPEG_WIN_X64 to slim the installer)')
   }
 
-  // ── Full ffmpeg-static download (macOS per-arch, or Windows fallback) ─────
+  // ── macOS: prefer the slim matroska-only build (per-arch) ─────────────────
+  if (platform === 'darwin') {
+    const minimal = resolveMinimalMacFfmpeg(archName)
+    if (minimal) {
+      fs.copyFileSync(minimal, dest)
+      fs.chmodSync(dest, 0o755)
+      console.log(`[embed-ffmpeg] embedded MINIMAL ffmpeg (${archName}) → ${dest} (${(fs.statSync(dest).size / 1048576).toFixed(1)} MB)`)
+      return
+    }
+    console.warn(`[embed-ffmpeg] minimal mac ffmpeg (${archName}) not staged — falling back to the full ~78 MB ffmpeg-static binary (run \`pnpm ffmpeg:min:mac\` on macOS to slim the DMG)`)
+  }
+
+  // ── Full ffmpeg-static download (fallback when no minimal binary is staged) ─
   // ffmpeg-static has no win32-arm64; x64 runs on Windows ARM via emulation.
   const dlArch = platform === 'win32' ? 'x64' : (archName === 'arm64' ? 'arm64' : 'x64')
 
