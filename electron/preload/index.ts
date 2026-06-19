@@ -19,8 +19,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Workflow
   runWorkflow: (templateId: string, imageData: string, destinationIndex?: number, historyId?: string) =>
     ipcRenderer.invoke('workflow:run', templateId, imageData, destinationIndex, historyId),
-  runInlineAction: (actionType: 'clipboard' | 'save', imageData: string) =>
-    ipcRenderer.invoke('workflow:inlineAction', actionType, imageData),
+  runInlineAction: (actionType: 'clipboard' | 'save', imageData: string, historyId?: string) =>
+    ipcRenderer.invoke('workflow:inlineAction', actionType, imageData, historyId),
   getTemplates: () => ipcRenderer.invoke('workflow:getTemplates'),
   saveTemplate: (template: unknown) => ipcRenderer.invoke('workflow:saveTemplate', template),
   deleteTemplate: (id: string) => ipcRenderer.invoke('workflow:deleteTemplate', id),
@@ -28,6 +28,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // History
   getHistory: () => ipcRenderer.invoke('history:get'),
   deleteHistoryItem: (id: string) => ipcRenderer.invoke('history:delete', id),
+  deleteHistoryItems: (ids: string[]) => ipcRenderer.invoke('history:deleteMany', ids),
   openHistoryFile: (filePath: string) => ipcRenderer.invoke('history:openFile', filePath),
   addHistoryItem: (item: unknown) => ipcRenderer.invoke('history:addCapture', item),
   readHistoryFile: (filePath: string) => ipcRenderer.invoke('history:readAsDataUrl', filePath),
@@ -165,12 +166,18 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Video recording — RecorderHost & Toolbar
   recorderGetTarget: () => ipcRenderer.invoke('recorder:get-target'),
   recorderGetWatermark: () => ipcRenderer.invoke('recorder:get-watermark'),
-  recorderReady: (ok: boolean, error?: string) => ipcRenderer.invoke('recorder:ready', ok, error),
+  recorderReady: (ok: boolean, error?: string, micAvailable?: boolean) =>
+    ipcRenderer.invoke('recorder:ready', ok, error, micAvailable),
   recorderStateChange: (state: string, payload?: unknown) =>
     ipcRenderer.invoke('recorder:state', state, payload),
   recorderTick: (elapsedMs: number) => ipcRenderer.invoke('recorder:tick', elapsedMs),
-  recorderSaveBlob: (buffer: ArrayBuffer, thumbnailDataUrl: string, durationMs: number) =>
-    ipcRenderer.invoke('recorder:save-blob', buffer, thumbnailDataUrl, durationMs),
+  // Streamed save — the finished webm is forwarded to disk in bounded slices
+  // (begin → chunk* → end) so a long recording never materializes one
+  // contiguous ArrayBuffer or blows the structured-clone limit over IPC.
+  recorderSaveBegin: () => ipcRenderer.invoke('recorder:save-begin'),
+  recorderSaveChunk: (chunk: ArrayBuffer) => ipcRenderer.invoke('recorder:save-chunk', chunk),
+  recorderSaveEnd: (thumbnailDataUrl: string, durationMs: number) =>
+    ipcRenderer.invoke('recorder:save-end', thumbnailDataUrl, durationMs),
   onRecorderBegin: (cb: () => void) => ipcRenderer.on('recorder:begin', cb),
   onRecorderPause: (cb: () => void) => ipcRenderer.on('recorder:pause', cb),
   onRecorderResume: (cb: () => void) => ipcRenderer.on('recorder:resume', cb),
@@ -222,12 +229,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
   onOverlaySetActive: (cb: (active: boolean) => void) => {
     ipcRenderer.on('overlay:set-active', (_e, active) => cb(active))
   },
+  onOverlayFrozenBgraChanged: (
+    cb: (data: { buffer: Uint8Array; width: number; height: number } | null) => void
+  ) => {
+    ipcRenderer.on('overlay:frozen-bgra-changed', (_e, data) => cb(data))
+  },
+  notifyOverlayBgReady: () => ipcRenderer.send('overlay:bg-ready'),
   overlayDrawing: (drawing: boolean) => ipcRenderer.send('overlay:drawing', drawing),
   notifyRoute: (route: string) => ipcRenderer.send('app:route-changed', route),
-
-  // OCR & Auto-Blur
-  ocrScan: (dataUrl: string) =>
-    ipcRenderer.invoke('ocr:scan', dataUrl),
 
   // Wallpapers (Unsplash)
   wallpapersRandom: (opts: {
@@ -241,6 +250,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   wallpapersIsConfigured: () => ipcRenderer.invoke('wallpapers:isConfigured'),
   wallpapersSetAsWallpaper: (photo: unknown) =>
     ipcRenderer.invoke('wallpapers:setAsWallpaper', photo),
+
+  // Stickers (R2-hosted, manifest-driven)
+  stickersManifest: (opts?: { force?: boolean }) => ipcRenderer.invoke('stickers:manifest', opts),
+  stickersFetch: (relPath: string) => ipcRenderer.invoke('stickers:fetch', relPath),
 
   // Clipboard
   writeClipboardText: (text: string) => ipcRenderer.invoke('clipboard:writeText', text),

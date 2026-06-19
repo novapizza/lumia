@@ -1,5 +1,5 @@
 import { clipboard, dialog, nativeImage, shell } from 'electron'
-import { writeFile, mkdir } from 'fs/promises'
+import { writeFile, mkdir, copyFile } from 'fs/promises'
 import { dirname, join } from 'path'
 import { homedir } from 'os'
 import type { TemplateStore } from './templates'
@@ -113,6 +113,7 @@ export class WorkflowEngine {
           body: parts.join(' · ') || 'Capture complete',
           thumbnailDataUrl: imageData,
           onClick: () => { void openHistoryItemInEditor(clickHistoryId, fromTray) },
+          launchId: clickHistoryId || undefined,
         })
       }
     }
@@ -125,12 +126,18 @@ export class WorkflowEngine {
     if (historyId) {
       const existing = this.historyStore.getAll().find(i => i.id === historyId)
       if (existing) {
-        const nextByDest = new Map(result.uploads.map(u => [u.destination, u]))
-        const mergedUploads: UploadResult[] = [
-          ...(existing.uploads ?? []).filter(u => !nextByDest.has(u.destination)),
-          ...result.uploads,
-        ]
-        this.historyStore.update(historyId, { uploads: mergedUploads })
+        // Merge per destination, but only let a NEW result replace an existing
+        // entry when the new one succeeded. A failed re-upload (e.g. offline)
+        // must not clobber a previously-successful {success:true,url} entry —
+        // the user would lose their working link.
+        const merged = new Map<string, UploadResult>(
+          (existing.uploads ?? []).map(u => [u.destination, u])
+        )
+        for (const next of result.uploads) {
+          const prior = merged.get(next.destination)
+          if (next.success || !prior?.success) merged.set(next.destination, next)
+        }
+        this.historyStore.update(historyId, { uploads: [...merged.values()] })
       }
     } else {
       this.historyStore.add({
@@ -150,7 +157,7 @@ export class WorkflowEngine {
     return result
   }
 
-  async runInlineAction(actionType: 'clipboard' | 'save', imageData: string): Promise<{ canceled?: boolean }> {
+  async runInlineAction(actionType: 'clipboard' | 'save', imageData: string, historyId?: string): Promise<{ canceled?: boolean }> {
     if (actionType === 'clipboard') {
       const img = nativeImage.createFromDataURL(imageData)
       clipboard.writeImage(img)
@@ -175,10 +182,44 @@ export class WorkflowEngine {
     if (result.canceled || !result.filePath) return { canceled: true }
 
     await mkdir(dirname(result.filePath), { recursive: true })
+
+    // When the editor was launched against an existing history row, prefer
+    // copying the on-disk file (original or annotated sidecar) over writing
+    // the dataURL. The dataURL is a fresh Konva canvas re-render and goes
+    // through a decode → drawImage (with default imageSmoothingEnabled) →
+    // encode round-trip — that introduces sub-pixel noise that hurts PNG
+    // compression (~+30-40% file size) and drops the iCCP chunk we attached
+    // at capture time. copyFile preserves bytes exactly, including color
+    // metadata. Caller is responsible for flushing pending annotation saves
+    // (Editor.handleExport awaits saveHistoryAnnotations) so the sidecar is
+    // on disk before we get here.
+    const source = historyId ? this.resolveSourceForCopy(historyId) : null
+    if (source) {
+      try {
+        await copyFile(source, result.filePath)
+        rememberSaveDir(dirname(result.filePath))
+        return {}
+      } catch (err) {
+        // Source disappeared between resolution and copy — fall through to
+        // the dataURL write so the user still gets a file.
+        console.warn('[workflow] save copyFile failed, falling back to dataURL write', err)
+      }
+    }
+
     const base64 = imageData.replace(/^data:image\/\w+;base64,/, '')
     await writeFile(result.filePath, Buffer.from(base64, 'base64'))
     rememberSaveDir(dirname(result.filePath))
     return {}
+  }
+
+  /** Pick the on-disk source for a Save-As: annotated sidecar when present
+   *  (user has annotations), otherwise the original capture file. Returns
+   *  null when neither exists or the history row is gone. */
+  private resolveSourceForCopy(historyId: string): string | null {
+    const item = this.historyStore.getAll().find(i => i.id === historyId)
+    if (!item) return null
+    const candidate = item.annotatedFilePath || item.filePath
+    return candidate || null
   }
 
   private async upload(dest: UploadDestination, imageData: string): Promise<UploadResult> {

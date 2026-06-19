@@ -11,6 +11,9 @@ import { showNotification } from './notify'
 import { applyWatermark } from './watermark'
 import { getSettings } from './settings'
 import { startVideoCapture } from './video'
+import { getDisplayIcc } from './display-icc'
+import { tagPngWithIcc } from './png-icc'
+import { captureDisplayNative } from './native-screen'
 
 /** Canonical folder for original captures (both images and videos). Not
  *  user-configurable — user-chosen locations are for the Save-As dialog only,
@@ -18,17 +21,31 @@ import { startVideoCapture } from './video'
 export const ORIGINALS_DIR = join(homedir(), 'Pictures', 'Lumia')
 
 /** Write the just-captured image to disk at {ORIGINALS_DIR}/capture-{ts}.{ext}.
- *  Best-effort — returns null if anything goes wrong so capture still completes. */
-async function saveOriginalImage(dataUrl: string): Promise<{ filePath: string; filename: string } | null> {
+ *  Best-effort — returns null if anything goes wrong so capture still completes.
+ *
+ *  When `displayId` is provided and the OS exposes an ICC profile for that
+ *  display, the PNG gets an `iCCP` chunk before write — so color-managed
+ *  viewers render wide-gamut content (P3 MacBooks, calibrated monitors)
+ *  faithfully instead of falling back to sRGB. JPEG path skips tagging
+ *  (different container, not currently produced by our capture pipeline). */
+async function saveOriginalImage(dataUrl: string, displayId?: number): Promise<{ filePath: string; filename: string } | null> {
   try {
     const { writeFile, mkdir } = await import('fs/promises')
     await mkdir(ORIGINALS_DIR, { recursive: true })
     const ts = localTimestamp()
-    const ext = dataUrl.startsWith('data:image/jpeg') ? 'jpg' : 'png'
+    const isJpeg = dataUrl.startsWith('data:image/jpeg')
+    const ext = isJpeg ? 'jpg' : 'png'
     const filename = `capture-${ts}.${ext}`
     const filePath = join(ORIGINALS_DIR, filename)
     const base64 = dataUrl.replace(/^data:image\/\w+;base64,/, '')
-    await writeFile(filePath, Buffer.from(base64, 'base64'))
+    let buf = Buffer.from(base64, 'base64')
+
+    if (!isJpeg && displayId != null) {
+      const icc = await getDisplayIcc(displayId)
+      if (icc) buf = tagPngWithIcc(buf, icc, 'Display')
+    }
+
+    await writeFile(filePath, buf)
     return { filePath, filename }
   } catch (err) {
     console.error('[capture] failed to save original image', err)
@@ -39,19 +56,85 @@ async function saveOriginalImage(dataUrl: string): Promise<{ filePath: string; f
 export type CaptureMode = 'all-screen' | 'region' | 'window' | 'screen'
 
 const HIDE_DELAY_MS = process.platform === 'darwin' ? 250 : 200
-const OVERLAY_GONE_DELAY_MS = 120
-
-function waitForOverlayGone(): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, OVERLAY_GONE_DELAY_MS))
-}
 
 function hideMainWindow(): Promise<void> {
   return new Promise(resolve => {
     const win = getMainWindow()
     if (!win || win.isDestroyed()) { resolve(); return }
+    // Already hidden → no compositor work needed, skip the delay so we get
+    // closer to hotkey-press time when freezing (preserves transient UI like
+    // tooltips/popovers that auto-dismiss on focus change).
+    if (!win.isVisible()) { resolve(); return }
     win.hide()
     setTimeout(resolve, HIDE_DELAY_MS)
   })
+}
+
+// Frozen snapshot cache, filled the moment before the overlay surfaces, then
+// consumed by the confirm handlers. Lets us capture the exact pixels visible
+// when the user pressed the hotkey — preserving tooltips/popovers that
+// auto-dismiss as soon as the overlay (or any other window) steals focus
+// from the source app.
+//
+// We only cache the NativeImage. Encoding to PNG via toDataURL() for a 4K
+// display takes ~500-1000ms and lands on the critical path before overlay
+// creation — so we hand the overlay raw BGRA bytes (free) instead, and only
+// PNG-encode when the user actually confirms a capture.
+const frozenImages = new Map<number, Electron.NativeImage>()
+
+/** Raw BGRA bitmap of the frozen snapshot for the given display, intended for
+ *  the overlay window to render as background via canvas putImageData. The
+ *  buffer comes straight from NativeImage.toBitmap() — no encode round-trip. */
+export function getFrozenBgrForDisplay(displayId: number): { buffer: Buffer; width: number; height: number } | null {
+  const img = frozenImages.get(displayId)
+  if (!img) return null
+  const size = img.getSize()
+  return { buffer: img.toBitmap(), width: size.width, height: size.height }
+}
+
+function clearFrozenCache() {
+  frozenImages.clear()
+}
+
+/** Snapshot every display at full physical resolution into the frozen cache.
+ *  Caller must have already hidden the main window (otherwise main bakes
+ *  into the cached frame). Runs all displays in parallel. */
+async function freezeAllDisplays(): Promise<void> {
+  clearFrozenCache()
+  const allDisplays = screen.getAllDisplays()
+  await Promise.all(allDisplays.map(async d => {
+    // Fast path: native capture (Windows GDI BitBlt). ~5–20 ms vs ~50–150 ms
+    // for desktopCapturer, with no WGC session setup per-call. No-op on macOS
+    // (returns null) — see native-screen.ts.
+    const nativeImg = await captureDisplayNative(d)
+    if (nativeImg) {
+      frozenImages.set(d.id, nativeImg)
+      return
+    }
+    // Fallback: desktopCapturer (if native capture fails for any reason).
+    const sf = d.scaleFactor || 1
+    const physW = Math.max(1, Math.round(d.size.width * sf))
+    const physH = Math.max(1, Math.round(d.size.height * sf))
+    const sources = await desktopCapturer.getSources({
+      types: ['screen'],
+      thumbnailSize: { width: physW, height: physH },
+    })
+    const src = findSourceForDisplay(sources, allDisplays, d.id)
+    if (src) frozenImages.set(d.id, src.thumbnail)
+  }))
+}
+
+/** One-shot warm-up of the desktopCapturer pipeline. First call after launch
+ *  initializes the underlying WGC / CGDisplayStream session and is ~300-500ms
+ *  slower than steady-state. Fire from app.whenReady() so the user's first
+ *  hotkey press doesn't eat that cold-start cost. */
+export async function prewarmDesktopCapturer(): Promise<void> {
+  try {
+    await desktopCapturer.getSources({
+      types: ['screen'],
+      thumbnailSize: { width: 1, height: 1 },
+    })
+  } catch { /* silent — best-effort */ }
 }
 
 function showMainWindow() {
@@ -65,7 +148,8 @@ function findSourceForDisplay(
   sources: Electron.DesktopCapturerSource[],
   allDisplays: Electron.Display[],
   displayId: number
-): Electron.DesktopCapturerSource {
+): Electron.DesktopCapturerSource | null {
+  if (sources.length === 0) return null
   if (sources.length === 1) return sources[0]
   const byId = sources.find(s => s.display_id === String(displayId))
   if (byId) return byId
@@ -121,9 +205,11 @@ export function setupCapture() {
     const displayId = getOverlayDisplayId()
     resetOverlayMode()
     closeAllOverlays()
-    await waitForOverlayGone()
+    // No overlay-gone wait — the crop comes from the frozen snapshot, not a
+    // fresh screen grab, so the overlay's residual presence doesn't matter.
     const dataUrl = await captureRect(payload.rect, displayId)
-    await sendCaptureToEditor(dataUrl, 'region')
+    clearFrozenCache()
+    await sendCaptureToEditor(dataUrl, 'region', displayId ?? undefined)
     return dataUrl
   })
 
@@ -245,23 +331,25 @@ export function setupCapture() {
     lastWindowPickPhysical = null
     resetOverlayMode()
     closeAllOverlays()
-    await waitForOverlayGone()
     const dataUrl = cached
       ? await capturePhysicalRect(cached)
       : await captureRect(rect, overlayId)
-    await sendCaptureToEditor(dataUrl, 'window')
+    clearFrozenCache()
+    await sendCaptureToEditor(dataUrl, 'window', cached?.displayId ?? overlayId ?? undefined)
     return dataUrl
   })
 
   ipcMain.handle('window-pick:cancel', () => {
     resetOverlayMode()
     closeAllOverlays()
+    clearFrozenCache()
     restoreFromOverlayCancel()
   })
 
   ipcMain.handle('region:cancel', () => {
     resetOverlayMode()
     closeAllOverlays()
+    clearFrozenCache()
     restoreFromOverlayCancel()
   })
 
@@ -283,15 +371,16 @@ export function setupCapture() {
     const target = allDisplays.find(d => d.id === displayId) ?? screen.getPrimaryDisplay()
     resetOverlayMode()
     closeAllOverlays()
-    await waitForOverlayGone()
     const dataUrl = await captureDisplay(target, allDisplays)
-    await sendCaptureToEditor(dataUrl, 'screen')
+    clearFrozenCache()
+    await sendCaptureToEditor(dataUrl, 'screen', target.id)
     return dataUrl
   })
 
   ipcMain.handle('monitor-pick:cancel', () => {
     resetOverlayMode()
     closeAllOverlays()
+    clearFrozenCache()
     restoreFromOverlayCancel()
   })
 }
@@ -304,13 +393,19 @@ function compositeBGRA(items: CompositeItem[], totalW: number, totalH: number): 
   const out = Buffer.alloc(totalW * totalH * 4)
   for (const it of items) {
     const { bitmap, srcW, srcH, dx, dy } = it
+    if (dx >= totalW) continue
     const rowBytes = srcW * 4
+    // Clamp the per-row copy so a display whose captured width differs from the
+    // requested width can't wrap past the composite's right edge into the next
+    // output row (horizontal shear).
+    const copyBytes = Math.min(rowBytes, Math.max(0, totalW - dx) * 4)
+    if (copyBytes <= 0) continue
     for (let row = 0; row < srcH; row++) {
       const destY = dy + row
       if (destY < 0 || destY >= totalH) continue
       const destOffset = (destY * totalW + dx) * 4
       const srcOffset  = row * rowBytes
-      bitmap.copy(out, destOffset, srcOffset, srcOffset + rowBytes)
+      bitmap.copy(out, destOffset, srcOffset, srcOffset + copyBytes)
     }
   }
   return nativeImage.createFromBuffer(out, { width: totalW, height: totalH }).toDataURL()
@@ -331,16 +426,18 @@ async function captureAllScreen(): Promise<string> {
         height: Math.max(1, Math.round(d.size.height * sf)),
       }
     })
-    const dataUrl = findSourceForDisplay(sources, allDisplays, d.id).thumbnail.toDataURL()
-    await sendCaptureToEditor(dataUrl, 'all-screen')
+    const src = findSourceForDisplay(sources, allDisplays, d.id)
+    if (!src) throw new Error('no screen source available for capture')
+    const dataUrl = src.thumbnail.toDataURL()
+    await sendCaptureToEditor(dataUrl, 'all-screen', d.id)
     return dataUrl
   }
 
-  // Keep each display at its native physical resolution. Position in physical-
-  // pixel space using DIP neighbor relationships: a display's physical X origin
-  // is the sum of the physical widths of displays whose DIP right edge is <= its
-  // DIP left edge (same rule for Y). Handles side-by-side, stacked, and mixed
-  // layouts without cumulating across independent rows/columns.
+  // Keep each display at its native physical resolution. Position each display
+  // in physical-pixel space by scaling its OWN DIP origin (offset from the
+  // bounding box of all displays) by its scale factor — rather than summing the
+  // sizes of other displays. The old summing rule double-offset stacked columns
+  // and vertically-offset layouts (black bands / top-aligned content).
   const grabs = await Promise.all(allDisplays.map(async d => {
     const sf = d.scaleFactor || 1
     const physW = Math.max(1, Math.round(d.size.width  * sf))
@@ -349,17 +446,19 @@ async function captureAllScreen(): Promise<string> {
       types: ['screen'],
       thumbnailSize: { width: physW, height: physH }
     })
-    return { display: d, thumb: findSourceForDisplay(srcs, allDisplays, d.id).thumbnail, physW, physH }
+    const src = findSourceForDisplay(srcs, allDisplays, d.id)
+    return { display: d, thumb: src ? src.thumbnail : null, physW, physH }
   }))
+
+  // Bounding box of all displays in DIP space.
+  const minX = Math.min(...grabs.map(g => g.display.bounds.x))
+  const minY = Math.min(...grabs.map(g => g.display.bounds.y))
 
   const phBounds = new Map<number, { x: number; y: number; w: number; h: number }>()
   for (const { display: d, physW, physH } of grabs) {
-    let px = 0, py = 0
-    for (const { display: other, physW: ow, physH: oh } of grabs) {
-      if (other.id === d.id) continue
-      if (other.bounds.x + other.bounds.width  <= d.bounds.x) px += ow
-      if (other.bounds.y + other.bounds.height <= d.bounds.y) py += oh
-    }
+    const sf = d.scaleFactor || 1
+    const px = Math.round((d.bounds.x - minX) * sf)
+    const py = Math.round((d.bounds.y - minY) * sf)
     phBounds.set(d.id, { x: px, y: py, w: physW, h: physH })
   }
 
@@ -368,6 +467,7 @@ async function captureAllScreen(): Promise<string> {
 
   const items: CompositeItem[] = []
   for (const { display: d, thumb } of grabs) {
+    if (!thumb) continue
     const pb = phBounds.get(d.id)!
     const ts = thumb.getSize()
     items.push({
@@ -380,20 +480,44 @@ async function captureAllScreen(): Promise<string> {
   }
 
   const dataUrl = compositeBGRA(items, totalW, totalH)
-  await sendCaptureToEditor(dataUrl, 'all-screen')
+  // Multi-display composite has mixed color spaces by construction (each
+  // display's pixels are in its own native space). Tag with the primary
+  // display's profile — accepts inaccuracy across non-primary regions in
+  // exchange for at least labeling the dominant color space.
+  await sendCaptureToEditor(dataUrl, 'all-screen', screen.getPrimaryDisplay().id)
   return dataUrl
 }
 
 async function captureWindow(): Promise<void> {
   setOverlayMode('window-pick')
   await hideMainWindow()
-  createOverlayWindows()
-  // Capture happens after overlay fires window-pick:confirm
+  try {
+    await freezeAllDisplays()
+    createOverlayWindows()
+    // Capture happens after overlay fires window-pick:confirm
+  } catch (err) {
+    // Freeze/overlay startup failed — without this restore the main window is
+    // left hidden with no way back (the confirm handlers never run).
+    console.error('[capture] window-pick startup failed', err)
+    resetOverlayMode()
+    clearFrozenCache()
+    closeAllOverlays()
+    showMainWindow()
+  }
 }
 
 async function captureRegion(): Promise<void> {
   await hideMainWindow()
-  createOverlayWindows()
+  try {
+    await freezeAllDisplays()
+    createOverlayWindows()
+  } catch (err) {
+    console.error('[capture] region startup failed', err)
+    resetOverlayMode()
+    clearFrozenCache()
+    closeAllOverlays()
+    showMainWindow()
+  }
 }
 
 // Crop directly in physical pixels against the target display's native
@@ -405,8 +529,14 @@ async function capturePhysicalRect(rect: { x: number; y: number; width: number; 
   const sf = target.scaleFactor || 1
   const physW = Math.max(1, Math.round(target.size.width  * sf))
   const physH = Math.max(1, Math.round(target.size.height * sf))
-  const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: physW, height: physH } })
-  const fullImg = findSourceForDisplay(sources, allDisplays, target.id).thumbnail
+  // Frozen cache hit → use the snapshot taken at hotkey time (preserves
+  // tooltips/popovers that the overlay would otherwise have dismissed).
+  let fullImg = frozenImages.get(target.id) ?? null
+  if (!fullImg) {
+    const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: physW, height: physH } })
+    fullImg = findSourceForDisplay(sources, allDisplays, target.id)?.thumbnail ?? null
+  }
+  if (!fullImg) throw new Error('no screen source available for capture')
   const fullSize = fullImg.getSize()
 
   // Map virtual-screen physical → display-local physical (thumbnail-local).
@@ -437,8 +567,14 @@ async function captureRect(rect: { x: number; y: number; width: number; height: 
   // mixed-DPI multi-monitor setups still crop correctly.
   const physW = Math.max(1, Math.round(targetDisplay.size.width * scaleFactor))
   const physH = Math.max(1, Math.round(targetDisplay.size.height * scaleFactor))
-  const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: physW, height: physH } })
-  const fullImg = findSourceForDisplay(sources, allDisplays, targetDisplay.id).thumbnail
+  // Prefer the frozen snapshot captured at hotkey time. Falls through to a
+  // live capture if cache is empty (legacy paths, scrolling capture).
+  let fullImg = frozenImages.get(targetDisplay.id) ?? null
+  if (!fullImg) {
+    const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: physW, height: physH } })
+    fullImg = findSourceForDisplay(sources, allDisplays, targetDisplay.id)?.thumbnail ?? null
+  }
+  if (!fullImg) throw new Error('no screen source available for capture')
   const fullSize = fullImg.getSize()
   // Derive actual scale from captured image vs logical size — handles cases where
   // the capturer returns a resolution different from what we requested.
@@ -455,6 +591,13 @@ async function captureRect(rect: { x: number; y: number; width: number; height: 
 }
 
 async function captureDisplay(display: Electron.Display, allDisplays: Electron.Display[]): Promise<string> {
+  // Frozen cache hit (monitor-pick path) — encode the cached NativeImage to
+  // PNG now. We deliberately don't pre-encode during freezeAllDisplays(): the
+  // encode is ~500-1000ms on 4K and would block overlay creation. At confirm
+  // time it's off the critical path (overlay already gone) so the cost is OK.
+  const cachedImg = frozenImages.get(display.id)
+  if (cachedImg) return cachedImg.toDataURL()
+
   const sf = display.scaleFactor || 1
   const sources = await desktopCapturer.getSources({
     types: ['screen'],
@@ -463,7 +606,9 @@ async function captureDisplay(display: Electron.Display, allDisplays: Electron.D
       height: Math.max(1, Math.round(display.size.height * sf)),
     }
   })
-  return findSourceForDisplay(sources, allDisplays, display.id).thumbnail.toDataURL()
+  const src = findSourceForDisplay(sources, allDisplays, display.id)
+  if (!src) throw new Error('no screen source available for capture')
+  return src.thumbnail.toDataURL()
 }
 
 async function captureActiveMonitor(): Promise<string | void> {
@@ -474,17 +619,26 @@ async function captureActiveMonitor(): Promise<string | void> {
     const activeDisplay = allDisplays[0] ?? screen.getPrimaryDisplay()
     await hideMainWindow()
     const dataUrl = await captureDisplay(activeDisplay, allDisplays)
-    await sendCaptureToEditor(dataUrl, 'screen')
+    await sendCaptureToEditor(dataUrl, 'screen', activeDisplay.id)
     return dataUrl
   }
 
   // Multiple displays → show overlays, let the user click one.
   setOverlayMode('monitor-pick')
   await hideMainWindow()
-  createOverlayWindows()
+  try {
+    await freezeAllDisplays()
+    createOverlayWindows()
+  } catch (err) {
+    console.error('[capture] monitor-pick startup failed', err)
+    resetOverlayMode()
+    clearFrozenCache()
+    closeAllOverlays()
+    showMainWindow()
+  }
 }
 
-export async function sendCaptureToEditor(dataUrlIn: string, source: string) {
+export async function sendCaptureToEditor(dataUrlIn: string, source: string, displayId?: number) {
   const mainWin = getMainWindow()
   if (!mainWin || mainWin.isDestroyed()) return
 
@@ -501,7 +655,8 @@ export async function sendCaptureToEditor(dataUrlIn: string, source: string) {
 
   // Always save the original capture to ~/Pictures/Lumia/ (fixed location).
   // Editor's Save button is a separate flow that writes to a user-chosen path.
-  const saved = await saveOriginalImage(dataUrl)
+  // Pass displayId so the PNG carries the originating display's ICC profile.
+  const saved = await saveOriginalImage(dataUrl, displayId)
 
   // Capture the new entry's id so the Editor knows it's already in history.
   // Without this, a follow-up runWorkflow(...) sees historyId=undefined and the
@@ -559,5 +714,6 @@ export async function sendCaptureToEditor(dataUrlIn: string, source: string) {
     body: `${label} captured — copied to clipboard`,
     thumbnailDataUrl: dataUrl,
     onClick: historyId ? () => { void openHistoryItemInEditor(historyId!, fromTray) } : undefined,
+    launchId: historyId ?? undefined,
   })
 }

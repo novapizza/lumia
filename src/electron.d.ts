@@ -6,6 +6,10 @@ interface AppSettings {
   activeWorkflowId: string
   googleDriveRefreshToken: string
   googleDriveAccessToken: string
+  // Derived flag sent by settings:get in place of the raw tokens (which are
+  // blanked before crossing the IPC boundary). True when a refresh token is
+  // stored in the main process.
+  googleDriveConnected?: boolean
   googleDriveTokenExpiresAt: number
   googleDriveFolderId: string
   launchAtStartup: boolean
@@ -37,13 +41,14 @@ declare global {
       showAfterRecording: () => Promise<void>
 
       runWorkflow: (templateId: string, imageData: string, destinationIndex?: number, historyId?: string) => Promise<import('./types').WorkflowResult>
-      runInlineAction: (actionType: 'clipboard' | 'save', imageData: string) => Promise<{ canceled?: boolean }>
+      runInlineAction: (actionType: 'clipboard' | 'save', imageData: string, historyId?: string) => Promise<{ canceled?: boolean }>
       getTemplates: () => Promise<import('./types').WorkflowTemplate[]>
       saveTemplate: (template: import('./types').WorkflowTemplate) => Promise<import('./types').WorkflowTemplate>
       deleteTemplate: (id: string) => Promise<boolean>
 
       getHistory: () => Promise<import('./types').HistoryItem[]>
       deleteHistoryItem: (id: string) => Promise<boolean>
+      deleteHistoryItems: (ids: string[]) => Promise<number>
       openHistoryFile: (filePath: string) => Promise<void>
       addHistoryItem: (item: import('./types').HistoryItem) => Promise<void>
       readHistoryFile: (filePath: string) => Promise<string | null>
@@ -100,6 +105,10 @@ declare global {
       ) => Promise<void>
       onOverlayModeChanged: (cb: (mode: string) => void) => void
       onOverlaySetActive: (cb: (active: boolean) => void) => void
+      onOverlayFrozenBgraChanged: (
+        cb: (data: { buffer: Uint8Array; width: number; height: number } | null) => void
+      ) => void
+      notifyOverlayBgReady: () => void
       overlayDrawing: (drawing: boolean) => void
       notifyRoute: (route: string) => void
 
@@ -127,10 +136,12 @@ declare global {
         outputSize?: { width: number; height: number }                   // physical-pixel output canvas dims (region/window)
       } | null>
       recorderGetWatermark: () => Promise<string | null>
-      recorderReady: (ok: boolean, error?: string) => Promise<void>
+      recorderReady: (ok: boolean, error?: string, micAvailable?: boolean) => Promise<void>
       recorderStateChange: (state: 'countdown' | 'recording' | 'paused' | 'stopping' | 'saving' | 'done' | 'error', payload?: unknown) => Promise<void>
       recorderTick: (elapsedMs: number) => Promise<void>
-      recorderSaveBlob: (buffer: ArrayBuffer, thumbnailDataUrl: string, durationMs: number) => Promise<{ filePath: string }>
+      recorderSaveBegin: () => Promise<{ ok: boolean }>
+      recorderSaveChunk: (chunk: ArrayBuffer) => Promise<{ ok: boolean }>
+      recorderSaveEnd: (thumbnailDataUrl: string, durationMs: number) => Promise<{ filePath: string }>
       onRecorderBegin: (cb: () => void) => void
       onRecorderPause: (cb: () => void) => void
       onRecorderResume: (cb: () => void) => void
@@ -168,9 +179,6 @@ declare global {
       onAnnotationClear: (cb: () => void) => void
       onAnnotationUndo: (cb: () => void) => void
 
-      // OCR & Auto-Blur
-      ocrScan: (dataUrl: string) => Promise<import('@/types').AutoBlurResult>
-
       // Wallpapers (Unsplash)
       wallpapersRandom: (opts: {
         picks: Array<{ id: string; topic?: string; query?: string }>
@@ -185,6 +193,16 @@ declare global {
       wallpapersIsConfigured: () => Promise<boolean>
       wallpapersSetAsWallpaper: (photo: import('@/types').UnsplashPhoto) => Promise<
         | { ok: true; filePath: string }
+        | { ok: false; error: string }
+      >
+
+      // Stickers (R2-hosted, manifest-driven)
+      stickersManifest: (opts?: { force?: boolean }) => Promise<
+        | { ok: true; manifest: import('@/types').StickerManifest }
+        | { ok: false; error: string }
+      >
+      stickersFetch: (relPath: string) => Promise<
+        | { ok: true; dataUrl: string }
         | { ok: false; error: string }
       >
 

@@ -136,6 +136,15 @@ function ModeBar({
     >
       <div
         className="flex items-center gap-3 glass-refractive rounded-full pl-1.5 pr-3 py-1.5"
+        // The overlay root drives region/window picking off POINTER events, so
+        // we must swallow pointer events here too — stopping only the mouse
+        // events lets `pointerdown` bubble through and start a drag (region) or
+        // confirm a window-pick (window) instead of switching modes, which also
+        // setPointerCapture-steals the tab's click. Keep the mouse handlers for
+        // screen mode, whose root listens on `onClick`.
+        onPointerDown={(e) => e.stopPropagation()}
+        onPointerMove={(e) => e.stopPropagation()}
+        onPointerUp={(e) => e.stopPropagation()}
         onMouseDown={(e) => e.stopPropagation()}
         onMouseMove={(e) => e.stopPropagation()}
         onMouseUp={(e) => e.stopPropagation()}
@@ -184,6 +193,17 @@ export default function Overlay() {
   const [isDrawing, setIsDrawing] = useState(false)
   const [isActive, setIsActive] = useState(true)
   const [hoveredWindow, setHoveredWindow] = useState<Rect | null>(null)
+  // Frozen snapshot pushed from main at hotkey-press time as raw BGRA bytes
+  // (no PNG encode round-trip — saves ~500-1000ms on 4K displays). The
+  // overlay's <canvas> paints it via putImageData. `frozenBgReady` flips
+  // true once the bitmap has been committed to the canvas and the GPU has
+  // had a frame to display it; main gates win.setOpacity(1) on that ack
+  // so the overlay only surfaces after the bg is visible.
+  const [frozenBgr, setFrozenBgr] = useState<
+    { buffer: Uint8Array; width: number; height: number } | null
+  >(null)
+  const [frozenBgReady, setFrozenBgReady] = useState(false)
+  const frozenCanvasRef = useRef<HTMLCanvasElement>(null)
   const overlayRef = useRef<HTMLDivElement>(null)
   const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const hoveredWindowRef = useRef<{ x: number; y: number; width: number; height: number } | null>(null)
@@ -205,11 +225,55 @@ export default function Overlay() {
       setIsDrawing(false)
       setHoveredWindow(null)
     })
+    window.electronAPI?.onOverlayFrozenBgraChanged?.((data) => setFrozenBgr(data))
     return () => {
       window.electronAPI?.removeAllListeners('overlay:set-active')
       window.electronAPI?.removeAllListeners('overlay:mode-changed')
+      window.electronAPI?.removeAllListeners('overlay:frozen-bgra-changed')
     }
   }, [])
+
+  // Paint the BGRA buffer directly to the canvas. We swizzle B↔R in-place via
+  // a Uint32Array view (4× fewer iterations than per-byte) — on a 4K image
+  // that's ~10ms vs ~40ms. ImageData wants RGBA so the swizzle is mandatory.
+  // Two rAFs after putImageData guarantees the GPU has shown the bitmap, then
+  // we ack main so it can ramp opacity to 1.
+  useEffect(() => {
+    if (!frozenBgr) { setFrozenBgReady(false); return }
+    const canvas = frozenCanvasRef.current
+    if (!canvas) return
+
+    canvas.width = frozenBgr.width
+    canvas.height = frozenBgr.height
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+
+    // BGRA → RGBA into a FRESH buffer — never mutate the IPC buffer in place.
+    // This effect re-runs on `mode` changes, and the swap is an involution, so
+    // an in-place swizzle would re-corrupt (red/blue swapped) on every other
+    // mode switch. Reading from the untouched source each time keeps it
+    // correct. For each px (little-endian BB GG RR AA → uint32 0xAARRGGBB),
+    // swap the B and R bytes.
+    const src = frozenBgr.buffer
+    const srcU32 = new Uint32Array(src.buffer, src.byteOffset, src.byteLength >>> 2)
+    const out = new Uint8ClampedArray(src.byteLength)
+    const outU32 = new Uint32Array(out.buffer)
+    for (let i = 0; i < srcU32.length; i++) {
+      const v = srcU32[i]
+      outU32[i] = (v & 0xFF00FF00) | ((v & 0x00FF0000) >>> 16) | ((v & 0x000000FF) << 16)
+    }
+    ctx.putImageData(new ImageData(out, frozenBgr.width, frozenBgr.height), 0, 0)
+
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        setFrozenBgReady(true)
+        window.electronAPI?.notifyOverlayBgReady?.()
+      })
+    })
+    // `mode` in deps: if the React tree shifts on mode change and the canvas
+    // ref is reattached to a fresh DOM node, re-paint instead of leaving it
+    // blank. Re-painting against the existing canvas is a no-op cost-wise.
+  }, [frozenBgr, mode])
 
   // Window-pick: poll window under cursor (throttled 80ms)
   const pollWindowAt = useCallback(async (x: number, y: number) => {
@@ -260,7 +324,7 @@ export default function Overlay() {
     }
   }
 
-  const handleMouseDown = (e: React.MouseEvent) => {
+  const handleMouseDown = (e: React.PointerEvent) => {
     if (!isActive) return
     if (base === 'window') {
       const x = e.clientX
@@ -274,13 +338,17 @@ export default function Overlay() {
       })
       return
     }
+    // Capture the pointer so a drag that ends past the display edge (onto an
+    // adjacent monitor) still delivers pointerup here — otherwise the drag
+    // would wedge isDrawing=true and hold the overlay:drawing lock until ESC.
+    try { e.currentTarget.setPointerCapture(e.pointerId) } catch { /* ignore */ }
     setStartPos({ x: e.clientX, y: e.clientY })
     setCurrentPos({ x: e.clientX, y: e.clientY })
     setIsDrawing(true)
     window.electronAPI?.overlayDrawing(true)
   }
 
-  const handleMouseMove = (e: React.MouseEvent) => {
+  const handleMouseMove = (e: React.PointerEvent) => {
     if (base === 'window') {
       const x = e.clientX
       const y = e.clientY
@@ -290,6 +358,15 @@ export default function Overlay() {
     }
     if (!isDrawing) return
     setCurrentPos({ x: e.clientX, y: e.clientY })
+  }
+
+  // Pointer drag interrupted (e.g. OS took the pointer, display unplugged):
+  // unwind cleanly so the overlay:drawing lock is released.
+  const handlePointerCancel = () => {
+    if (base === 'window' || !isDrawing) return
+    setIsDrawing(false)
+    window.electronAPI?.overlayDrawing(false)
+    resetDrawState()
   }
 
   const handleMouseUp = async () => {
@@ -316,6 +393,22 @@ export default function Overlay() {
 
   const rect = getRect()
 
+  // Full-bleed snapshot rendered to a <canvas> via putImageData on the raw
+  // BGRA bytes from main. Always in the DOM so the ref is bound when bgra
+  // arrives; hidden via visibility until the first paint commits to avoid
+  // a flash of empty canvas. Tint is intentionally not layered on top — any
+  // blanket darken misrepresents the user's on-screen colors to the picker,
+  // and the picker UI elements already convey "capture mode active". For
+  // inactive overlays (cursor on another display) the snapshot still shows
+  // so the user can see what's on each monitor.
+  const FrozenBgLayer = (
+    <canvas
+      ref={frozenCanvasRef}
+      className="absolute inset-0 w-full h-full pointer-events-none select-none"
+      style={{ zIndex: 0, visibility: frozenBgReady ? 'visible' : 'hidden' }}
+    />
+  )
+
   // ── Monitor-pick / video-screen UI ───────────────────────────────────────
   if (base === 'screen') {
     const onClick = () => {
@@ -331,10 +424,13 @@ export default function Overlay() {
         className="fixed inset-0 select-none"
         style={{
           cursor: isActive ? 'pointer' : 'default',
-          background: isActive ? accent.activeBg : 'transparent',
+          // Tint only over a transparent (video) overlay; over a frozen
+          // snapshot any darken misrepresents the user's screen colors.
+          background: !frozenBgReady && isActive ? accent.activeBg : 'transparent',
         }}
         onClick={onClick}
       >
+        {FrozenBgLayer}
         {isActive && (
           <>
             <div
@@ -362,11 +458,12 @@ export default function Overlay() {
         className="fixed inset-0 select-none"
         style={{
           cursor: isActive ? 'crosshair' : 'default',
-          background: isActive ? 'rgba(0,0,0,0.03)' : 'transparent',
+          background: !frozenBgReady && isActive ? 'rgba(0,0,0,0.03)' : 'transparent',
         }}
-        onMouseMove={handleMouseMove}
-        onMouseDown={handleMouseDown}
+        onPointerMove={handleMouseMove}
+        onPointerDown={handleMouseDown}
       >
+        {FrozenBgLayer}
 
         {isActive && (
           <ModeBar mode={mode} intent={intent} icon="window" hint={hint} />
@@ -418,13 +515,14 @@ export default function Overlay() {
       className="fixed inset-0 select-none"
       style={{
         cursor: isActive ? 'crosshair' : 'default',
-        background: isActive ? 'rgba(0,0,0,0.08)' : 'transparent',
-        transition: 'background 0.15s ease'
+        background: !frozenBgReady && isActive ? 'rgba(0,0,0,0.08)' : 'transparent',
       }}
-      onMouseDown={handleMouseDown}
-      onMouseMove={handleMouseMove}
-      onMouseUp={handleMouseUp}
+      onPointerDown={handleMouseDown}
+      onPointerMove={handleMouseMove}
+      onPointerUp={handleMouseUp}
+      onPointerCancel={handlePointerCancel}
     >
+      {FrozenBgLayer}
       <style>{`
         @keyframes scroll-region-border-pulse {
           0%, 100% { border-color: rgba(56, 189, 248, 0.8); box-shadow: 0 0 0 9999px rgba(0,0,0,0.18); }

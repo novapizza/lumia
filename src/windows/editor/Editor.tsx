@@ -6,9 +6,9 @@ import AnnotationCanvas, {
 } from '../../components/AnnotationCanvas/Canvas'
 import AnnotationToolBar from '../../components/AnnotationCanvas/ToolBar'
 import { matchToolShortcut } from '../../components/AnnotationCanvas/tools'
-import type { WorkflowTemplate, HistoryItem, SensitiveRegion, AnnotationObject } from '../../types'
+import type { WorkflowTemplate, HistoryItem, AnnotationObject } from '../../types'
 import type { DrawObject } from '../../components/AnnotationCanvas/Canvas'
-import { AutoBlurPanel } from '../../components/AutoBlurPanel'
+import StickerPicker, { type PickedSticker } from '../../components/StickerPicker'
 import { deriveActions, type ActionBtn } from '../../lib/workflow-actions'
 import { useLocalVideoUrl } from '../../hooks/useLocalVideoUrl'
 
@@ -81,7 +81,6 @@ export default function Editor() {
   const [color, setColor] = useState('#f87171')
   const [strokeWidth, setStrokeWidth] = useState(3)
   const [exportTrigger, setExportTrigger] = useState(0)
-  const [, setExportedDataUrl] = useState<string>('')
   const [templates, setTemplates] = useState<WorkflowTemplate[]>([])
   const [activeWorkflowId, setActiveWorkflowId] = useState<string>('')
   const [gdriveConnected, setGdriveConnected] = useState(false)
@@ -105,13 +104,7 @@ export default function Editor() {
     }[]
   >([])
   const [showClipPanel, setShowClipPanel] = useState(false)
-  const [showAutoBlur, setShowAutoBlur] = useState(false)
   // Color popover is now handled inside AnnotationToolBar.
-  const [autoBlurScanning, setAutoBlurScanning] = useState(false)
-  const [autoBlurRegions, setAutoBlurRegions] = useState<SensitiveRegion[]>([])
-  const [autoBlurSelected, setAutoBlurSelected] = useState<Set<string>>(new Set())
-  const [autoBlurOcrTime, setAutoBlurOcrTime] = useState<number>()
-  const [, setAutoBlurDetectTime] = useState<number>()
 
   // Video is view-only here — plain HTML5 <video controls> for playback. Save
   // / Copy / Upload R2 operate on the source file directly, not on frames.
@@ -166,12 +159,6 @@ export default function Editor() {
     // effect runs AFTER Canvas's mount effects.
     setImageDataUrl(dataUrl)
     setExportTrigger(0)
-    setAutoBlurRegions([])
-    setAutoBlurSelected(new Set())
-    setAutoBlurScanning(false)
-    setAutoBlurOcrTime(undefined)
-    setAutoBlurDetectTime(undefined)
-    setShowAutoBlur(false)
   }, [])
 
   const activeTemplate = useMemo(() => {
@@ -190,7 +177,6 @@ export default function Editor() {
     setHistoryId(state.historyId)
     setInitialAnnotations(state.annotations)
     userEditedRef.current = false
-    baselineObjectsLenRef.current = state.annotations?.length ?? 0
     if (nextKind === 'video') {
       setKind('video')
       setVideoFilePath(state.filePath ?? '')
@@ -218,7 +204,6 @@ export default function Editor() {
       setHistoryId(undefined)
       setInitialAnnotations(undefined)
       userEditedRef.current = false
-      baselineObjectsLenRef.current = 0
       resetForNewImage(dataUrl)
     })
     Promise.all([
@@ -227,7 +212,7 @@ export default function Editor() {
     ]).then(([t, s]) => {
       if (t) setTemplates(t)
       if (s?.activeWorkflowId) setActiveWorkflowId(s.activeWorkflowId)
-      setGdriveConnected(!!s?.googleDriveRefreshToken)
+      setGdriveConnected(!!s?.googleDriveConnected)
     })
     return () => { window.electronAPI?.removeAllListeners('capture:ready') }
   }, [])
@@ -252,10 +237,15 @@ export default function Editor() {
     })
   }, [])
 
-  const loadClipboardItem = useCallback(async (entry: { id: string; filePath?: string; annotatedFilePath?: string; legacyDataUrl?: string }) => {
-    // Prefer the annotated sidecar so switching back to a history item shows
-    // the user's edited version, not the untouched original.
-    const sourcePath = entry.annotatedFilePath ?? entry.filePath
+  const loadClipboardItem = useCallback(async (entry: { id: string; filePath?: string; annotatedFilePath?: string; legacyDataUrl?: string; annotations?: AnnotationObject[] }) => {
+    // When the item carries vector annotations, load the ORIGINAL file and let
+    // Canvas replay the vectors on top — same as Dashboard. Using the annotated
+    // sidecar here would flatten the annotations into pixels AND replay the
+    // vectors, doubling them (and leaving ghosts when one is deleted). Only when
+    // there are no vectors do we fall back to the annotated sidecar so a legacy
+    // item edited before vectors were persisted still shows its edited version.
+    const hasVectors = (entry.annotations?.length ?? 0) > 0
+    const sourcePath = hasVectors ? entry.filePath : (entry.annotatedFilePath ?? entry.filePath)
     if (sourcePath) {
       try {
         const dataUrl = await window.electronAPI?.readHistoryFile(sourcePath)
@@ -277,6 +267,10 @@ export default function Editor() {
         if (e.key === '-')                  { e.preventDefault(); canvasRef.current?.zoomOut(); return }
         if (e.key === '0')                  { e.preventDefault(); canvasRef.current?.zoomReset(); return }
       }
+      // Don't let a modified chord (Ctrl+V/A/R/T/B/E/P, etc.) silently switch
+      // the active tool — those are clipboard/select/etc. shortcuts, not the
+      // bare single-key tool picks.
+      if (e.ctrlKey || e.metaKey || e.altKey) return
       const match = matchToolShortcut(e.key)
       if (match) setTool(match)
     }
@@ -352,11 +346,10 @@ export default function Editor() {
   // Suppress saves triggered by Canvas's replay of `initialAnnotations`. The
   // replay fires before `useImage` has finished loading the background, so
   // `stage.toDataURL()` at that moment captures the strokes on a transparent
-  // canvas — the resulting sidecar PNG would lose the original image. We
-  // only enable saves after a genuine user edit (objects diverge from the
-  // baseline length seeded from `initialAnnotations`).
+  // canvas — the resulting sidecar PNG would lose the original image. We only
+  // enable saves after Canvas reports a genuine user edit via the `userEdited`
+  // flag on onHistoryChange.
   const userEditedRef = useRef(false)
-  const baselineObjectsLenRef = useRef(0)
   useEffect(() => () => {
     if (annotationSaveTimer.current) {
       clearTimeout(annotationSaveTimer.current)
@@ -369,8 +362,7 @@ export default function Editor() {
     }
   }, [])
 
-  const handleExport = useCallback((dataUrl: string) => {
-    setExportedDataUrl(dataUrl)
+  const handleExport = useCallback(async (dataUrl: string) => {
     setExportTrigger(0)
 
     const pendingRaw = pendingAction.current
@@ -385,20 +377,28 @@ export default function Editor() {
     // is about not creating a *new* history entry — `runInlineAction` doesn't
     // touch the history store, so updating an existing item's annotations
     // here is fine.
+    //
+    // AWAIT instead of fire-and-forget: runInlineAction('save') below reads
+    // the just-written sidecar off disk and copies it to the user's chosen
+    // location (preserves bytes + iCCP, avoids a lossy decode/re-encode
+    // round-trip through Konva canvas). Racing the two would let copyFile
+    // pick up stale sidecar contents from the previous edit.
     if (historyId && !isVideo && canvasRef.current) {
       if (annotationSaveTimer.current) { clearTimeout(annotationSaveTimer.current); annotationSaveTimer.current = null }
       pendingAnnotationSave.current = null  // action save supersedes any pending debounced save
       const objects = canvasRef.current.getObjects() as AnnotationObject[]
-      window.electronAPI?.saveHistoryAnnotations(historyId, objects, dataUrl).catch((err) => {
+      try {
+        await window.electronAPI?.saveHistoryAnnotations(historyId, objects, dataUrl)
+      } catch (err) {
         console.error('[editor] failed to save annotations', err)
-      })
+      }
     }
 
     if (!pending) return
     const { key, templateId, destinationIndex, actionType } = pending
     setActionBusy(key)
     if (actionType) {
-      window.electronAPI?.runInlineAction(actionType, dataUrl)
+      window.electronAPI?.runInlineAction(actionType, dataUrl, historyId)
         .then((res) => {
           if (res?.canceled) return // user dismissed the save dialog
           showToast(actionType === 'clipboard' ? 'Copied to clipboard' : 'Saved to file', 'check_circle')
@@ -423,7 +423,7 @@ export default function Editor() {
     setExportTrigger((n) => n + 1)
   }
 
-  const handleHistoryChange = useCallback((u: boolean, r: boolean) => {
+  const handleHistoryChange = useCallback((u: boolean, r: boolean, userEdited?: boolean) => {
     setCanUndo(u)
     setCanRedo(r)
     // Lightweight auto-save: just the annotation JSON, no flattened PNG. That
@@ -438,25 +438,25 @@ export default function Editor() {
     // would wipe the user's persisted annotations.
     if (!u && !r) return
     if (historyId && !isVideo && canvasRef.current) {
-      const objects = canvasRef.current.getObjects() as AnnotationObject[]
-      // Gate out Canvas replay: the first fire with objects.length matching
-      // the baseline is the rehydration of `initialAnnotations`, not a user
-      // edit. `useImage` is still loading the background at that point, so
-      // `toDataURL` would flatten strokes onto a transparent canvas. Once the
-      // user draws/edits/clears the object count diverges and we latch
-      // `userEditedRef` so every subsequent commit saves.
+      // Gate out Canvas replay using its explicit `userEdited` signal rather
+      // than an object-count diff — the count check missed same-length first
+      // edits (e.g. dragging a single Text), silently dropping that save.
+      // `userEditedRef` latches once Canvas reports the first real edit.
       if (!userEditedRef.current) {
-        if (objects.length === baselineObjectsLenRef.current) return
+        if (!userEdited) return
         userEditedRef.current = true
       }
-      // Capture the flattened PNG synchronously here — at unmount the Konva
-      // stage may already be torn down, so stashing it now guarantees the
-      // sidecar survives a Back/close within the 600ms debounce window.
-      let flattenedDataUrl: string | undefined
-      try { flattenedDataUrl = canvasRef.current.toDataURL() } catch { /* stage unavailable */ }
-      pendingAnnotationSave.current = { historyId, objects, flattenedDataUrl }
+      const objects = canvasRef.current.getObjects() as AnnotationObject[]
+      // Stash JSON now; defer the expensive full-resolution rasterisation to
+      // the debounce callback so we don't flatten the whole stage on every
+      // stroke commit. The unmount flush below may run before this fires and
+      // sends JSON-only (flattenedDataUrl undefined) — that's fine, the next
+      // action refreshes the sidecar.
+      pendingAnnotationSave.current = { historyId, objects, flattenedDataUrl: undefined }
       if (annotationSaveTimer.current) clearTimeout(annotationSaveTimer.current)
       annotationSaveTimer.current = setTimeout(() => {
+        // Rasterise inside the debounce window — the stage is still alive here.
+        try { if (canvasRef.current && pendingAnnotationSave.current) pendingAnnotationSave.current.flattenedDataUrl = canvasRef.current.toDataURL() } catch { /* stage unavailable */ }
         const pending = pendingAnnotationSave.current
         pendingAnnotationSave.current = null
         annotationSaveTimer.current = null
@@ -467,45 +467,13 @@ export default function Editor() {
     }
   }, [historyId, isVideo])
 
-  const handleAutoBlurScan = useCallback(async () => {
-    if (!imageDataUrl || autoBlurScanning) return
-    setAutoBlurScanning(true)
-    setShowAutoBlur(true)
-    try {
-      const result = await window.electronAPI?.ocrScan(imageDataUrl)
-      if (result) {
-        setAutoBlurRegions(result.regions)
-        setAutoBlurSelected(new Set(result.regions.map(r => r.id)))
-        setAutoBlurOcrTime(result.ocrTimeMs)
-        setAutoBlurDetectTime(result.detectTimeMs)
-        if (result.regions.length === 0) showToast('No sensitive info detected', 'verified_user')
-      }
-    } catch {
-      showToast('OCR scan failed', 'error', 'error')
-    } finally {
-      setAutoBlurScanning(false)
-    }
-  }, [imageDataUrl, autoBlurScanning, showToast])
-
-  const handleApplyAutoBlur = useCallback(() => {
-    const selected = autoBlurRegions.filter(r => autoBlurSelected.has(r.id))
-    if (selected.length === 0) return
-    // Inject detected regions as Konva blur annotations — non-destructive,
-    // re-editable, and merged into the canvas's undo stack as one entry.
-    const objs: Omit<DrawObject, 'id'>[] = selected.map(r => ({
-      type: 'blur',
-      x: r.bbox.x,
-      y: r.bbox.y,
-      width: r.bbox.width,
-      height: r.bbox.height,
-      color: '#000000',
-      strokeWidth: 6,
-    }))
-    canvasRef.current?.addObjects(objs)
-    setAutoBlurRegions([])
-    setAutoBlurSelected(new Set())
-    showToast(`Blurred ${selected.length} region${selected.length > 1 ? 's' : ''}`, 'blur_on')
-  }, [autoBlurRegions, autoBlurSelected, showToast])
+  const handlePickSticker = useCallback((s: PickedSticker) => {
+    const aspect = s.natural.h > 0 ? s.natural.w / s.natural.h : 1
+    canvasRef.current?.addSticker({ src: s.path, aspect })
+    // Drop back to cursor so the freshly-placed sticker is selected and
+    // draggable, and the picker (gated on tool === 'sticker') closes.
+    setTool('none')
+  }, [])
 
   /* ── Empty state (no source at all — covers both image and video modes) ── */
   const hasSource = isVideo ? !!videoFilePath : !!imageDataUrl
@@ -708,28 +676,6 @@ export default function Editor() {
           )}
         </div>
 
-        {/* ── Auto-blur panel ── */}
-        {showAutoBlur && (
-          <aside className="w-60 flex-shrink-0 glass-refractive border-l border-white/5 flex flex-col overflow-hidden">
-            <AutoBlurPanel
-              regions={autoBlurRegions}
-              selectedIds={autoBlurSelected}
-              scanning={autoBlurScanning}
-              ocrTimeMs={autoBlurOcrTime}
-              onToggleRegion={(id) => setAutoBlurSelected(prev => {
-                const next = new Set(prev)
-                next.has(id) ? next.delete(id) : next.add(id)
-                return next
-              })}
-              onSelectAll={() => setAutoBlurSelected(new Set(autoBlurRegions.map(r => r.id)))}
-              onDeselectAll={() => setAutoBlurSelected(new Set())}
-              onApplyBlur={handleApplyAutoBlur}
-              onScan={handleAutoBlurScan}
-              onClose={() => setShowAutoBlur(false)}
-            />
-          </aside>
-        )}
-
         {/* ── Clipboard history panel ── */}
         {showClipPanel && (
           <aside className="w-60 flex-shrink-0 glass-refractive border-l border-white/5 flex flex-col overflow-hidden">
@@ -763,7 +709,6 @@ export default function Editor() {
                       setHistoryId(item.id)
                       setInitialAnnotations(item.annotations)
                       userEditedRef.current = false
-                      baselineObjectsLenRef.current = item.annotations?.length ?? 0
                       resetForNewImage(dataUrl)
                     }}
                   >
@@ -784,6 +729,13 @@ export default function Editor() {
            build; to annotate, extract a frame via the History page or rebuild
            the dedicated video annotator. */}
       {!isVideo && (
+        <div className="relative flex-shrink-0">
+        {tool === 'sticker' && (
+          <StickerPicker
+            onSelect={handlePickSticker}
+            onClose={() => setTool('none')}
+          />
+        )}
         <AnnotationToolBar
           tool={tool} setTool={setTool}
           color={color} setColor={setColor}
@@ -792,20 +744,8 @@ export default function Editor() {
           onUndo={() => canvasRef.current?.undo()}
           onRedo={() => canvasRef.current?.redo()}
           onClear={() => canvasRef.current?.clear()}
-          extraLeft={
-            <button
-              title="AI blur sensitive info"
-              onClick={() => { setShowAutoBlur(p => !p); if (!showAutoBlur && autoBlurRegions.length === 0) setShowAutoBlur(true) }}
-              className={`flex items-center justify-center w-9 h-9 rounded-lg transition-all ${
-                showAutoBlur
-                  ? 'bg-orange-500/20 text-orange-400 shadow-[0_0_12px_rgba(251,146,60,0.15)]'
-                  : 'text-slate-400 hover:text-orange-400 hover:bg-orange-500/10'
-              }`}
-            >
-              <span className="material-symbols-outlined text-[18px]">security</span>
-            </button>
-          }
         />
+        </div>
       )}
 
       {/* No playback bar — the native HTML5 <video controls> provides

@@ -70,6 +70,10 @@ export default function RecordingToolbar() {
   const [elapsed, setElapsed] = useState(0)
   const [countdown, setCountdown] = useState(COUNTDOWN_START)
   const [micEnabled, setMicEnabled] = useState(false)
+  // Whether a microphone track was actually acquired by the recorder host.
+  // When false the mic toggle is disabled — otherwise it would show a "live"
+  // mic while no audio is being captured. Defaults true until told otherwise.
+  const [micAvailable, setMicAvailable] = useState(true)
   const [annotationOn, setAnnotationOn] = useState(false)
   const [error, setError] = useState<string>('')
 
@@ -125,7 +129,8 @@ export default function RecordingToolbar() {
 
   // Listen for state updates from main
   useEffect(() => {
-    const handler = (s: { phase?: Phase; elapsedMs?: number; countdown?: number; micEnabled?: boolean; annotationOn?: boolean; error?: string }) => {
+    const handler = (s: { phase?: Phase; elapsedMs?: number; countdown?: number; micEnabled?: boolean; micAvailable?: boolean; annotationOn?: boolean; error?: string }) => {
+      if (typeof s.micAvailable === 'boolean') setMicAvailable(s.micAvailable)
       if (s.phase === 'countdown') {
         // Start local countdown (main just kicks it off)
         setPhase('countdown')
@@ -141,6 +146,15 @@ export default function RecordingToolbar() {
           }
         }, 1000)
         return
+      }
+      // Any non-countdown phase means the countdown is over (begin fired, or
+      // the session errored / was cancelled): stop the local countdown timer
+      // so it can't call toolbarBegin() and start a recording the user was
+      // trying to abort. (s.phase is already narrowed to exclude 'countdown'
+      // here by the early return above.)
+      if (s.phase && countdownTimer.current) {
+        clearInterval(countdownTimer.current)
+        countdownTimer.current = null
       }
       // Some state messages (e.g. mic toggle) carry only a payload field
       // and intentionally omit `phase` so they don't disturb the current
@@ -188,6 +202,7 @@ export default function RecordingToolbar() {
   const handlePause  = () => window.electronAPI?.toolbarPause?.()
   const handleResume = () => window.electronAPI?.toolbarResume?.()
   const handleMic    = () => {
+    if (!micAvailable) return
     const next = !micEnabled
     setMicEnabled(next)
     window.electronAPI?.toolbarToggleMic?.(next)
@@ -240,13 +255,15 @@ export default function RecordingToolbar() {
             <div className="w-px h-6 bg-white/10" />
             {/* Mic toggle — RecorderHost has already pre-acquired the mic
                 track during this countdown window, so flipping it here is
-                instant and stays in effect once recording begins. */}
+                instant and stays in effect once recording begins. Disabled
+                when no mic was acquired (permission denied / no device). */}
             <ToolbarBtn
-              icon={micEnabled ? 'mic' : 'mic_off'}
-              label={micEnabled ? 'Mute microphone' : 'Enable microphone'}
+              icon={!micAvailable ? 'mic_off' : micEnabled ? 'mic' : 'mic_off'}
+              label={!micAvailable ? 'No microphone available' : micEnabled ? 'Mute microphone' : 'Enable microphone'}
               onClick={handleMic}
-              active={micEnabled}
-              accent={micEnabled ? 'red' : 'neutral'}
+              active={micAvailable && micEnabled}
+              accent={micAvailable && micEnabled ? 'red' : 'neutral'}
+              disabled={!micAvailable}
             />
           </div>
         )}
@@ -292,11 +309,12 @@ export default function RecordingToolbar() {
 
             {/* Mic toggle */}
             <ToolbarBtn
-              icon={micEnabled ? 'mic' : 'mic_off'}
-              label={micEnabled ? 'Mute microphone' : 'Enable microphone'}
+              icon={!micAvailable ? 'mic_off' : micEnabled ? 'mic' : 'mic_off'}
+              label={!micAvailable ? 'No microphone available' : micEnabled ? 'Mute microphone' : 'Enable microphone'}
               onClick={handleMic}
-              active={micEnabled}
-              accent={micEnabled ? 'red' : 'neutral'}
+              active={micAvailable && micEnabled}
+              accent={micAvailable && micEnabled ? 'red' : 'neutral'}
+              disabled={!micAvailable}
             />
 
             {/* Annotate (live drawing overlay on the recording display) */}

@@ -51,6 +51,10 @@ export interface AnnotationObject {
   strokeWidth: number
   fill?: string
   isBlur?: boolean
+  /** Sticker only: manifest-relative R2 path (e.g. "cat-stickers/01-love.png").
+   *  Stored instead of the data URL so history.json stays small; the renderer
+   *  re-resolves it through the cached sticker fetch on reopen. */
+  src?: string
 }
 
 export interface HistoryItem {
@@ -75,45 +79,4 @@ export interface HistoryItem {
   // surfaces outside the Editor (Dashboard Share/Copy, thumbnail) operate
   // on the annotated version without re-running Konva.
   annotatedFilePath?: string
-}
-
-// ── OCR & Auto-Blur ──────────────────────────────────────────────
-
-export interface OcrWord {
-  text: string
-  bbox: { x: number; y: number; width: number; height: number }
-  confidence: number
-}
-
-export type SensitiveCategory =
-  | 'email'
-  | 'phone'
-  | 'credit-card'
-  | 'ssn'
-  | 'api-key'
-  | 'jwt'
-  | 'private-key'
-  | 'password'
-  | 'bearer-token'
-  | 'ip-address'
-  | 'url-credentials'
-
-export interface SensitiveRegion {
-  id: string
-  category: SensitiveCategory
-  text: string
-  bbox: { x: number; y: number; width: number; height: number }
-}
-
-export interface AutoBlurResult {
-  regions: SensitiveRegion[]
-  ocrTimeMs: number
-  detectTimeMs: number
-}
-
-export interface AutoBlurSettings {
-  enabled: boolean
-  autoBlurOnCapture: 'off' | 'suggest' | 'auto-apply'
-  categories: Record<SensitiveCategory, boolean>
-  blurIntensity: number // 1-20 pixelation block size
 }

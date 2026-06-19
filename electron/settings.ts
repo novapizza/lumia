@@ -11,7 +11,6 @@ export interface AppSettings {
   defaultSavePath: string
   theme: 'dark' | 'light' | 'system'
   activeWorkflowId: string
-  lastSeenReleaseVersion: string
   googleDriveRefreshToken: string
   googleDriveAccessToken: string
   googleDriveTokenExpiresAt: number
@@ -63,11 +62,13 @@ const PRINT_SCREEN_DEFAULT = process.platform === 'darwin'
 
 const store = new Store<AppSettings>({
   name: 'settings',
+  // A corrupted settings.json must not crash the app at module-import time
+  // (this store is read on import below) — reset to defaults instead.
+  clearInvalidConfig: true,
   defaults: {
     defaultSavePath: join(homedir(), 'Downloads'),
     theme: 'system',
     activeWorkflowId: 'builtin-r2',
-    lastSeenReleaseVersion: '',
     googleDriveRefreshToken: '',
     googleDriveAccessToken: '',
     googleDriveTokenExpiresAt: 0,
@@ -100,7 +101,6 @@ export function getSettings(): AppSettings {
     defaultSavePath: store.get('defaultSavePath'),
     theme: store.get('theme'),
     activeWorkflowId: store.get('activeWorkflowId'),
-    lastSeenReleaseVersion: store.get('lastSeenReleaseVersion'),
     googleDriveRefreshToken: store.get('googleDriveRefreshToken'),
     googleDriveAccessToken: store.get('googleDriveAccessToken'),
     googleDriveTokenExpiresAt: store.get('googleDriveTokenExpiresAt'),

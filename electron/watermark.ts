@@ -79,10 +79,15 @@ export function applyWatermark(dataUrl: string): string {
     const baseBuf = Buffer.from(base.toBitmap())
     const logoBuf = logoResized.toBitmap()
 
-    // Alpha-blend the logo onto the base buffer. Both buffers are BGRA
-    // when `toBitmap` returns them on Windows/macOS. Clamp to the base
-    // bounds so partial off-screen pixels are ignored instead of
-    // wrapping into the next row.
+    // Alpha-blend the logo onto the base buffer. Both buffers are BGRA when
+    // `toBitmap` returns them on Windows/macOS — and the source is
+    // PREMULTIPLIED (logoBuf[si] is already color × per-pixel alpha). So the
+    // source contribution is just `logoBuf[si] * LOGO_OPACITY` (scaling the
+    // already-premultiplied color by the global opacity); multiplying by the
+    // alpha again would square it and darken antialiased edges toward black.
+    // The destination is dimmed by the effective coverage `a`. Clamp to the
+    // base bounds so partial off-screen pixels are ignored instead of wrapping
+    // into the next row.
     for (let y = 0; y < lh; y++) {
       const dyRow = dy + y
       if (dyRow < 0 || dyRow >= ih) continue
@@ -90,13 +95,13 @@ export function applyWatermark(dataUrl: string): string {
         const dxCol = dx + x
         if (dxCol < 0 || dxCol >= iw) continue
         const si = (y * lw + x) * 4
-        const alpha = (logoBuf[si + 3] / 255) * LOGO_OPACITY
-        if (alpha <= 0) continue
+        const a = (logoBuf[si + 3] / 255) * LOGO_OPACITY // effective coverage
+        if (a <= 0) continue
         const di = (dyRow * iw + dxCol) * 4
-        const oneMinus = 1 - alpha
-        baseBuf[di]     = Math.round(logoBuf[si]     * alpha + baseBuf[di]     * oneMinus)
-        baseBuf[di + 1] = Math.round(logoBuf[si + 1] * alpha + baseBuf[di + 1] * oneMinus)
-        baseBuf[di + 2] = Math.round(logoBuf[si + 2] * alpha + baseBuf[di + 2] * oneMinus)
+        const oneMinus = 1 - a
+        baseBuf[di]     = Math.round(logoBuf[si]     * LOGO_OPACITY + baseBuf[di]     * oneMinus)
+        baseBuf[di + 1] = Math.round(logoBuf[si + 1] * LOGO_OPACITY + baseBuf[di + 1] * oneMinus)
+        baseBuf[di + 2] = Math.round(logoBuf[si + 2] * LOGO_OPACITY + baseBuf[di + 2] * oneMinus)
         // base alpha left as-is — composite into an opaque image
       }
     }

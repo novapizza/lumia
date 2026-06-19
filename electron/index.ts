@@ -1,21 +1,23 @@
-import { app, BrowserWindow, ipcMain, shell, dialog, nativeImage, clipboard, screen, Menu, nativeTheme } from 'electron'
+import { app, BrowserWindow, ipcMain, shell, dialog, nativeImage, clipboard, screen, Menu, nativeTheme, protocol, powerMonitor } from 'electron'
 import { join, dirname } from 'path'
 import fs from 'fs/promises'
-import { constants as fsConstants } from 'fs'
-import { setupCapture, ORIGINALS_DIR } from './capture'
-import { setupVideo } from './video'
-import { uploadToR2 } from './uploaders/r2'
+import { setupCapture, ORIGINALS_DIR, getFrozenBgrForDisplay, prewarmDesktopCapturer } from './capture'
+import { prewarmNativeCapture } from './native-screen'
+import { getIccFromPng, tagPngWithIcc } from './png-icc'
+import { setupVideo, isRecordingActive } from './video'
+import { uploadFileToR2 } from './uploaders/r2'
 import {
-  uploadToGoogleDrive,
   refreshGoogleToken,
   revokeGoogleToken,
   exchangeGoogleAuthCode,
 } from './uploaders/googledrive'
+import { uploadFilePathToDrive } from './google-drive-service'
 import { localTimestamp } from './utils'
-import { registerOverlayHwnd, unregisterOverlayHwnd } from './native-input'
+import { registerOverlayHwnd, unregisterOverlayHwnd, disableDwmTransitions } from './native-input'
 import { setupHotkeys, teardownHotkeys, getHotkeys, saveHotkeys, resetHotkeys, defaultHotkeys, type HotkeyConfig } from './hotkeys'
 import { setupTray, destroyTray } from './tray'
 import { setupScrollCapture, getOverlayMode } from './scroll-capture'
+import { setupStickers } from './stickers'
 import { WorkflowEngine } from './workflow'
 import { TemplateStore } from './templates'
 import { HistoryStore } from './history'
@@ -51,6 +53,18 @@ if (process.platform === 'win32') {
 // them via HTTP. When the cap fills, Chromium evicts LRU; recently-viewed
 // wallpapers stay warm, ancient ones get reclaimed automatically.
 app.commandLine.appendSwitch('disk-cache-size', String(80 * 1024 * 1024))
+
+// Privileged scheme for streaming local recordings into <video> without
+// reading the whole file into renderer memory as a Blob. Chromium's media
+// stack issues HTTP Range requests against this scheme; the handler (wired in
+// whenReady) serves them from disk with explicit 206/Content-Range responses
+// so seeking works. Must be registered before app 'ready', i.e. at top level.
+protocol.registerSchemesAsPrivileged([
+  {
+    scheme: 'lumia-media',
+    privileges: { standard: true, secure: true, stream: true, supportFetchAPI: true, bypassCSP: true },
+  },
+])
 
 const isDev = !app.isPackaged
 
@@ -118,16 +132,29 @@ export function markQuitting() { isQuitting = true }
 /** Schedule a quit-and-install for an already-downloaded update, but only if
  *  the window stays hidden for the full grace window. Called from
  *  `update-downloaded` and from the main window's 'hide' event. */
+/** True when restarting now would destroy in-progress work the user can't get
+ *  back. The main window is hidden for the entire duration of a recording and
+ *  while the capture overlay is up, so visibility alone is not enough — a
+ *  quit-and-install here would silently drop a recording mid-capture. */
+function isAppBusy(): boolean {
+  if (isRecordingActive()) return true
+  if (overlayWindows.size > 0) return true
+  return false
+}
+
 function scheduleAutoInstall() {
   if (autoInstallTimer) clearTimeout(autoInstallTimer)
   autoInstallTimer = null
   if (!updateDownloaded) return
   if (mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible()) return
+  if (isAppBusy()) return
   autoInstallTimer = setTimeout(() => {
     autoInstallTimer = null
-    // Re-check: user may have surfaced the window during the grace window.
+    // Re-check: user may have surfaced the window or started a recording /
+    // capture during the grace window.
     if (!updateDownloaded) return
     if (mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible()) return
+    if (isAppBusy()) return
     console.log('[autoUpdater] grace period elapsed with window hidden — installing update')
     updateDownloaded = false
     isQuitting = true
@@ -318,11 +345,30 @@ export function closeAllOverlays() {
     overlayPollTimer = null
   }
   overlayDrawingInProgress = false
-  // Hide instead of destroy — the windows live in overlayPool and get reused
-  // on the next createOverlayWindows() call. Destroying them would force a
-  // full BrowserWindow + renderer rebuild on every capture.
+  // Snipping-Tool-style opacity trick: instead of win.hide() (which incurs
+  // DWM fade-out + drops the alpha compositor for the renderer's frame,
+  // causing the next show to flicker as the pipeline warms back up), keep
+  // the overlay "shown" in DWM at opacity 0 over its display. The renderer
+  // stays composited; ramping opacity back to 1 next capture is instant.
+  // We intentionally do NOT setBounds off-screen — Electron's per-monitor
+  // DPI tracking can get scrambled on Windows when a window is moved
+  // between monitors with different scale factors, manifesting as a
+  // mis-scaled snapshot when the overlay returns to its display.
   for (const [, win] of overlayWindows) {
-    if (!win.isDestroyed() && win.isVisible()) win.hide()
+    if (win.isDestroyed()) continue
+    win.setOpacity(0)
+    // Drop `forward: true` while parked — with it set, Chromium keeps
+    // dispatching mouse-move to the renderer, and the renderer's CSS
+    // `cursor: 'crosshair'` then bleeds through over apps below the
+    // (invisible) overlay. Plain setIgnoreMouseEvents(true) sets
+    // WS_EX_TRANSPARENT cleanly so the cursor hit-test falls through.
+    win.setIgnoreMouseEvents(true)
+    // Reset renderer state to its idle look (cursor default, no
+    // crosshair) for the parked period. Belt-and-suspenders alongside
+    // the EX_TRANSPARENT flag above.
+    if (!win.webContents.isDestroyed()) {
+      win.webContents.send('overlay:set-active', false)
+    }
   }
   overlayWindows.clear()
   activeOverlayDisplayId = null
@@ -394,6 +440,11 @@ function createMainWindow(startHidden = false): BrowserWindow {
   ipcMain.once('window:ready', () => showOnce())
   win.once('ready-to-show', () => {
     setTimeout(showOnce, 1000)
+    // Opt main out of DWM's hide animation so capture flows can rely on
+    // win.hide() removing it from the compositor instantly. Without this,
+    // Windows fades main over ~200ms; freezeAllDisplays lands mid-fade
+    // and bakes a translucent Lumia frame into the cached screenshot.
+    disableDwmTransitions(win)
   })
 
   // Intercept close: keep the app alive in the tray instead of exiting. Only
@@ -468,6 +519,16 @@ function addOverlayToPool(display: Electron.Display): BrowserWindow {
       preload: join(__dirname, '../preload/index.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      // Pool overlays live hidden (opacity 0, showInactive) between captures.
+      // With the default backgroundThrottling, Chromium throttles a non-visible
+      // renderer's timers and — critically — its requestAnimationFrame loop
+      // after it's been idle. That stalls the double-rAF in Overlay.tsx that
+      // gates `overlay:bg-ready`, so on the first capture (or one after a long
+      // idle) the ack arrives late and the overlay surfaces slowly — worst case
+      // not until the 1500ms BG_READY_TIMEOUT_MS fallback. Disabling throttling
+      // keeps the pre-warmed renderer at full frame rate so the snapshot paints
+      // and acks immediately. Matches the recording windows in video.ts.
+      backgroundThrottling: false,
     }
   })
 
@@ -485,12 +546,26 @@ function addOverlayToPool(display: Electron.Display): BrowserWindow {
   }
 
   // One-time per-window setup: register the HWND for the native click-through
-  // helper. The overlay is reused across captures so this only fires once.
+  // helper, kill DWM transitions, then immediately surface the window at
+  // opacity 0 over its display. This lights up the alpha compositor + caches
+  // the first rendered frame *before* the user ever triggers a capture, so
+  // the hot-path (createOverlayWindows) just bumps opacity to 1 — no fade,
+  // no cold-start render, no transparent-window flicker. Bounds stay at the
+  // display: moving an Electron window across monitors with different DPI
+  // scrambles its scale-factor tracking on Windows.
   win.once('ready-to-show', () => {
-    if (process.platform === 'win32' && !win.isDestroyed()) {
+    if (win.isDestroyed()) return
+    if (process.platform === 'win32') {
       const hwnd = win.getNativeWindowHandle().readInt32LE(0)
       registerOverlayHwnd(hwnd)
+      disableDwmTransitions(win)
     }
+    win.setOpacity(0)
+    // No `forward` — pool windows are parked invisible at this point; we
+    // want cursor hit-test to fall through (otherwise the renderer's
+    // crosshair cursor leaks over apps below).
+    win.setIgnoreMouseEvents(true)
+    win.showInactive()
   })
 
   win.on('closed', () => {
@@ -534,6 +609,45 @@ export function setupOverlayPool() {
   })
 }
 
+// Wait for the renderer to ack that the frozen bg is decoded + painted, then
+// ramp opacity to 1 in one shot. Without the gate, opacity flips before the
+// renderer has committed the new bg → user sees a stale frame from the
+// previous capture for one composite cycle. Falls back after a generous
+// timeout so a renderer hang doesn't strand the user with an invisible
+// overlay.
+const BG_READY_TIMEOUT_MS = 1500
+
+function revealOverlayWhenBgReady(win: BrowserWindow, displayId: number, isActive: boolean): void {
+  const wcId = win.webContents.id
+  let done = false
+
+  const reveal = () => {
+    if (done) return
+    done = true
+    clearTimeout(timer)
+    ipcMain.off('overlay:bg-ready', handler)
+    if (win.isDestroyed() || !overlayWindows.has(displayId)) return
+    if (isActive) {
+      win.setIgnoreMouseEvents(false)
+      // Bring to top + grab keyboard focus so the renderer's ESC handler
+      // receives keydown without the user having to click the overlay
+      // first. We surfaced with showInactive() at pool time to avoid
+      // stealing focus pre-capture, but during a live capture the user
+      // expects ESC to work immediately.
+      win.focus()
+    }
+    else win.setIgnoreMouseEvents(true, { forward: true })
+    win.setOpacity(1)
+  }
+
+  const handler = (e: Electron.IpcMainEvent) => {
+    if (e.sender.id === wcId) reveal()
+  }
+
+  const timer = setTimeout(reveal, BG_READY_TIMEOUT_MS)
+  ipcMain.on('overlay:bg-ready', handler)
+}
+
 export function createOverlayWindows(): Map<number, BrowserWindow> {
   closeAllOverlays()
   // Lazy fallback: caller might invoke this before whenReady has finished
@@ -567,24 +681,49 @@ export function createOverlayWindows(): Map<number, BrowserWindow> {
     const displayBounds = { x, y, width, height }
     const isActive = display.id === activeOverlayDisplayId
 
+    // Move into position while still invisible (opacity 0) — bounds change is
+    // free under DWM when the window isn't rendering pixels to the desktop.
     win.setBounds(displayBounds)
-    if (!isActive) {
-      win.setIgnoreMouseEvents(true, { forward: true })
-    } else {
-      win.setIgnoreMouseEvents(false)
-    }
 
     // Reset renderer state for a fresh session: pushes the current mode and
     // clears any leftover draw state from a previous capture. The renderer
     // listens for 'overlay:mode-changed' and resets startPos/currentPos/etc.
     win.webContents.send('overlay:mode-changed', currentMode)
     win.webContents.send('overlay:set-active', isActive)
+    // Push the frozen-screen snapshot captured at hotkey-press time (null
+    // for video flows) as raw BGRA bytes. Renderer paints it to a <canvas>
+    // via putImageData and acks once a frame has been committed; we gate
+    // setOpacity(1) on that ack so the first visible frame already has the
+    // snapshot. Without this gate, opacity flips before the renderer
+    // commits → user sees the previous capture's bg for one frame.
+    //
+    // We pass raw BGRA (not a data URL) because PNG-encoding a 4K display
+    // takes ~500-1000ms and would land on the critical path before the
+    // overlay can surface. toBitmap() is free.
+    const frozenBgr = getFrozenBgrForDisplay(display.id)
+    win.webContents.send('overlay:frozen-bgra-changed', frozenBgr)
 
     overlayWindows.set(display.id, win)
-    win.show()
+
+    if (frozenBgr) {
+      revealOverlayWhenBgReady(win, display.id, isActive)
+    } else {
+      // Video flow: no snapshot to wait for, surface immediately.
+      if (isActive) {
+        win.setIgnoreMouseEvents(false)
+        win.focus()
+      } else {
+        win.setIgnoreMouseEvents(true, { forward: true })
+      }
+      win.setOpacity(1)
+    }
   }
 
-  // Poll cursor position to switch active overlay when mouse moves between displays
+  // Poll cursor position to switch active overlay when mouse moves between
+  // displays. Pointless with a single display — the active overlay is already
+  // pinned at creation and can never change — so skip the 10/s wakeups on the
+  // most common hardware config.
+  if (allDisplays.length <= 1) return overlayWindows
   overlayPollTimer = setInterval(() => {
     if (overlayDrawingInProgress) return // don't switch while user is drawing
 
@@ -608,6 +747,7 @@ export function createOverlayWindows(): Map<number, BrowserWindow> {
       if (newWin && !newWin.isDestroyed()) {
         newWin.webContents.send('overlay:set-active', true)
         newWin.setIgnoreMouseEvents(false)
+        newWin.focus()
       }
     }
   }, 100)
@@ -742,9 +882,19 @@ app.whenReady().then(async () => {
 
   setupCapture()
   setupVideo()
+  setupStickers()
   setupHotkeys()
   setupTray()
   setupScrollCapture(mainWindow, createOverlayWindows, closeAllOverlays, getOverlayDisplayId, restoreFromOverlayCancel)
+
+  // Init the desktopCapturer pipeline now so the first hotkey press doesn't
+  // pay the ~300-500ms cold-start. Fire-and-forget — no consumer waits on it.
+  void prewarmDesktopCapturer()
+
+  // Warm the GDI capture path too — it's the primary screenshot route on
+  // Windows now, and its first call does the koffi/user32/gdi32 binding. Warm
+  // it here so the first hotkey doesn't pay that load. No-op off Windows.
+  prewarmNativeCapture()
 
   // Pre-warm the overlay pool: one hidden BrowserWindow per display, with
   // the renderer already loaded. The first capture after boot drops from
@@ -825,7 +975,13 @@ app.whenReady().then(async () => {
   // state must update manually by running the new installer with admin.
   let canWriteInstallDir = false
   try {
-    await fs.access(dirname(app.getPath('exe')), fsConstants.W_OK)
+    // fs.access(W_OK) does NOT consult Windows ACLs — it only checks the
+    // read-only attribute, so it reports a Program Files dir as writable for a
+    // non-admin user (exactly the case this guard exists for). Probe by
+    // actually creating and deleting a temp file in the install dir.
+    const probe = join(dirname(app.getPath('exe')), `.lumia-write-probe-${process.pid}`)
+    await fs.writeFile(probe, '')
+    await fs.unlink(probe).catch(() => { /* best-effort cleanup */ })
     canWriteInstallDir = true
   } catch { /* not writable — auto-update disabled */ }
 
@@ -902,8 +1058,8 @@ app.whenReady().then(async () => {
   ipcMain.handle('workflow:run', async (_e, templateId: string, imageData: string, destinationIndex?: number, historyId?: string) => {
     return workflowEngine.run(templateId, imageData, destinationIndex, historyId)
   })
-  ipcMain.handle('workflow:inlineAction', async (_e, actionType: 'clipboard' | 'save', imageData: string) => {
-    return workflowEngine.runInlineAction(actionType, imageData)
+  ipcMain.handle('workflow:inlineAction', async (_e, actionType: 'clipboard' | 'save', imageData: string, historyId?: string) => {
+    return workflowEngine.runInlineAction(actionType, imageData, historyId)
   })
 
   // IPC: History
@@ -927,9 +1083,16 @@ app.whenReady().then(async () => {
   // Prune unlinks the associated files on disk too (shared with the manual
   // delete path in HistoryStore), so old captures don't sit around orphaned.
   const runHistoryPrune = async () => {
-    const days = getSettings().historyRetentionDays
-    const removed = await historyStore.pruneOlderThan(days)
-    if (removed > 0) console.log(`[history] pruned ${removed} item(s) older than ${days} day(s)`)
+    try {
+      const days = getSettings().historyRetentionDays
+      const removed = await historyStore.pruneOlderThan(days)
+      if (removed > 0) console.log(`[history] pruned ${removed} item(s) older than ${days} day(s)`)
+    } catch (err) {
+      // Fire-and-forget from boot, an hourly timer, and settings:set — a sync
+      // electron-store write can throw (EPERM from AV file-locking on Windows),
+      // which would otherwise surface as a recurring unhandled rejection.
+      console.error('[history] prune failed', err)
+    }
   }
   runHistoryPrune()
   const HISTORY_PRUNE_INTERVAL_MS = 60 * 60 * 1000
@@ -955,6 +1118,14 @@ app.whenReady().then(async () => {
     // ENOENT ignored) and then mutates history.json.
     return historyStore.delete(id)
   })
+  // Bulk delete in a single read-filter-write. The renderer previously fired
+  // N concurrent history:delete calls, which all snapshotted the same array
+  // and clobbered each other (last-writer-wins) — deleted rows resurrected as
+  // "Missing" orphans on the next refetch. deleteMany closes that race.
+  ipcMain.handle('history:deleteMany', async (_e, ids: string[]) => {
+    if (!Array.isArray(ids) || ids.length === 0) return 0
+    return historyStore.deleteMany(ids)
+  })
   ipcMain.handle('history:cleanupMissing', async () => {
     const items = historyStore.getAll()
     const { access } = await import('fs/promises')
@@ -963,7 +1134,9 @@ app.whenReady().then(async () => {
       if (!item.filePath) return
       try { await access(item.filePath) } catch { orphanIds.push(item.id) }
     }))
-    await Promise.all(orphanIds.map(id => historyStore.delete(id)))
+    // Single read-filter-write — the old Promise.all(map(delete)) raced and
+    // left orphans behind.
+    if (orphanIds.length > 0) await historyStore.deleteMany(orphanIds)
     return orphanIds.length
   })
   // Persist the current annotation shapes (and optionally a flattened PNG
@@ -999,8 +1172,28 @@ app.whenReady().then(async () => {
       const ext = extname(originalPath) || '.png'
       const stem = basename(originalPath, ext)
       const sidecar = join(dir, `${stem}-annotated.png`)
-      const base64 = flattenedDataUrl.replace(/^data:image\/\w+;base64,/, '')
-      await writeFile(sidecar, Buffer.from(base64, 'base64'))
+
+      // Renderer's canvas.toDataURL emits 32-bit RGBA PNGs even when the
+      // composite is fully opaque (annotation drawn over an opaque
+      // background → every output pixel ends at alpha=255). Pipe through
+      // NativeImage so Chromium's main-process PNG encoder — which detects
+      // all-opaque images and downgrades to 24-bit RGB (colorType=2) —
+      // takes over. Lossless pixel-wise, ~25-30% smaller on opaque content.
+      let sidecarBuf = nativeImage.createFromDataURL(flattenedDataUrl).toPNG()
+
+      // Konva's canvas encoder also doesn't embed any color profile. Lift
+      // the iCCP chunk off the on-disk original (already tagged at capture
+      // time) and stamp it onto the sidecar so both files share the same
+      // color space. Best-effort — missing original ICC just leaves the
+      // sidecar un-tagged (same as pre-2.0.4 behavior, no regression).
+      try {
+        const { readFile } = await import('fs/promises')
+        const originalBuf = await readFile(originalPath)
+        const icc = getIccFromPng(originalBuf)
+        if (icc) sidecarBuf = tagPngWithIcc(sidecarBuf, icc, 'Display')
+      } catch { /* original missing or unreadable — write sidecar un-tagged */ }
+
+      await writeFile(sidecar, sidecarBuf)
       annotatedFilePath = sidecar
       thumbnailUrl = makeThumbnail(flattenedDataUrl)
     }
@@ -1048,13 +1241,11 @@ app.whenReady().then(async () => {
       return existing
     }
 
-    const { readFile } = await import('fs/promises')
     const { extname } = await import('path')
 
     // Prefer the annotated sidecar when present so shared links carry the
     // user's final edited version rather than the untouched original.
     const sourcePath = item.annotatedFilePath ?? item.filePath
-    const buffer = await readFile(sourcePath)
     const ext = extname(sourcePath).replace(/^\./, '').toLowerCase() || (item.type === 'recording' ? 'webm' : 'png')
     const isVideo = item.type === 'recording'
     const contentType = isVideo
@@ -1062,8 +1253,9 @@ app.whenReady().then(async () => {
       : (ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : 'image/png')
     const keyPrefix = isVideo ? 'recordings' : 'captures'
 
-    const res = await uploadToR2(
-      { buffer, contentType, ext, keyPrefix },
+    const res = await uploadFileToR2(
+      sourcePath,
+      { contentType, ext, keyPrefix },
       import.meta.env.MAIN_VITE_R2_ACCOUNT_ID,
       import.meta.env.MAIN_VITE_R2_ACCESS_KEY_ID,
       import.meta.env.MAIN_VITE_R2_SECRET_ACCESS_KEY,
@@ -1104,7 +1296,6 @@ app.whenReady().then(async () => {
     }
 
     const settings = getSettings()
-    let token = settings.googleDriveAccessToken
     if (!settings.googleDriveRefreshToken) {
       return { destination: 'google-drive', success: false, error: 'Not connected to Google Drive' }
     }
@@ -1112,36 +1303,21 @@ app.whenReady().then(async () => {
       return { destination: 'google-drive', success: false, error: 'No Drive folder selected — choose one in Settings → Google Drive.' }
     }
 
-    if (Date.now() >= settings.googleDriveTokenExpiresAt - 60_000) {
-      try {
-        const refreshed = await refreshGoogleToken(
-          import.meta.env.MAIN_VITE_GDRIVE_CLIENT_ID,
-          import.meta.env.MAIN_VITE_GDRIVE_CLIENT_SECRET,
-          settings.googleDriveRefreshToken
-        )
-        token = refreshed.accessToken
-        setSetting('googleDriveAccessToken', refreshed.accessToken)
-        setSetting('googleDriveTokenExpiresAt', refreshed.expiresAt)
-      } catch (err) {
-        return { destination: 'google-drive', success: false, error: `Token refresh failed: ${err instanceof Error ? err.message : String(err)}` }
-      }
-    }
-
-    const { readFile } = await import('fs/promises')
     const { extname, basename } = await import('path')
     const sourcePath = item.annotatedFilePath ?? item.filePath
-    const buffer = await readFile(sourcePath)
     const ext = extname(sourcePath).replace(/^\./, '').toLowerCase()
     const isVideo = item.type === 'recording'
     const mimeType = isVideo
       ? (ext === 'mp4' ? 'video/mp4' : 'video/webm')
       : (ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : 'image/png')
-    const dataUrl = `data:${mimeType};base64,${buffer.toString('base64')}`
 
-    const res = await uploadToGoogleDrive(dataUrl, token, settings.googleDriveFolderId, {
-      filename: basename(sourcePath),
-      mimeType,
-    })
+    // Stream the file straight from disk to the resumable uploader — no
+    // whole-file buffer and no base64 data-URL intermediary. For a recording
+    // that round-trip held the whole file plus a ~1.33× base64 string in
+    // memory and blocked the main thread on the sync toString('base64'). The
+    // service wrapper handles token refresh (with in-flight dedup + 401 retry)
+    // and the default folder.
+    const res = await uploadFilePathToDrive(sourcePath, mimeType, basename(sourcePath))
 
     if (res.success && res.url) {
       clipboard.writeText(res.url)
@@ -1235,7 +1411,18 @@ app.whenReady().then(async () => {
     if (recording) teardownHotkeys()
     else setupHotkeys()
   })
-  ipcMain.handle('settings:get', () => getSettings())
+  ipcMain.handle('settings:get', () => {
+    // Never ship the Google OAuth tokens to the renderer — a renderer
+    // compromise (XSS via rendered content) could exfiltrate the long-lived
+    // refresh token. The renderer only ever needs a connected boolean.
+    const s = getSettings()
+    return {
+      ...s,
+      googleDriveRefreshToken: '',
+      googleDriveAccessToken: '',
+      googleDriveConnected: !!s.googleDriveRefreshToken,
+    }
+  })
   ipcMain.handle('settings:set', (_e, key: keyof AppSettings, value: unknown) => {
     // 'screen' on a single-display system is equivalent to an all-monitors
     // grab, so don't pin it — same one-shot policy as 'all-screen'. Lets
@@ -1267,14 +1454,6 @@ app.whenReady().then(async () => {
     teardownHotkeys()
     setupHotkeys()
     return setSnippingHijack(!enabled)
-  })
-
-  // IPC: OCR & Auto-Blur
-  // Pixel-level blur application is gone — auto-blur regions are injected as
-  // re-editable Konva annotations on the renderer side, not flattened here.
-  ipcMain.handle('ocr:scan', async (_e, dataUrl: string) => {
-    const { scanForSensitiveData } = await import('./auto-blur')
-    return scanForSensitiveData(dataUrl)
   })
 
   // IPC: Wallpapers (Unsplash). Lazy-import keeps the access-key check off the
@@ -1946,7 +2125,8 @@ app.whenReady().then(async () => {
     })
   })
 
-  // IPC: Read local file as buffer (for video blob URL playback in renderer)
+  // IPC: Read local file as buffer (legacy fallback; <video> now streams via
+  // the lumia-media:// protocol below instead of buffering the whole file).
   ipcMain.handle('file:read', async (_e, filePath: string) => {
     const { readFile } = await import('fs/promises')
     const { resolve, normalize } = await import('path')
@@ -1954,6 +2134,71 @@ app.whenReady().then(async () => {
     const normalized = resolve(normalize(filePath))
     if (!normalized.startsWith(homedir())) throw new Error('Access denied — path outside home directory')
     return readFile(normalized)
+  })
+
+  // Stream a local recording into <video> with Range support, instead of the
+  // renderer reading the entire file over IPC and holding it as a Blob (a
+  // multi-hundred-MB recording would OOM both processes). The URL shape is
+  // `lumia-media://stream/?path=<encodeURIComponent(absPath)>`.
+  //
+  // Range is handled explicitly: <video> seeks by re-requesting a byte range,
+  // and the response MUST be 206 with Content-Range / Accept-Ranges or the
+  // scrubber is dead. (net.fetch of a file:// URL does not forward the Range
+  // header, so seeking silently fell back to a full-file 200 — no seeking.)
+  protocol.handle('lumia-media', async (request) => {
+    try {
+      const reqUrl = new URL(request.url)
+      const filePath = reqUrl.searchParams.get('path')
+      if (!filePath) return new Response('Missing path', { status: 400 })
+      const { resolve, normalize, extname } = await import('path')
+      const { homedir } = await import('os')
+      const { stat } = await import('fs/promises')
+      const { createReadStream } = await import('fs')
+      const { Readable } = await import('stream')
+      const normalized = resolve(normalize(filePath))
+      // Same homedir sandbox as file:read — never serve arbitrary disk paths.
+      if (!normalized.startsWith(homedir())) return new Response('Forbidden', { status: 403 })
+
+      const total = (await stat(normalized)).size
+      const ext = extname(normalized).toLowerCase()
+      const contentType = ext === '.mp4' ? 'video/mp4' : ext === '.webm' ? 'video/webm' : 'application/octet-stream'
+
+      const toWeb = (start?: number, end?: number) =>
+        Readable.toWeb(createReadStream(normalized, { start, end })) as unknown as ReadableStream<Uint8Array>
+
+      const rangeHeader = request.headers.get('range')
+      const m = rangeHeader ? /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim()) : null
+      if (m && total > 0) {
+        let start = m[1] ? parseInt(m[1], 10) : 0
+        let end = m[2] ? parseInt(m[2], 10) : total - 1
+        if (Number.isNaN(start)) start = 0
+        if (Number.isNaN(end) || end >= total) end = total - 1
+        if (start > end || start >= total) {
+          return new Response(null, { status: 416, headers: { 'Content-Range': `bytes */${total}` } })
+        }
+        return new Response(toWeb(start, end), {
+          status: 206,
+          headers: {
+            'Content-Type': contentType,
+            'Content-Range': `bytes ${start}-${end}/${total}`,
+            'Accept-Ranges': 'bytes',
+            'Content-Length': String(end - start + 1),
+          },
+        })
+      }
+
+      return new Response(toWeb(), {
+        status: 200,
+        headers: {
+          'Content-Type': contentType,
+          'Accept-Ranges': 'bytes',
+          'Content-Length': String(total),
+        },
+      })
+    } catch (err) {
+      console.error('[lumia-media] stream failed', err)
+      return new Response('Error', { status: 500 })
+    }
   })
 
   // IPC: Recording state — hide main window before recording starts
@@ -1998,6 +2243,15 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit()
 })
 
+// OS-initiated logout / shutdown / restart. Without this, the before-quit
+// handler above would preventDefault() the Quit Apple Event (macOS) / session
+// end (Windows) and the OS reports "Lumia interrupted shutdown". Mark the quit
+// as ours so before-quit lets it through, then quit for real.
+powerMonitor.on('shutdown', () => {
+  isQuitting = true
+  app.quit()
+})
+
 app.on('will-quit', () => {
   teardownHotkeys()
   destroyTray()
@@ -2020,18 +2274,43 @@ app.on('second-instance', (_e, argv) => {
   // `activationType="protocol"` — the click opens our scheme, spawns
   // electron, and lands on second-instance.
   //
-  // If a notification click is pending, defer the window surfacing to
-  // `openHistoryItemInEditor`. Calling `mainWindow.show()` here would
-  // fire the 'show' listener which clears `mainDismissedByUser`, and the
-  // pending callback would then snapshot `wasDismissed=false` and skip
-  // setting `surfacedFromTray` — making the X-close-to-tray behavior
-  // never trigger.
-  const pending = consumePendingNotificationClick()
-  if (pending) {
+  // Only treat this as a toast click when the relaunch args actually carry our
+  // protocol URL (`activationType="protocol"` → lumia:/lumia-dev:). A plain
+  // duplicate launch (double-clicking the shortcut, a stray --hidden re-fire)
+  // must NOT replay the last toast's callback — otherwise it opens the editor
+  // on the most recent capture as if the toast had been clicked.
+  const toastArg = argv.find(a => a.startsWith('lumia:') || a.startsWith('lumia-dev:'))
+  if (toastArg) {
+    // Deferring the window surfacing to `openHistoryItemInEditor` matters:
+    // calling `mainWindow.show()` here would fire the 'show' listener which
+    // clears `mainDismissedByUser`, so the callback would snapshot
+    // `wasDismissed=false` and skip `surfacedFromTray` — breaking the
+    // X-close-to-tray behavior.
+    //
+    // Prefer the per-toast id baked into the launch URI so clicking an OLDER
+    // Action Center toast opens ITS history item, not whatever the most-recent
+    // toast latched. Fall back to the single latched callback for toasts with
+    // no id.
+    let routedById = false
     try {
-      pending()
-      return
-    } catch { /* fall through to plain show */ }
+      const id = new URL(toastArg).searchParams.get('id')
+      if (id) {
+        routedById = true
+        void openHistoryItemInEditor(id, mainDismissedByUser)
+        // Drop any stale latch so a later plain activation can't replay it.
+        consumePendingNotificationClick()
+        return
+      }
+    } catch { /* not a parseable URL — fall through to the latched callback */ }
+    if (!routedById) {
+      const pending = consumePendingNotificationClick()
+      if (pending) {
+        try {
+          pending()
+          return
+        } catch { /* fall through to plain show */ }
+      }
+    }
   }
   // Plain second-instance (e.g. user double-clicked the .lnk directly,
   // or any non-notification activation) — just surface the window.

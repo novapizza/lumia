@@ -220,16 +220,36 @@ function raiseAboveOverlay(wins: (BrowserWindow | null)[]) {
   forceWindowsTopmost(wins)
 }
 
-/** Direct Win32 SetWindowPos(HWND_TOPMOST) on each window's HWND. */
-function forceWindowsTopmost(wins: (BrowserWindow | null)[]) {
-  if (process.platform !== 'win32') return
+/** Lazily-bound user32!SetWindowPos. Hoisted to module scope (like
+ *  native-input.ts's ensureLoaded) so the Annotate toggle — which calls
+ *  forceWindowsTopmost twice per activation — doesn't re-run koffi.load +
+ *  user32.func each time. Cached across calls; bound on first use. */
+type SetWindowPosFn = (
+  hWnd: bigint, hWndInsertAfter: number, X: number, Y: number, cx: number, cy: number, uFlags: number,
+) => boolean
+let _setWindowPos: SetWindowPosFn | null = null
+function getSetWindowPos(): SetWindowPosFn | null {
+  if (_setWindowPos) return _setWindowPos
   try {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const koffi = require('koffi')
     const user32 = koffi.load('user32.dll')
-    const SetWindowPos = user32.func(
+    _setWindowPos = user32.func(
       'bool __stdcall SetWindowPos(intptr_t hWnd, intptr_t hWndInsertAfter, int X, int Y, int cx, int cy, uint32_t uFlags)',
     )
+    return _setWindowPos
+  } catch (err) {
+    console.warn('[annotation] failed to bind SetWindowPos', err)
+    return null
+  }
+}
+
+/** Direct Win32 SetWindowPos(HWND_TOPMOST) on each window's HWND. */
+function forceWindowsTopmost(wins: (BrowserWindow | null)[]) {
+  if (process.platform !== 'win32') return
+  try {
+    const SetWindowPos = getSetWindowPos()
+    if (!SetWindowPos) return
     const HWND_TOPMOST = -1
     const SWP_NOMOVE = 0x0002
     const SWP_NOSIZE = 0x0001

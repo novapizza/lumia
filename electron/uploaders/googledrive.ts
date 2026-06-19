@@ -1,20 +1,41 @@
+import { net } from 'electron'
+import { open, stat } from 'fs/promises'
 import type { UploadResult } from '../types'
 import { localTimestamp } from '../utils'
 
 const GOOGLE_DRIVE_UPLOAD_URL = 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart'
 
-/** Returns true if the string looks like a real Drive file ID (not a folder name) */
+/** Returns true if the string looks like a real Drive file ID (not a folder
+ *  name). Drive IDs are long, base64url-ish, and — crucially for telling them
+ *  apart from human folder names — they're never all-letters. Real IDs reliably
+ *  mix in digits, '-' and '_'; ordinary folder names like
+ *  "CompanyScreenshotsArchive" are pure alphabetic CamelCase. So in addition to
+ *  the length + charset check we require at least one non-letter character,
+ *  which keeps long folder names from being mistaken for IDs (→ Drive 404). */
 function looksLikeDriveId(s: string): boolean {
-  return /^[a-zA-Z0-9_-]{20,}$/.test(s)
+  return s.length >= 25 && /^[a-zA-Z0-9_-]+$/.test(s) && /[0-9_-]/.test(s)
 }
 
-/** Find folder by name, returns its ID or null */
+/** Escape a value for use inside a single-quoted Drive query string literal.
+ *  Drive's query syntax requires '\' and "'" to be backslash-escaped; without
+ *  this a folder name containing an apostrophe produces a malformed query
+ *  (HTTP 400). */
+function escapeDriveQueryValue(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/'/g, "\\'")
+}
+
+/** Find folder by name, returns its ID or null when no such folder exists.
+ *  Throws on an API error so the caller doesn't mistake a transient/400 failure
+ *  for "folder not found" and create a duplicate folder. */
 async function findFolderByName(name: string, accessToken: string): Promise<string | null> {
-  const q = encodeURIComponent(`name='${name}' and mimeType='application/vnd.google-apps.folder' and trashed=false`)
+  const q = encodeURIComponent(`name='${escapeDriveQueryValue(name)}' and mimeType='application/vnd.google-apps.folder' and trashed=false`)
   const res = await fetch(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name)`, {
     headers: { Authorization: `Bearer ${accessToken}` }
   })
-  if (!res.ok) return null
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(`Folder lookup failed: HTTP ${res.status}: ${text}`)
+  }
   const json = await res.json() as { files: { id: string }[] }
   return json.files[0]?.id ?? null
 }
@@ -107,18 +128,91 @@ export async function uploadToGoogleDrive(
   return { destination: 'google-drive', success: true, url: viewUrl }
 }
 
+/** PUT a file to a URL, streaming it from disk through Electron's net stack
+ *  with a known Content-Length. The body is written one bounded chunk at a
+ *  time, awaiting each write's flush callback for backpressure — so a large
+ *  recording never lands in memory (peak ≈ one chunk), unlike a `body: buffer`
+ *  fetch which holds the whole file plus an undici copy. */
+async function netPutFile(
+  url: string,
+  headers: Record<string, string>,
+  filePath: string,
+  size: number,
+): Promise<{ ok: boolean; status: number; body: string }> {
+  const req = net.request({ url, method: 'PUT', useSessionCookies: false })
+  for (const [k, v] of Object.entries(headers)) req.setHeader(k, v)
+  req.setHeader('Content-Length', String(size))
+
+  // A connection error must be able to unblock a write we're awaiting — the
+  // flush callback never fires once the socket is gone, so without this the
+  // upload would hang forever on a mid-transfer network drop. `failed` rejects
+  // on 'error'; it carries its own .catch so it never leaks an unhandled
+  // rejection when nothing happens to be racing it.
+  let failConnection: ((e: Error) => void) | null = null
+  const failed = new Promise<never>((_, rej) => { failConnection = rej })
+  failed.catch(() => { /* consumed via Promise.race below, or never rejected */ })
+
+  // Attach response/error handlers synchronously, before any body is written.
+  const responsePromise = new Promise<{ ok: boolean; status: number; body: string }>((resolve, reject) => {
+    req.on('response', res => {
+      const chunks: Buffer[] = []
+      res.on('data', (c: Buffer) => chunks.push(c))
+      res.on('end', () => resolve({
+        ok: res.statusCode >= 200 && res.statusCode < 300,
+        status: res.statusCode,
+        body: Buffer.concat(chunks).toString('utf8'),
+      }))
+      res.on('error', reject)
+    })
+    req.on('error', err => { reject(err); failConnection?.(err) })
+  })
+
+  const CHUNK = 1024 * 1024
+  const fh = await open(filePath, 'r')
+  try {
+    const buf = Buffer.allocUnsafe(CHUNK)
+    let position = 0
+    while (position < size) {
+      const { bytesRead } = await fh.read(buf, 0, CHUNK, position)
+      if (bytesRead <= 0) break
+      position += bytesRead
+      // Copy out the slice: buf is reused for the next read, and the flush
+      // callback only guarantees the chunk was accepted, not that the source
+      // bytes are no longer referenced.
+      const chunk = Buffer.from(buf.subarray(0, bytesRead))
+      // write()'s flush callback (3rd arg) is the only backpressure signal —
+      // Electron's ClientRequest.write returns void, not the usual boolean.
+      // Race it against `failed` so a connection drop rejects instead of hangs.
+      await Promise.race([
+        new Promise<void>(res => req.write(chunk, undefined, () => res())),
+        failed,
+      ])
+    }
+    req.end()
+  } catch (err) {
+    try { req.abort() } catch { /* already gone */ }
+    responsePromise.catch(() => { /* aborted — don't leak an unhandled rejection */ })
+    throw err
+  } finally {
+    await fh.close()
+  }
+
+  return responsePromise
+}
+
 /**
- * Upload a binary file (typically a video recording) using Google Drive's
+ * Upload a file on disk (typically a video recording) using Google Drive's
  * resumable upload protocol. Multipart upload caps out at 5 MB, which most
  * screen recordings exceed, so we always use resumable here.
  *
  * Flow: POST metadata to start a session and read the upload URL out of the
- * Location header, then PUT the raw bytes to that URL in a single request.
- * Drive supports chunked PUTs for resilience but a single upload is fine for
- * the file sizes Lumia produces (typically tens of MB).
+ * Location header, then stream the bytes to that URL in a single PUT. Drive's
+ * resumable protocol is sequential by design (one ordered session), so we don't
+ * parallelise it — but streaming from disk keeps memory flat regardless of size,
+ * which is what blew up before (the whole file sat in a Buffer + an undici copy).
  */
 export async function uploadFileToGoogleDrive(
-  buffer: Buffer,
+  filePath: string,
   contentType: string,
   filename: string,
   accessToken: string,
@@ -138,6 +232,7 @@ export async function uploadFileToGoogleDrive(
     }
   }
 
+  const size = (await stat(filePath)).size
   const metadata: Record<string, unknown> = { name: filename, mimeType: contentType }
   if (resolvedFolderId) metadata.parents = [resolvedFolderId]
 
@@ -147,7 +242,7 @@ export async function uploadFileToGoogleDrive(
       Authorization: `Bearer ${accessToken}`,
       'Content-Type': 'application/json; charset=UTF-8',
       'X-Upload-Content-Type': contentType,
-      'X-Upload-Content-Length': String(buffer.length),
+      'X-Upload-Content-Length': String(size),
     },
     body: JSON.stringify(metadata),
   })
@@ -160,17 +255,12 @@ export async function uploadFileToGoogleDrive(
     return { destination: 'google-drive', success: false, error: 'Upload init returned no session URL' }
   }
 
-  const putRes = await fetch(sessionUrl, {
-    method: 'PUT',
-    headers: { 'Content-Type': contentType, 'Content-Length': String(buffer.length) },
-    body: buffer,
-  })
-  if (!putRes.ok) {
-    const text = await putRes.text()
-    return { destination: 'google-drive', success: false, error: `HTTP ${putRes.status}: ${text}` }
+  const put = await netPutFile(sessionUrl, { 'Content-Type': contentType }, filePath, size)
+  if (!put.ok) {
+    return { destination: 'google-drive', success: false, error: `HTTP ${put.status}: ${put.body}` }
   }
 
-  const json = await putRes.json() as { id: string; name: string }
+  const json = JSON.parse(put.body) as { id: string; name: string }
   return { destination: 'google-drive', success: true, url: `https://drive.google.com/file/d/${json.id}/view` }
 }
 

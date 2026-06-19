@@ -10,18 +10,18 @@ export function setupTray() {
   const trayIconPath = app.isPackaged
     ? join(process.resourcesPath, `tray/${isMac ? 'mac' : 'win'}/tray-icon.png`)
     : join(__dirname, `../../resources/tray/${isMac ? 'mac' : 'win'}/tray-icon.png`)
-  console.log(`Tray icon path: ${trayIconPath}`)
   let icon: Electron.NativeImage
 
 
   try {
     icon = nativeImage.createFromPath(trayIconPath)
     if (icon.isEmpty()) {
+      // Fall back to an empty icon (same as the catch branch) but STILL create
+      // the Tray — returning here would leave the app with no tray, which is
+      // unrecoverable since close-hides-to-tray.
       console.error('Could not load tray icon.')
       icon = nativeImage.createEmpty()
-      return
-    }
-    if (isMac) {
+    } else if (isMac) {
       // macOS menu bar icons should be 22x22 points (44x44 px @2x Retina)
       // Resize to 22x22 so Electron treats it as 22pt, not 44pt
       icon = icon.resize({ width: 22, height: 22 })

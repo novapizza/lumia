@@ -7,9 +7,11 @@ on:
     tags:
       - 'v*.*.*'
 
-# Allow the workflow to create a GitHub Release and upload assets
+# Azure Trusted Signing's federated auth needs id-token. The workflow no
+# longer touches GitHub Releases (R2-only since 2.0.0), so contents:read
+# is enough for checkout.
 permissions:
-  contents: write
+  contents: read
   id-token: write
 jobs:
 
@@ -46,12 +48,23 @@ jobs:
           MAIN_VITE_R2_PUBLIC_URL: ${{ secrets.MAIN_VITE_R2_PUBLIC_URL }}
           MAIN_VITE_GDRIVE_CLIENT_ID: ${{ secrets.MAIN_VITE_GDRIVE_CLIENT_ID }}
           MAIN_VITE_GDRIVE_CLIENT_SECRET: ${{ secrets.MAIN_VITE_GDRIVE_CLIENT_SECRET }}
+          MAIN_VITE_GDRIVE_API_KEY: ${{ secrets.MAIN_VITE_GDRIVE_API_KEY }}
+          MAIN_VITE_GDRIVE_PROJECT_NUMBER: ${{ secrets.MAIN_VITE_GDRIVE_PROJECT_NUMBER }}
 
       # Rebuild Swift helpers as universal binaries so the same DMG works on
       # both arm64 and x86_64 Macs. Committed binaries (if any) are only used
       # for local dev — CI always produces fresh universal ones here.
       - name: Compile macOS Swift helpers (universal)
         run: bash build/compile-mac-helpers.sh
+
+      # Minimal matroska-only ffmpeg for both arches (see
+      # build/build-minimal-ffmpeg-mac.sh) — embed-ffmpeg.cjs picks these up
+      # per-arch over the full ~78 MB ffmpeg-static download. macos-latest is
+      # arm64, so the x64 binary is cross-compiled via `clang -arch x86_64`.
+      - name: Build minimal ffmpeg (arm64 + x64)
+        run: |
+          bash build/build-minimal-ffmpeg-mac.sh arm64 build/minimal-ffmpeg/dist
+          bash build/build-minimal-ffmpeg-mac.sh x64 build/minimal-ffmpeg/dist
 
       - name: Verify R2 publish env
         run: |
@@ -67,10 +80,10 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_RELEASES_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_RELEASES_SECRET_ACCESS_KEY }}
 
-      - name: Package & publish to R2 + GitHub Releases
+      - name: Package & publish to R2
         run: pnpm exec electron-builder --mac --publish always
         env:
-          # ── R2 (primary, S3-compatible) ─────────────────────────────────────
+          # ── R2 (S3-compatible) ──────────────────────────────────────────────
           # AWS_* are read directly by the S3 publisher in electron-builder.
           # R2_RELEASES_* are read by electron-builder.cjs via process.env.
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_RELEASES_ACCESS_KEY_ID }}
@@ -78,9 +91,6 @@ jobs:
           R2_RELEASES_ACCOUNT_ID: ${{ secrets.R2_RELEASES_ACCOUNT_ID }}
           R2_RELEASES_BUCKET: ${{ secrets.R2_RELEASES_BUCKET }}
           R2_RELEASES_PUBLIC_URL: ${{ secrets.R2_RELEASES_PUBLIC_URL }}
-
-          # ── GitHub (legacy fallback for pre-R2 installs) ────────────────────
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
           # ── Code signing — Developer ID Application ─────────────────────────
           # Export from Keychain as .p12, then: base64 -i cert.p12
@@ -93,11 +103,40 @@ jobs:
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
 
+  # ── Minimal Windows ffmpeg (cross-compiled on Linux) ─────────────────────────
+  # Lumia only runs `ffmpeg -i in.webm -c copy -f webm out.webm`, so we ship a
+  # ~2.5 MB matroska-only build instead of ffmpeg-static's ~82 MB full one.
+  # mingw-w64 cross-compile is fast (~1 min) on Linux; the artifact is handed to
+  # release-win, where build/embed-ffmpeg.cjs picks it up over the full download.
+  ffmpeg-win:
+    name: Build minimal ffmpeg (win x64)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install mingw-w64 toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-mingw-w64-x86-64 make nasm pkg-config curl xz-utils
+
+      - name: Cross-compile minimal ffmpeg
+        run: bash build/build-minimal-ffmpeg-win.sh dist-ffmpeg
+
+      - name: Upload ffmpeg artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-win-x64
+          path: dist-ffmpeg/ffmpeg.exe
+          if-no-files-found: error
+
   # ── Windows ──────────────────────────────────────────────────────────────────
   release-win:
     environment: Production
     name: Release · Windows
     runs-on: windows-latest
+    needs: ffmpeg-win
 
     steps:
       - name: Checkout
@@ -114,6 +153,14 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      # embed-ffmpeg.cjs (afterPack) looks here before falling back to the full
+      # ffmpeg-static download — see resolveMinimalWinFfmpeg().
+      - name: Download minimal ffmpeg
+        uses: actions/download-artifact@v4
+        with:
+          name: ffmpeg-win-x64
+          path: build/minimal-ffmpeg/dist
 
       - name: Build (electron-vite)
         run: pnpm run build
@@ -147,15 +194,12 @@ jobs:
         shell: pwsh
         run: pnpm exec electron-builder --win --publish always
         env:
-          # ── R2 (primary, S3-compatible) ─────────────────────────────────────
+          # ── R2 (S3-compatible) ──────────────────────────────────────────────
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_RELEASES_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_RELEASES_SECRET_ACCESS_KEY }}
           R2_RELEASES_ACCOUNT_ID: ${{ secrets.R2_RELEASES_ACCOUNT_ID }}
           R2_RELEASES_BUCKET: ${{ secrets.R2_RELEASES_BUCKET }}
           R2_RELEASES_PUBLIC_URL: ${{ secrets.R2_RELEASES_PUBLIC_URL }}
-
-          # ── GitHub (legacy fallback for pre-R2 installs) ────────────────────
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
           # Azure auth for Trusted Signing
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
@@ -174,31 +218,44 @@ jobs:
           # Optional: reduce Azure CLI output in logs
           AZURE_CORE_OUTPUT: none
 
-
-  # ── Mark as latest ───────────────────────────────────────────────────────────
-  mark-latest:
-    name: Mark release as latest
-    runs-on: ubuntu-latest
+  # ── GitHub Release (notes only, no artifacts) ────────────────────────────────
+  # Binaries live on R2 (release.lumia.asia). The GitHub release here is just a
+  # public changelog page — body is taken from the tag commit's message and a
+  # footer points users at lumia.asia for the actual installer.
+  release-github:
+    name: Publish GitHub release notes
     needs: [release-mac, release-win]
-
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      # electron-builder creates the release as a draft (releaseType: draft
-      # in electron-builder.cjs) so it doesn't surface as `latest` while
-      # mac/win are still uploading. Now that both jobs are done, set the
-      # release notes from the tagged commit body, un-draft the release,
-      # and mark it latest — all in one edit.
-      - name: Publish release with notes
+      - name: Build release notes
         run: |
-          NOTES=$(git log -1 --format=%b "${{ github.ref_name }}")
-          gh release edit "${{ github.ref_name }}" \
-            --draft=false \
-            --latest \
-            --notes "$NOTES" \
-            --repo ${{ github.repository }}
+          VERSION="${GITHUB_REF_NAME#v}"
+          {
+            # Drop the "Release version X.Y.Z" subject line + blank separator
+            # and strip the Co-Authored-By trailer. What's left is whatever
+            # changelog body the maintainer wrote in the release commit.
+            git log -1 --format=%B HEAD \
+              | tail -n +3 \
+              | sed '/^Co-Authored-By:/d'
+            echo ""
+            echo "Download the installer at [lumia.asia](https://lumia.asia)."
+          } > release-notes.md
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Create release
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        # `--latest` matches the manual releases we've been making; safe while
+        # tag pattern stays v*.*.* (no -rc / -beta). Re-running this job for
+        # an existing tag will fail — re-create the release manually if you
+        # need to overwrite.
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$VERSION" \
+            --notes-file release-notes.md \
+            --latest

@@ -101,19 +101,28 @@ export default function Dashboard() {
     window.electronAPI?.getHotkeys().then(h => { if (h) setHotkeys(h) })
     const refreshGdriveReady = () => {
       window.electronAPI?.getSettings().then(s => {
-        setGdriveReady(!!(s?.googleDriveRefreshToken && s?.googleDriveFolderId))
+        setGdriveReady(!!(s?.googleDriveConnected && s?.googleDriveFolderId))
       })
     }
     window.electronAPI?.getSettings().then(s => {
       if (s?.lastCaptureKind === 'video' || s?.lastCaptureKind === 'image') {
         setMediaKind(s.lastCaptureKind)
       }
-      setGdriveReady(!!(s?.googleDriveRefreshToken && s?.googleDriveFolderId))
+      setGdriveReady(!!(s?.googleDriveConnected && s?.googleDriveFolderId))
     })
     // Settings can change while we're on this view (user goes to Settings,
     // connects Drive, comes back) — refresh on connect events + window focus.
     window.electronAPI?.onGdriveConnected(refreshGdriveReady)
-    window.addEventListener('focus', refreshGdriveReady)
+    // Re-fetch history every time the window regains focus. Captures fired
+    // while the window was hidden in tray (hotkey path) add entries to the
+    // store but the renderer can't observe that — it's still alive with its
+    // stale recentItems array, so the user opens the window back up and
+    // sees pre-capture state until something else triggers a refetch.
+    const onWindowFocus = () => {
+      refreshGdriveReady()
+      window.electronAPI?.getHistory().then(setRecentItems)
+    }
+    window.addEventListener('focus', onWindowFocus)
 
     window.electronAPI?.onCaptureReady(({ dataUrl, source }) => {
       navigate('/editor', { state: { dataUrl, source } })
@@ -128,7 +137,7 @@ export default function Dashboard() {
       window.electronAPI?.removeAllListeners('recorder:open')
       window.electronAPI?.removeAllListeners('scroll-capture:open')
       window.electronAPI?.removeAllListeners('gdrive:connected')
-      window.removeEventListener('focus', refreshGdriveReady)
+      window.removeEventListener('focus', onWindowFocus)
     }
   }, [navigate])
 
@@ -190,7 +199,10 @@ export default function Dashboard() {
     if (ids.length === 0) return
     setIsBulkDeleting(true)
     try {
-      await Promise.all(ids.map(id => window.electronAPI?.deleteHistoryItem(id)))
+      // Single store transaction. The old Promise.all(map(delete)) fired N
+      // concurrent read-modify-writes that clobbered each other — deleted rows
+      // resurrected as "Missing" orphans on the next refetch.
+      await window.electronAPI?.deleteHistoryItems(ids)
       setRecentItems(prev => prev.filter(i => !selectedIds.has(i.id)))
       setSelectedIds(new Set())
       setIsSelecting(false)
@@ -291,7 +303,7 @@ export default function Dashboard() {
         setIsSelecting(false)
         setSelectedIds(new Set())
       }
-      if ((e.metaKey || e.ctrlKey) && e.key === 'a' && isSelecting) {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'a' && isSelecting) {
         e.preventDefault()
         setSelectedIds(new Set(filtered.map(i => i.id)))
       }

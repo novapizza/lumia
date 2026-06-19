@@ -6,43 +6,97 @@ import type { HistoryItem } from './types'
 
 export class HistoryStore {
   private store: Store<{ items: HistoryItem[]; cleanupVersion?: number }>
+  // In-memory cache of the items array for this instance. Populated lazily on
+  // first read and kept in sync on every write, so repeated getAll/get within
+  // one instance don't re-parse history.json each time. NOTE: this cache is
+  // per-instance — two HistoryStore instances exist (WorkflowEngine + the IPC
+  // layer) and do NOT share it, so each only trusts writes made through itself.
+  // That's acceptable here because each instance always writes through its own
+  // store.set (which refreshes its cache) before any await, so its cache never
+  // lags its own mutations. Cross-instance staleness was already possible with
+  // the previous read-from-disk approach (conf has no shared cache either).
+  private cache: HistoryItem[] | null = null
 
   constructor() {
     this.store = new Store<{ items: HistoryItem[]; cleanupVersion?: number }>({
       name: 'history',
-      defaults: { items: [] }
+      defaults: { items: [] },
+      // A corrupted history.json should reset to empty rather than crash the
+      // app at first read.
+      clearInvalidConfig: true
     })
   }
 
+  // Read the items array, preferring the in-memory cache. The cached array is
+  // returned directly (not cloned) for read speed; callers must not mutate it
+  // in place — they go through setItems for writes.
+  private readItems(): HistoryItem[] {
+    if (this.cache === null) this.cache = this.store.get('items')
+    return this.cache
+  }
+
+  // Single write path: persist to disk and refresh the cache in lockstep.
+  private setItems(items: HistoryItem[]): void {
+    this.store.set('items', items)
+    this.cache = items
+  }
+
   getAll(): HistoryItem[] {
-    return this.store.get('items').sort((a, b) => b.timestamp - a.timestamp)
+    return [...this.readItems()].sort((a, b) => b.timestamp - a.timestamp)
   }
 
   add(item: HistoryItem) {
-    const items = this.store.get('items')
+    const items = [...this.readItems()]
     items.unshift(item)
     // Keep last 1000 items. At ~4 KB per item (thumbnail-only) that caps
     // history.json at ~4 MB — still trivial to read/write on every call.
-    if (items.length > 1000) items.splice(1000)
-    this.store.set('items', items)
+    if (items.length > 1000) {
+      // Evicted rows still have app-managed artifacts (annotated sidecars) on
+      // disk — drop those, mirroring delete/prune. We do NOT unlink filePath
+      // originals here: those live under ~/Pictures/Lumia and belong to the
+      // user, not the app's eviction policy.
+      const evicted = items.splice(1000)
+      void Promise.all(evicted.map(it => this.unlinkItemFiles(it, { originals: false })))
+    }
+    this.setItems(items)
   }
 
   async delete(id: string): Promise<boolean> {
-    const items = this.store.get('items')
+    const items = this.readItems()
     const victim = items.find(i => i.id === id)
     if (!victim) return false
-    await this.unlinkItemFiles(victim)
-    this.store.set('items', items.filter(i => i.id !== id))
+    // Write the kept list BEFORE awaiting unlinks so the store write doesn't
+    // span an await — otherwise a concurrent add() landing during the unlink
+    // window would be clobbered by a stale snapshot. Explicit user delete is
+    // allowed to remove the original too.
+    this.setItems(items.filter(i => i.id !== id))
+    await this.unlinkItemFiles(victim, { originals: true })
     return true
   }
 
+  // Bulk delete in a single read → filter → write so N concurrent single
+  // deletes can't race and resurrect orphans. The store write happens before
+  // any await (same reasoning as delete()), then victim files are unlinked.
+  async deleteMany(ids: string[]): Promise<number> {
+    if (ids.length === 0) return 0
+    const idSet = new Set(ids)
+    const items = this.readItems()
+    const kept: HistoryItem[] = []
+    const victims: HistoryItem[] = []
+    for (const it of items) (idSet.has(it.id) ? victims : kept).push(it)
+    if (victims.length === 0) return 0
+    this.setItems(kept)
+    await Promise.all(victims.map(it => this.unlinkItemFiles(it, { originals: true })))
+    return victims.length
+  }
+
   update(id: string, patch: Partial<HistoryItem>): HistoryItem | null {
-    const items = this.store.get('items')
+    const items = [...this.readItems()]
     const idx = items.findIndex(i => i.id === id)
     if (idx < 0) return null
     const updated = { ...items[idx], ...patch }
     items[idx] = updated
-    this.store.set('items', items)
+    this.setItems(items)
     return updated
   }
 
@@ -53,13 +107,15 @@ export class HistoryStore {
   async pruneOlderThan(days: number): Promise<number> {
     if (!Number.isFinite(days) || days <= 0) return 0
     const cutoff = Date.now() - days * 24 * 60 * 60 * 1000
-    const items = this.store.get('items')
+    const items = this.readItems()
     const kept: HistoryItem[] = []
     const pruned: HistoryItem[] = []
     for (const it of items) (it.timestamp >= cutoff ? kept : pruned).push(it)
     if (pruned.length === 0) return 0
-    await Promise.all(pruned.map(it => this.unlinkItemFiles(it)))
-    this.store.set('items', kept)
+    // Write kept list before awaiting unlinks so the store.set no longer spans
+    // the await — closes the race with a concurrent add().
+    this.setItems(kept)
+    await Promise.all(pruned.map(it => this.unlinkItemFiles(it, { originals: true })))
     return pruned.length
   }
 
@@ -73,19 +129,27 @@ export class HistoryStore {
   async runStartupCleanup(targetVersion: number): Promise<number> {
     const current = (this.store.get('cleanupVersion') as number | undefined) ?? 0
     if (current >= targetVersion) return 0
-    const items = this.store.get('items')
-    await Promise.all(items.map(it => this.unlinkItemFiles(it)))
-    this.store.set('items', [])
+    const items = this.readItems()
+    this.setItems([])
     this.store.set('cleanupVersion', targetVersion)
+    // Startup cleanup only resets the app's own metadata + artifacts. It must
+    // NEVER delete filePath originals under ~/Pictures/Lumia — a future version
+    // bump would otherwise mass-delete the user's screenshot library.
+    await Promise.all(items.map(it => this.unlinkItemFiles(it, { originals: false })))
     return items.length
   }
 
-  // Shared file cleanup for delete + prune. Bounded to the user's home
-  // directory so a tampered history entry can't coax us into unlinking
-  // system files; ENOENT is swallowed because the goal state (file gone)
-  // is already achieved.
-  private async unlinkItemFiles(item: HistoryItem): Promise<void> {
-    const paths = [item.filePath, item.annotatedFilePath].filter((p): p is string => !!p)
+  // Shared file cleanup for delete + prune + eviction + startup. Bounded to the
+  // user's home directory so a tampered history entry can't coax us into
+  // unlinking system files; ENOENT is swallowed because the goal state (file
+  // gone) is already achieved. `originals` gates whether the user's original
+  // capture (filePath, under ~/Pictures/Lumia) is removed: only explicit user
+  // delete + retention prune opt in; eviction and startup cleanup do not.
+  private async unlinkItemFiles(item: HistoryItem, opts: { originals: boolean }): Promise<void> {
+    const paths = [
+      opts.originals ? item.filePath : undefined,
+      item.annotatedFilePath,
+    ].filter((p): p is string => !!p)
     for (const p of paths) {
       try {
         const resolved = resolve(normalize(p))

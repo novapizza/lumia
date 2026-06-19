@@ -4,7 +4,6 @@ import { Sidebar } from './components/Sidebar'
 import { TitleBar } from './components/TitleBar'
 import Dashboard from './windows/dashboard/Dashboard'
 import { AboutDialog } from './components/AboutDialog'
-import { ReleaseNotesDialog } from './components/ReleaseNotesDialog'
 import { UpdateNotification } from './components/UpdateNotification'
 import { PrintScreenPromptDialog } from './components/PrintScreenPromptDialog'
 
@@ -123,7 +122,6 @@ export default function App() {
       </main>
       </div>
       <AboutDialog />
-      <ReleaseNotesDialog />
       <UpdateNotification />
       <PrintScreenPromptDialog />
     </div>

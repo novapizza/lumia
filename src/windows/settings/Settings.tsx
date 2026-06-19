@@ -2,9 +2,9 @@ import { useState, useEffect, useRef } from 'react'
 
 interface AppSettings {
   theme: 'dark' | 'light' | 'system'
-  googleDriveRefreshToken: string
-  googleDriveAccessToken: string
-  googleDriveTokenExpiresAt: number
+  // Derived connected flag — the raw OAuth tokens are never sent to the
+  // renderer (stripped by settings:get).
+  googleDriveConnected: boolean
   googleDriveFolderId: string
   launchAtStartup: boolean
   historyRetentionDays: number
@@ -13,9 +13,7 @@ interface AppSettings {
 
 const DEFAULT_SETTINGS: AppSettings = {
   theme: 'system',
-  googleDriveRefreshToken: '',
-  googleDriveAccessToken: '',
-  googleDriveTokenExpiresAt: 0,
+  googleDriveConnected: false,
   googleDriveFolderId: '',
   launchAtStartup: true,
   historyRetentionDays: 0,
@@ -33,7 +31,6 @@ const RETENTION_OPTIONS = [
 
 export default function Settings() {
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS)
-  const [savedToast, setSavedToast] = useState(false)
   const [loading, setLoading] = useState(true)
   const [activeSection, setActiveSection] = useState<string | null>(null)
   const originalRef = useRef<AppSettings>(DEFAULT_SETTINGS)
@@ -52,9 +49,7 @@ export default function Settings() {
       // release gate).
       const ui: AppSettings = {
         theme: s.theme,
-        googleDriveRefreshToken: s.googleDriveRefreshToken,
-        googleDriveAccessToken: s.googleDriveAccessToken,
-        googleDriveTokenExpiresAt: s.googleDriveTokenExpiresAt,
+        googleDriveConnected: !!s.googleDriveConnected,
         googleDriveFolderId: s.googleDriveFolderId,
         launchAtStartup: s.launchAtStartup,
         historyRetentionDays: s.historyRetentionDays,
@@ -65,8 +60,6 @@ export default function Settings() {
       setLoading(false)
     })
   }, [])
-
-  const isDirty = JSON.stringify(settings) !== JSON.stringify(originalRef.current)
 
   const update = <K extends keyof AppSettings>(key: K, value: AppSettings[K]) => {
     setSettings(prev => ({ ...prev, [key]: value }))
@@ -108,18 +101,13 @@ export default function Settings() {
       setSettings(prev => ({ ...prev, googleDriveFolderId: s.googleDriveFolderId }))
       originalRef.current = { ...originalRef.current, googleDriveFolderId: s.googleDriveFolderId }
     })
+    // Without this, every visit to Settings adds a permanent ipcRenderer
+    // listener (the preload wrapper never removes it) — MaxListenersExceeded
+    // warnings + N redundant getSettings round-trips per folder selection.
+    return () => window.electronAPI?.removeAllListeners('gdrive:folderSelected')
   }, [])
 
-  const handleSave = async () => {
-    for (const [key, value] of Object.entries(settings)) {
-      await window.electronAPI?.setSetting(key as keyof AppSettings, value)
-    }
-    originalRef.current = { ...settings }
-    setSavedToast(true)
-    setTimeout(() => setSavedToast(false), 2500)
-  }
-
-  const gdriveConnected = !!settings.googleDriveRefreshToken
+  const gdriveConnected = settings.googleDriveConnected
 
   if (loading) {
     return (
@@ -136,7 +124,11 @@ export default function Settings() {
     setGdriveConnecting(false)
     if (result?.success) {
       const s = await window.electronAPI?.getSettings()
-      if (s) { setSettings(s); originalRef.current = s }
+      if (s) {
+        const next = { ...settings, googleDriveConnected: !!s.googleDriveConnected, googleDriveFolderId: s.googleDriveFolderId }
+        setSettings(next)
+        originalRef.current = next
+      }
       // No auto-redirect to the picker — the Connected page in the browser
       // surfaces a "Browse Drive folders" button so the user picks the folder
       // there. Falling back to the in-app Browse button covers the case where
@@ -165,8 +157,8 @@ export default function Settings() {
     setConfirmingDisconnect(false)
     await window.electronAPI?.gdriveDisconnect()
     setSettings(prev => {
-      const next = { ...prev, googleDriveRefreshToken: '', googleDriveAccessToken: '', googleDriveFolderId: '' }
-      originalRef.current = { ...originalRef.current, googleDriveRefreshToken: '', googleDriveAccessToken: '', googleDriveFolderId: '' }
+      const next = { ...prev, googleDriveConnected: false, googleDriveFolderId: '' }
+      originalRef.current = { ...originalRef.current, googleDriveConnected: false, googleDriveFolderId: '' }
       return next
     })
     setGdriveFolderName('')
@@ -233,23 +225,6 @@ export default function Settings() {
           <h1 className="text-sm font-bold text-white leading-tight" style={{ fontFamily: 'Manrope, sans-serif' }}>Settings</h1>
           <p className="text-[11px] text-slate-500 leading-tight">Configure uploads, paths and integrations</p>
         </div>
-        {(isDirty || savedToast) && (
-          <button
-            onClick={handleSave}
-            disabled={savedToast}
-            className={`font-bold px-5 py-2 rounded-xl text-xs flex items-center gap-2 transition-all animate-slide-up ${
-              savedToast
-                ? 'bg-secondary/15 text-secondary border border-secondary/25'
-                : 'primary-gradient text-slate-900 hover:scale-[1.02] active:scale-95'
-            }`}
-            style={{ fontFamily: 'Manrope, sans-serif' }}
-          >
-            <span className="material-symbols-outlined text-sm">
-              {savedToast ? 'check_circle' : 'save'}
-            </span>
-            {savedToast ? 'Saved!' : 'Save Changes'}
-          </button>
-        )}
       </header>
 
       <div className="flex flex-1 overflow-hidden">

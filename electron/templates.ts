@@ -44,7 +44,10 @@ export class TemplateStore {
   constructor() {
     this.store = new Store<{ templates: WorkflowTemplate[] }>({
       name: 'templates',
-      defaults: { templates: [] }
+      defaults: { templates: [] },
+      // A corrupted templates.json should reset to empty (built-ins still
+      // apply) rather than crash on first read.
+      clearInvalidConfig: true
     })
   }
 
