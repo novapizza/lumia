@@ -41,9 +41,12 @@ cd "$WORK/ffmpeg-${FFMPEG_VERSION}"
 # Cross-compile only when the host arch differs from the target (macos-latest is
 # arm64, so building x64 needs --enable-cross-compile; configure can't run test
 # binaries for the other arch).
-CROSS_FLAGS=()
+# A plain string (not an array): macOS ships bash 3.2, where expanding an empty
+# array under `set -u` ("${arr[@]}") aborts with "unbound variable" — which is
+# exactly what broke the native arm64 build. An unquoted empty string is safe.
+CROSS_FLAG=""
 if [ "$(uname -m)" != "$FF_ARCH" ]; then
-  CROSS_FLAGS+=(--enable-cross-compile)
+  CROSS_FLAG="--enable-cross-compile"
 fi
 
 echo "[ffmpeg-min] configuring darwin-${TARGET_ARCH} (matroska demux + webm mux only)"
@@ -51,7 +54,7 @@ echo "[ffmpeg-min] configuring darwin-${TARGET_ARCH} (matroska demux + webm mux 
   --cc="clang -arch ${FF_ARCH}" \
   --arch="${FF_ARCH}" \
   --target-os=darwin \
-  "${CROSS_FLAGS[@]}" \
+  $CROSS_FLAG \
   --extra-cflags="-arch ${FF_ARCH}" \
   --extra-ldflags="-arch ${FF_ARCH}" \
   --disable-x86asm \
