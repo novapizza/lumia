@@ -110,7 +110,7 @@ export default function RecordingToolbar() {
   // over a pill. Sending IPC only on transition keeps traffic bounded.
   useEffect(() => {
     const onMove = (e: MouseEvent) => {
-      const insidePill = (ref: React.RefObject<HTMLDivElement>) => {
+      const insidePill = (ref: React.RefObject<HTMLDivElement | null>) => {
         const el = ref.current
         if (!el) return false
         const r = el.getBoundingClientRect()

@@ -15,16 +15,16 @@
     "preview": "electron-vite preview",
     "build:win": "electron-vite build && set CSC_IDENTITY_AUTO_DISCOVERY=false && electron-builder --win",
     "build:mac": "electron-vite build && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac",
-    "postinstall": "electron-builder install-app-deps"
+    "postinstall": "node node_modules/electron/install.js && electron-builder install-app-deps"
   },
   "dependencies": {
-    "electron-log": "^5.4.3",
-    "electron-store": "^8.2.0",
-    "electron-updater": "^6.6.2",
+    "electron-log": "^5.4.4",
+    "electron-store": "^11.0.2",
+    "electron-updater": "^6.8.9",
     "ffmpeg-static": "^5.3.0",
     "fft.js": "^4.0.4",
-    "koffi": "^2.16.0",
-    "uuid": "^10.0.0"
+    "koffi": "^3.0.2",
+    "uuid": "^14.0.0"
   },
   "pnpm": {
     "onlyBuiltDependencies": [
@@ -36,28 +36,28 @@
     ]
   },
   "devDependencies": {
-    "@electron/notarize": "^2.5.0",
+    "@electron/notarize": "^3.1.1",
     "@fontsource/inter": "^5.2.8",
     "@fontsource/manrope": "^5.2.8",
-    "@tailwindcss/vite": "^4.1.4",
-    "material-symbols": "^0.44.4",
-    "@types/node": "^22.0.0",
-    "@types/react": "^18.3.0",
-    "@types/react-dom": "^18.3.0",
-    "@types/uuid": "^10.0.0",
-    "@vitejs/plugin-react": "^4.3.0",
-    "dotenv": "^17.4.0",
-    "electron": "^33.4.0",
-    "electron-builder": "^26.8.1",
-    "electron-vite": "^2.3.0",
-    "konva": "^9.3.0",
+    "@tailwindcss/vite": "^4.3.1",
+    "material-symbols": "^0.45.2",
+    "@types/node": "^26.0.0",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.2.0",
+    "dotenv": "^17.4.2",
+    "electron": "^42.4.1",
+    "electron-builder": "^26.15.3",
+    "electron-vite": "^5.0.0",
+    "konva": "^10.3.0",
     "png2icons": "^2.0.1",
-    "react": "^18.3.0",
-    "react-dom": "^18.3.0",
-    "react-konva": "^18.2.10",
-    "react-router-dom": "^6.26.0",
-    "tailwindcss": "^4.1.4",
-    "typescript": "^5.5.0",
-    "use-image": "^1.1.1"
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "react-konva": "^19.2.5",
+    "react-router-dom": "^7.18.0",
+    "tailwindcss": "^4.3.1",
+    "typescript": "^6.0.3",
+    "use-image": "^1.1.1",
+    "vite": "^7.0.0"
   }
 }

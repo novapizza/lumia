@@ -38,7 +38,9 @@ async function saveOriginalImage(dataUrl: string, displayId?: number): Promise<{
     const filename = `capture-${ts}.${ext}`
     const filePath = join(ORIGINALS_DIR, filename)
     const base64 = dataUrl.replace(/^data:image\/\w+;base64,/, '')
-    let buf = Buffer.from(base64, 'base64')
+    // Annotate as the default Buffer<ArrayBufferLike> so reassigning the result
+    // of tagPngWithIcc (also Buffer<ArrayBufferLike>) type-checks under @types/node 26.
+    let buf: Buffer = Buffer.from(base64, 'base64')
 
     if (!isJpeg && displayId != null) {
       const icc = await getDisplayIcc(displayId)

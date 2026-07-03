@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What is Lumia?
 
-Lumia is a cross-platform Electron desktop app for screen capture, screen recording, annotation, and sharing (Windows + macOS). Built with Electron 33, React 18, TypeScript, Tailwind CSS 4, and Konva.
+Lumia is a cross-platform Electron desktop app for screen capture, screen recording, annotation, and sharing (Windows + macOS). Built with Electron 42, React 19, TypeScript, Tailwind CSS 4, and Konva.
 
 Headline features:
 - Image capture: region, active window, active monitor, fullscreen, scrolling capture. The screen is **frozen at hotkey time** (native GDI snapshot on Windows) so captures preserve transient UI like tooltips/popovers
@@ -25,9 +25,11 @@ Headline features:
 | `pnpm build:mac` | Build + package macOS DMG (x64 + arm64) into `release/` |
 | `pnpm icons` | Regenerate platform icon sets from `resources/icon.png` |
 
-`postinstall` runs `electron-builder install-app-deps` automatically. `preinstall` enforces pnpm.
+`postinstall` runs `node node_modules/electron/install.js && electron-builder install-app-deps`. As of Electron 42 the `electron` package no longer downloads its binary via its own postinstall script (it would otherwise download lazily on first launch), so we fetch it explicitly — otherwise `electron-vite dev` fails with `Error: Electron uninstall`. `preinstall` enforces pnpm.
 
-There is **no test framework, linter, or formatter** configured. Type-check via `pnpm build`.
+There is **no test framework, linter, or formatter** configured. Type-check via `pnpm build` (note: electron-vite uses esbuild and does **not** type-check — run `tsc --noEmit -p tsconfig.node.json` / `-p tsconfig.web.json` for a real type-check).
+
+> If `pnpm dev` crashes at startup with `require('electron')` returning a path / `app` undefined, or a V8 `snapshot_data() != nullptr` assertion, check that `ELECTRON_RUN_AS_NODE` is **not** set in your environment — when present (even empty) it makes the Electron binary run as plain Node.
 
 ### Releases
 
