@@ -7,6 +7,17 @@ export type CaptureKind = 'image' | 'video'
 export type LastImageMode = 'region' | 'window' | 'all-screen' | 'screen' | 'scrolling'
 export type LastVideoMode = 'region' | 'window' | 'screen'
 
+/** Deliberate remember policy: only explicit Region / Window picks update the
+ *  replay mode that "New Capture" / PrtSc re-run. Everything else (screen,
+ *  all-screen, scrolling) is a one-shot — it still flips lastCaptureKind, but
+ *  New Capture should never replay an all-monitor grab or a scroll session.
+ *  Enforced at every write site: the settings:set IPC handler (renderer
+ *  writers — Dashboard, overlay ModeBar) and hotkeys' remember helpers, plus
+ *  a load-time normalization below for values persisted by older builds. */
+export function isRememberedMode(mode: unknown): mode is 'region' | 'window' {
+  return mode === 'region' || mode === 'window'
+}
+
 export interface AppSettings {
   defaultSavePath: string
   theme: 'dark' | 'light' | 'system'
@@ -94,6 +105,11 @@ const store = new Store<AppSettings>({
   const raw = store.get('lastImageMode') as string
   if (raw === 'fullscreen') store.set('lastImageMode', 'all-screen')
   else if (raw === 'active-monitor') store.set('lastImageMode', 'screen')
+  // Remember policy (see isRememberedMode): older builds persisted screen /
+  // all-screen / scrolling here — normalize to the default so New Capture
+  // can't keep replaying a mode the policy no longer saves.
+  if (!isRememberedMode(store.get('lastImageMode'))) store.set('lastImageMode', 'region')
+  if (!isRememberedMode(store.get('lastVideoMode'))) store.set('lastVideoMode', 'region')
 }
 
 export function getSettings(): AppSettings {

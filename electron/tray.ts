@@ -14,6 +14,11 @@ export function setupTray() {
 
 
   try {
+    // Assets ship at their display sizes (generate-icons.cjs): win 32×32
+    // full-bleed; mac 22×22 base + tray-icon@2x.png alongside it, which
+    // createFromPath auto-loads as the Retina representation. No resize()
+    // here — resize flattens the image to a single representation, dropping
+    // the @2x rep and leaving the menu bar icon pixelated on Retina.
     icon = nativeImage.createFromPath(trayIconPath)
     if (icon.isEmpty()) {
       // Fall back to an empty icon (same as the catch branch) but STILL create
@@ -22,12 +27,9 @@ export function setupTray() {
       console.error('Could not load tray icon.')
       icon = nativeImage.createEmpty()
     } else if (isMac) {
-      // macOS menu bar icons should be 22x22 points (44x44 px @2x Retina)
-      // Resize to 22x22 so Electron treats it as 22pt, not 44pt
-      icon = icon.resize({ width: 22, height: 22 })
+      // Template image: macOS renders the alpha silhouette in the menu bar's
+      // foreground color, adapting to light/dark mode automatically.
       icon.setTemplateImage(true)
-    } else {
-      icon = icon.resize({ width: 32, height: 32 })
     }
   } catch {
     icon = nativeImage.createEmpty()

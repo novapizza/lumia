@@ -1,15 +1,21 @@
 /**
- * Fast Windows screen capture via GDI32 BitBlt — ~5–20 ms per display vs
- * ~50–150 ms for desktopCapturer.getSources() (no WGC session setup per-call).
+ * Fast native screen capture.
  *
- * Windows-only. Returns null on other platforms or on FFI load failure so
- * callers fall back to desktopCapturer.
+ * Windows: GDI32 BitBlt via koffi — ~5–20 ms per display vs ~50–150 ms for
+ * desktopCapturer.getSources() (no WGC session setup per-call).
  *
- * macOS deliberately has no native path here: desktopCapturer already runs on
- * ScreenCaptureKit, and the legacy CGDisplayCreateImage fast-grab was obsoleted
- * (not just deprecated) in the macOS 15 SDK, so it no longer compiles.
+ * macOS: delegated to the screen-snap Swift helper (ScreenCaptureKit's
+ * SCScreenshotManager, macOS 14+ — see mac-screen-snap.ts). Electron's own
+ * desktopCapturer also runs on ScreenCaptureKit but re-enumerates shareable
+ * content per call, costing 1–3 s at full resolution on macOS 14/15; the
+ * helper keeps that enumeration warm. The legacy CGDisplayCreateImage
+ * fast-grab was obsoleted (not just deprecated) in the macOS 15 SDK, so SCK
+ * is the only native route left. macOS ≤ 13 falls back to desktopCapturer.
+ *
+ * Returns null on any failure so callers fall back to desktopCapturer.
  */
 import { nativeImage, screen } from 'electron'
+import { captureDisplayMacSnap, prewarmMacScreenSnap } from './mac-screen-snap'
 
 // ── Win32 constants ──────────────────────────────────────────────────────────
 const SRCCOPY    = 0x00CC0020
@@ -69,16 +75,26 @@ function ensureLoaded(): boolean {
   }
 }
 
+/** A native capture result: the NativeImage plus the raw BGRA it was built
+ *  from. Callers that need the raw pixels again (the frozen-snapshot cache
+ *  hands them to the overlay as its background) reuse `raw` instead of paying
+ *  NativeImage.toBitmap() — another full-frame copy (~59 MB on 5K Retina) on
+ *  the hotkey→overlay hot path. */
+export interface NativeCapture {
+  image: Electron.NativeImage
+  raw: { buffer: Buffer; width: number; height: number }
+}
+
 /**
  * Capture a physical-pixel rect from the virtual desktop using GDI BitBlt.
- * Returns a NativeImage (BGRA, fully opaque) or null if GDI is unavailable.
+ * Returns the capture (BGRA, fully opaque) or null if GDI is unavailable.
  *
  * Coordinates must be in virtual-screen physical pixels — i.e. the same space
  * that screen.dipToScreenPoint() returns on Windows.
  */
 export function captureRectGdi(
   physX: number, physY: number, physW: number, physH: number
-): Electron.NativeImage | null {
+): NativeCapture | null {
   if (!ensureLoaded()) return null
 
   const w = Math.max(1, Math.round(physW))
@@ -139,7 +155,8 @@ export function captureRectGdi(
 
     // createFromBitmap (NOT createFromBuffer) — the latter decodes PNG/JPEG.
     // createFromBitmap takes raw BGRA, which is exactly what GetDIBits produced.
-    return nativeImage.createFromBitmap(pixels, { width: w, height: h })
+    const image = nativeImage.createFromBitmap(pixels, { width: w, height: h })
+    return { image, raw: { buffer: pixels, width: w, height: h } }
   } finally {
     if (hOld)   _SelectObject(hdcMem, hOld)
     if (hbmp)   _DeleteObject(hbmp)
@@ -152,7 +169,7 @@ export function captureRectGdi(
  * Capture a full Electron Display using GDI.
  * Returns null if GDI is unavailable (non-Windows or load failure).
  */
-export function captureDisplayGdi(display: Electron.Display): Electron.NativeImage | null {
+export function captureDisplayGdi(display: Electron.Display): NativeCapture | null {
   const origin = screen.dipToScreenPoint({ x: display.bounds.x, y: display.bounds.y })
   const sf = display.scaleFactor || 1
   const physW = Math.round(display.size.width  * sf)
@@ -163,27 +180,33 @@ export function captureDisplayGdi(display: Electron.Display): Electron.NativeIma
 // ── Unified entry point ───────────────────────────────────────────────────────
 
 /**
- * Fast display capture. Windows uses synchronous GDI; every other platform
- * returns null so the caller falls back to desktopCapturer.
- *
- * Kept async so callers don't have to change shape if a macOS native path is
- * added later (e.g. a warm ScreenCaptureKit session).
+ * Fast display capture. Windows uses synchronous GDI; macOS goes through the
+ * warm ScreenCaptureKit helper; anything else (or any failure) returns null
+ * so the caller falls back to desktopCapturer.
  */
 export async function captureDisplayNative(
   display: Electron.Display
-): Promise<Electron.NativeImage | null> {
+): Promise<NativeCapture | null> {
   if (process.platform === 'win32') return captureDisplayGdi(display)
+  if (process.platform === 'darwin') return captureDisplayMacSnap(display)
   return null
 }
 
 /**
- * One-shot warm-up of the GDI capture path. The first call does koffi.load +
- * user32/gdi32 binding (~tens of ms) inside ensureLoaded(), which would
- * otherwise land on the critical path of the user's first hotkey capture.
- * Fire-and-forget from app.whenReady(). A 1×1 BitBlt is enough to force the
- * bindings without grabbing a full display. No-op off Windows.
+ * One-shot warm-up of the native capture path, fired from app.whenReady() so
+ * the cost never lands on the user's first hotkey capture.
+ *
+ * Windows: the first call does koffi.load + user32/gdi32 binding (~tens of
+ * ms) inside ensureLoaded() — a 1×1 BitBlt forces the bindings without
+ * grabbing a full display.
+ *
+ * macOS: spawns the screen-snap helper and pre-fetches its SCShareableContent
+ * cache (~200–500 ms), the slow part of a cold ScreenCaptureKit capture.
  */
 export function prewarmNativeCapture(): void {
-  if (process.platform !== 'win32') return
-  try { captureRectGdi(0, 0, 1, 1) } catch { /* silent — best-effort */ }
+  if (process.platform === 'win32') {
+    try { captureRectGdi(0, 0, 1, 1) } catch { /* silent — best-effort */ }
+    return
+  }
+  if (process.platform === 'darwin') prewarmMacScreenSnap()
 }

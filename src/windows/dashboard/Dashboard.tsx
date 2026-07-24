@@ -147,15 +147,12 @@ export default function Dashboard() {
   }
 
   const handleCapture = async (mode: CaptureMode) => {
+    // Send every selection; the remember policy lives in main's settings:set
+    // handler (isRememberedMode): only Region / Window update the replay mode
+    // that "New Capture" / PrtSc re-run — screen / all-screen / scrolling are
+    // one-shots that just flip the kind back to image.
     window.electronAPI?.setSetting('lastCaptureKind', 'image')
-    // All Screens is a one-shot — don't pin it as the remembered mode, so
-    // the next "New Capture" replays the user's usual mode (Region etc.)
-    // instead of always re-grabbing every monitor. Single-monitor 'screen'
-    // is filtered out by the main process settings:set handler (it's
-    // equivalent to all-screen on a 1-display setup).
-    if (mode !== 'all-screen') {
-      window.electronAPI?.setSetting('lastImageMode', mode)
-    }
+    window.electronAPI?.setSetting('lastImageMode', mode)
     if (mode === 'scrolling') {
       await window.electronAPI?.startScrollCapture()
     } else {
