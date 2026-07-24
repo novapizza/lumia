@@ -305,8 +305,16 @@ export default function Overlay() {
   }, [mode, resetDrawState])
 
   const handleKeyDown = useCallback((e: KeyboardEvent) => {
-    if (e.key === 'Escape') cancel()
-  }, [cancel])
+    if (e.key === 'Escape') { cancel(); return }
+    // Window picker: Enter confirms the active (foreground) window without
+    // hunting for it with the cursor. Main resolves which window that is and
+    // routes to the capture or record confirm path based on the overlay mode.
+    if (e.key === 'Enter' && base === 'window' && isActive) {
+      e.preventDefault()
+      resetDrawState()
+      window.electronAPI?.confirmActiveWindow?.()
+    }
+  }, [cancel, base, isActive, resetDrawState])
 
   useEffect(() => {
     document.addEventListener('keydown', handleKeyDown)
@@ -451,8 +459,8 @@ export default function Overlay() {
   // ── Window-pick / video-window UI ────────────────────────────────────────
   if (base === 'window') {
     const hint = intent === 'record'
-      ? 'Click a window to record · ESC to cancel'
-      : 'Click a window · ESC to cancel'
+      ? 'Click a window to record · Enter for active window · ESC to cancel'
+      : 'Click a window · Enter for active window · ESC to cancel'
     return (
       <div
         className="fixed inset-0 select-none"

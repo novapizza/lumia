@@ -96,6 +96,7 @@ declare global {
       cancelRegion: () => Promise<void>
       getWindowAt: (x: number, y: number) => Promise<{ x: number; y: number; width: number; height: number } | null>
       confirmWindowPick: (rect: { x: number; y: number; width: number; height: number }) => Promise<void>
+      confirmActiveWindow: () => Promise<string | null>
       cancelWindowPick: () => Promise<void>
       confirmMonitorPick: () => Promise<void>
       cancelMonitorPick: () => Promise<void>

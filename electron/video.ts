@@ -23,6 +23,7 @@ import { localTimestamp } from './utils'
 import { makeThumbnail } from './thumbnail'
 import { openAnnotation, closeAnnotation, destroyAnnotation, isAnnotationOpen, setupAnnotation } from './annotation'
 import { forceWindowsExcludeFromCapture } from './native-input'
+import { getSinglePickTarget } from './window-list'
 import { getWatermarkLogoDataUrl } from './watermark'
 import { remuxWebmInPlace } from './ffmpeg-remux'
 
@@ -444,6 +445,39 @@ async function recordHistoryAndNotify(
   return { filePath, historyId }
 }
 
+/** Start a window recording for a display-local DIP rect. Shared by the
+ *  overlay click-confirm, the Enter-picks-active-window shortcut, and the
+ *  single-window fast path (where no overlay was ever created — the overlay
+ *  teardown calls are no-ops then). */
+export async function beginWindowRecording(
+  rect: { x: number; y: number; width: number; height: number },
+  displayId?: number | null,
+) {
+  const allDisplays = screen.getAllDisplays()
+  const display = allDisplays.find(d => d.id === displayId) ?? screen.getPrimaryDisplay()
+  const sf = display.scaleFactor || 1
+
+  resetOverlayMode()
+  closeAllOverlays()
+  await waitForOverlayGone()
+
+  const sourceId = await resolveScreenSourceId(display.id)
+  if (!sourceId) { showMain(); return }
+
+  openRecordingSession({
+    kind: 'window',
+    sourceId,
+    displayId: display.id,
+    rect,
+    displayDipSize: { width: display.size.width, height: display.size.height },
+    displayScaleFactor: sf,
+    outputSize: {
+      width:  Math.max(1, Math.round(rect.width  * sf)),
+      height: Math.max(1, Math.round(rect.height * sf)),
+    },
+  })
+}
+
 // ── Setup IPC ──────────────────────────────────────────────────────────────
 
 export function setupVideo() {
@@ -453,13 +487,7 @@ export function setupVideo() {
   // Start: user clicked "Record Screen" on dashboard (or hotkey).
   // Opens overlay in video mode so user can pick region/window/screen.
   ipcMain.handle('video:start', async (_e, mode: 'region' | 'window' | 'screen') => {
-    if (isRecordingActive()) return
-    const overlayMode =
-      mode === 'region' ? 'video-region' :
-      mode === 'window' ? 'video-window' : 'video-screen'
-    setOverlayMode(overlayMode)
-    await hideMain()
-    createOverlayWindows()
+    await startVideoCapture(mode)
   })
 
   // Region confirm: user dragged a region → compute target, close overlay,
@@ -495,30 +523,7 @@ export function setupVideo() {
   // crop the display's capture to the window's rect. Window movement/resize
   // during recording is not yet tracked (v2 TODO).
   ipcMain.handle('video:window-confirm', async (_e, rect: { x: number; y: number; width: number; height: number }) => {
-    const displayId = getOverlayDisplayId()
-    const allDisplays = screen.getAllDisplays()
-    const display = allDisplays.find(d => d.id === displayId) ?? screen.getPrimaryDisplay()
-    const sf = display.scaleFactor || 1
-
-    resetOverlayMode()
-    closeAllOverlays()
-    await waitForOverlayGone()
-
-    const sourceId = await resolveScreenSourceId(display.id)
-    if (!sourceId) { showMain(); return }
-
-    openRecordingSession({
-      kind: 'window',
-      sourceId,
-      displayId: display.id,
-      rect,
-      displayDipSize: { width: display.size.width, height: display.size.height },
-      displayScaleFactor: sf,
-      outputSize: {
-        width:  Math.max(1, Math.round(rect.width  * sf)),
-        height: Math.max(1, Math.round(rect.height * sf)),
-      },
-    })
+    await beginWindowRecording(rect, getOverlayDisplayId())
   })
 
   // Screen confirm: user clicked a monitor overlay.
@@ -883,6 +888,17 @@ export async function startVideoCapture(mode: 'region' | 'window' | 'screen') {
     mode === 'window' ? 'video-window' : 'video-screen'
   setOverlayMode(overlayMode)
   await hideMain()
+
+  // Exactly one app window showing → nothing to choose between; skip the
+  // picker and start recording it directly.
+  if (mode === 'window') {
+    const single = await getSinglePickTarget()
+    if (single) {
+      await beginWindowRecording(single.rect, single.displayId)
+      return
+    }
+  }
+
   createOverlayWindows()
 }
 

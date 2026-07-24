@@ -153,3 +153,45 @@ export function getMacWindowAtPoint(x: number, y: number): Promise<WindowRect | 
     pump()
   })
 }
+
+/**
+ * Enumerate all eligible on-screen windows (same filters as the point query),
+ * front-to-back — the first entry is the frontmost (≈ active) window. Bounds
+ * are in macOS screen-DIP / points, top-left origin.
+ *
+ * Bypasses the drop-latest pendingRequest slot: this is a one-shot query, not
+ * hover polling, so it must never be discarded in favor of a newer hover
+ * request. Handler push + stdin write happen synchronously together, so FIFO
+ * line pairing with in-flight point queries stays correct. An older helper
+ * binary that predates "list" replies "null" → resolves to [].
+ */
+export function listMacWindows(): Promise<WindowRect[]> {
+  return new Promise<WindowRect[]>(res => {
+    if (!startHelper() || !proc) {
+      res([])
+      return
+    }
+
+    lineQueue.push((line: string) => {
+      try {
+        const arr = JSON.parse(line)
+        if (!Array.isArray(arr)) { res([]); return }
+        res(arr.filter((o): o is WindowRect =>
+          o && typeof o.x === 'number' && typeof o.y === 'number' &&
+          typeof o.width === 'number' && typeof o.height === 'number'
+        ))
+      } catch {
+        res([])
+      }
+    })
+
+    try {
+      proc.stdin.write('list\n')
+    } catch {
+      const handler = lineQueue.pop()
+      handler?.('null')
+      try { proc.kill() } catch { /* */ }
+      proc = null
+    }
+  })
+}
