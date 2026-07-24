@@ -112,20 +112,30 @@ if (!icns) throw new Error('ICNS generation failed')
 writeFileSync(ICNS_OUT, icns)
 console.log(`  ✓ mac/icon.icns (artwork ${macContent}×${macContent} in ${macSize}×${macSize})`)
 
-// ── Tray icons (22 × 22 PNG) ──────────────────────────────────────────────────
+// ── Tray icons ────────────────────────────────────────────────────────────────
 // Windows tray accepts full-bleed; macOS menu bar wants the artwork around 16pt
 // within the 22pt slot, otherwise it dominates the menu bar height. The mac
 // tray PNG is also rendered as a template image at runtime (tray.ts), so the
 // alpha channel is what actually drives the on-screen silhouette.
+//
+// macOS ships two files: tray-icon.png (22×22, the 1x/22pt base) and
+// tray-icon@2x.png (44×44). nativeImage.createFromPath picks the @2x variant
+// up automatically as the Retina representation — without it, every modern
+// Mac (all 2x) upscales the 22px bitmap and the menu bar icon looks broken.
 const trayWinDir = join(ROOT, 'resources/tray/win')
 const trayMacDir = join(ROOT, 'resources/tray/mac')
 
-const trayWin = resizePNG(pngBuffer, 22, 22)
+// 32×32 native (not upscaled at runtime) — Windows scales per tray DPI itself.
+const trayWin = resizePNG(pngBuffer, 32, 32)
 writeFileSync(join(trayWinDir, 'tray-icon.png'), trayWin)
-console.log('  ✓ tray/win/tray-icon.png (full-bleed 22×22)')
+console.log('  ✓ tray/win/tray-icon.png (full-bleed 32×32)')
 
 const trayMac = padPNG(pngBuffer, 22, 16)
 writeFileSync(join(trayMacDir, 'tray-icon.png'), trayMac)
 console.log('  ✓ tray/mac/tray-icon.png (artwork 16×16 in 22×22)')
+
+const trayMac2x = padPNG(pngBuffer, 44, 32)
+writeFileSync(join(trayMacDir, 'tray-icon@2x.png'), trayMac2x)
+console.log('  ✓ tray/mac/tray-icon@2x.png (artwork 32×32 in 44×44)')
 
 console.log('Icons ready.')
