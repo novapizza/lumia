@@ -2,9 +2,13 @@
 //
 // Protocol:
 //   - argv[1] (optional): PID to exclude from results (Lumia's own windows).
-//   - stdin:  one query per line, format "x y" in screen-DIP / points (top-left origin).
-//   - stdout: one JSON object per query, or the literal string "null".
+//   - stdin:  one query per line:
+//       "x y"  — point query in screen-DIP / points (top-left origin).
+//       "list" — enumerate all eligible windows, front-to-back.
+//   - stdout: one line per query.
+//       point query: JSON object or the literal string "null".
 //             { "x": <pt>, "y": <pt>, "width": <pt>, "height": <pt> }
+//       list query:  JSON array of the same objects ("[]" when none).
 //   - exits when stdin is closed.
 //
 // Permissions: reading window names requires Screen Recording, but bounds + PID
@@ -22,7 +26,51 @@ let excludePid: Int = CommandLine.arguments.count >= 2
 
 setbuf(stdout, nil)
 
+// Shared eligibility filter: returns the window's bounds when the entry is a
+// regular, visible, non-Lumia app window; nil otherwise.
+func eligibleBounds(_ w: [String: Any]) -> CGRect? {
+    // Layer 0 == regular app windows. Higher layers are dock/menu/popup chrome.
+    guard let layer = w[kCGWindowLayer as String] as? Int, layer == 0 else { return nil }
+    if let pid = w[kCGWindowOwnerPID as String] as? Int {
+        if pid == ownPid { return nil }
+        if excludePid >= 0 && pid == excludePid { return nil }
+    }
+    if let alpha = w[kCGWindowAlpha as String] as? Double, alpha <= 0.01 { return nil }
+    guard let boundsDict = w[kCGWindowBounds as String] as? NSDictionary,
+          let bounds = CGRect(dictionaryRepresentation: boundsDict) else { return nil }
+    // Skip degenerate slivers (offscreen helpers / 1px windows).
+    if bounds.width < 8 || bounds.height < 8 { return nil }
+    return bounds
+}
+
+func rectJson(_ bounds: CGRect) -> [String: Any] {
+    return [
+        "x": bounds.origin.x,
+        "y": bounds.origin.y,
+        "width": bounds.size.width,
+        "height": bounds.size.height,
+    ]
+}
+
 while let line = readLine(strippingNewline: true) {
+    let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+
+    if line == "list" {
+        guard let info = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else {
+            print("[]")
+            continue
+        }
+        // Front-to-back — the first entry is the frontmost (≈ active) window.
+        let wins = info.compactMap { eligibleBounds($0) }.map { rectJson($0) }
+        if let data = try? JSONSerialization.data(withJSONObject: wins),
+           let str = String(data: data, encoding: .utf8) {
+            print(str)
+        } else {
+            print("[]")
+        }
+        continue
+    }
+
     let parts = line.split(separator: " ").compactMap { Double($0) }
     if parts.count < 2 {
         print("null")
@@ -30,7 +78,6 @@ while let line = readLine(strippingNewline: true) {
     }
     let pt = CGPoint(x: parts[0], y: parts[1])
 
-    let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
     guard let info = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else {
         print("null")
         continue
@@ -39,26 +86,10 @@ while let line = readLine(strippingNewline: true) {
     var emitted = false
     // CGWindowListCopyWindowInfo returns front-to-back z-order; first hit wins.
     for w in info {
-        // Layer 0 == regular app windows. Higher layers are dock/menu/popup chrome.
-        guard let layer = w[kCGWindowLayer as String] as? Int, layer == 0 else { continue }
-        if let pid = w[kCGWindowOwnerPID as String] as? Int {
-            if pid == ownPid { continue }
-            if excludePid >= 0 && pid == excludePid { continue }
-        }
-        if let alpha = w[kCGWindowAlpha as String] as? Double, alpha <= 0.01 { continue }
-        guard let boundsDict = w[kCGWindowBounds as String] as? NSDictionary,
-              let bounds = CGRect(dictionaryRepresentation: boundsDict) else { continue }
-        // Skip degenerate slivers (offscreen helpers / 1px windows).
-        if bounds.width < 8 || bounds.height < 8 { continue }
+        guard let bounds = eligibleBounds(w) else { continue }
         if !bounds.contains(pt) { continue }
 
-        let json: [String: Any] = [
-            "x": bounds.origin.x,
-            "y": bounds.origin.y,
-            "width": bounds.size.width,
-            "height": bounds.size.height,
-        ]
-        if let data = try? JSONSerialization.data(withJSONObject: json),
+        if let data = try? JSONSerialization.data(withJSONObject: rectJson(bounds)),
            let str = String(data: data, encoding: .utf8) {
             print(str)
             emitted = true

@@ -4,13 +4,14 @@ import { join } from 'path'
 import { getMainWindow, createOverlayWindows, closeAllOverlays, getHistoryStore, getOverlayDisplayId, broadcastToOverlays, restoreFromOverlayCancel, waitForViewMounted, openHistoryItemInEditor, isMainDismissed } from './index'
 import { getWindowAtPointPhysical } from './native-input'
 import { getMacWindowAtPoint } from './mac-window-pick'
-import { setOverlayMode, resetOverlayMode } from './scroll-capture'
+import { resolveWin32PickRect, resolveMacPickRect, getSinglePickTarget, getActivePickTarget, PickTarget } from './window-list'
+import { setOverlayMode, resetOverlayMode, getOverlayMode } from './scroll-capture'
 import { localTimestamp } from './utils'
 import { makeThumbnail } from './thumbnail'
 import { showNotification } from './notify'
 import { applyWatermark } from './watermark'
 import { getSettings } from './settings'
-import { startVideoCapture } from './video'
+import { startVideoCapture, beginWindowRecording } from './video'
 import { getDisplayIcc } from './display-icc'
 import { tagPngWithIcc } from './png-icc'
 import { captureDisplayNative } from './native-screen'
@@ -240,18 +241,7 @@ export function setupCapture() {
 
         // Clip to overlay's display so the highlight (and downstream crop)
         // never extends past the visible area when a window spans displays.
-        const left   = Math.max(display.bounds.x, Math.round(rect.x))
-        const top    = Math.max(display.bounds.y, Math.round(rect.y))
-        const right  = Math.min(display.bounds.x + display.bounds.width,  Math.round(rect.x + rect.width))
-        const bottom = Math.min(display.bounds.y + display.bounds.height, Math.round(rect.y + rect.height))
-        if (right <= left || bottom <= top) return null
-
-        return {
-          x: left - display.bounds.x,
-          y: top - display.bounds.y,
-          width: right - left,
-          height: bottom - top,
-        }
+        return resolveMacPickRect(rect, display)
       } catch (err: any) {
         console.error('[window-pick mac] error:', err?.message ?? err)
         return null
@@ -270,55 +260,20 @@ export function setupCapture() {
       const screenDip = { x: x + display.bounds.x, y: y + display.bounds.y }
       const physPt = screen.dipToScreenPoint(screenDip)
 
-      // Native layer returns a rect in virtual-screen PHYSICAL pixels.
+      // Native layer returns a rect in virtual-screen PHYSICAL pixels. The
+      // resolver clips it to the overlay's display (maximized windows extend
+      // ~8px past monitor edges via DWM's invisible resize border), bites past
+      // Win11 rounded corners, and converts to display-local DIP.
       const raw = getWindowAtPointPhysical(physPt.x, physPt.y)
       if (!raw) return null
 
-      // Clip physical rect to the display's physical bounds. Maximized windows
-      // on Win10/11 extend ~8px beyond the monitor edges (the invisible resize
-      // border baked into DWM's frame bounds) — without this clip the crop
-      // would include wallpaper/other monitor content at the edges.
-      const displayPhysOrigin = screen.dipToScreenPoint({ x: display.bounds.x, y: display.bounds.y })
-      const sf = display.scaleFactor || 1
-      const displayPhysW = Math.round(display.size.width  * sf)
-      const displayPhysH = Math.round(display.size.height * sf)
-
-      // Win11 apps have ~8 DIP rounded corners; DWM's rectangular frame bounds
-      // encloses them so wallpaper pokes through the 4 corners of the crop.
-      // Inset by a couple physical px to bite past the corner curvature without
-      // eating visible window content.
-      const cornerInset = Math.max(1, Math.round(2 * sf))
-      const pLeft   = Math.max(displayPhysOrigin.x, raw.x + cornerInset)
-      const pTop    = Math.max(displayPhysOrigin.y, raw.y + cornerInset)
-      const pRight  = Math.min(displayPhysOrigin.x + displayPhysW, raw.x + raw.width  - cornerInset)
-      const pBottom = Math.min(displayPhysOrigin.y + displayPhysH, raw.y + raw.height - cornerInset)
-      if (pRight <= pLeft || pBottom <= pTop) return null
-
-      // Convert clipped physical → DIP for the overlay highlight.
-      const dipRect = screen.screenToDipRect(null as never, {
-        x: pLeft, y: pTop, width: pRight - pLeft, height: pBottom - pTop,
-      })
-      const left   = Math.max(display.bounds.x, Math.round(dipRect.x))
-      const top    = Math.max(display.bounds.y, Math.round(dipRect.y))
-      const right  = Math.min(display.bounds.x + display.bounds.width,  Math.round(dipRect.x + dipRect.width))
-      const bottom = Math.min(display.bounds.y + display.bounds.height, Math.round(dipRect.y + dipRect.height))
-      if (right <= left || bottom <= top) return null
+      const resolved = resolveWin32PickRect(raw, display)
+      if (!resolved) return null
 
       // Cache the clipped physical rect for the confirm handler to crop against.
-      lastWindowPickPhysical = {
-        x: pLeft,
-        y: pTop,
-        width: pRight - pLeft,
-        height: pBottom - pTop,
-        displayId: display.id,
-      }
+      lastWindowPickPhysical = resolved.phys
 
-      return {
-        x: left - display.bounds.x,
-        y: top - display.bounds.y,
-        width: right - left,
-        height: bottom - top,
-      }
+      return resolved.rect
     } catch (err: any) {
       console.error('[window-pick] error:', err?.message ?? err)
       return null
@@ -346,6 +301,39 @@ export function setupCapture() {
     closeAllOverlays()
     clearFrozenCache()
     restoreFromOverlayCancel()
+  })
+
+  // Enter while the window picker is up: confirm the active (foreground)
+  // window without hunting for it with the cursor. No-op when nothing is
+  // pickable (empty desktop, enumeration unsupported) — the overlay stays up.
+  //
+  // Guarded twice against key-repeat / double-press: the mode check rejects
+  // Enters arriving after a confirm already reset the session, and the
+  // in-flight latch rejects a second invoke racing the first one's awaits
+  // (which would otherwise double-capture — the second pass live-grabs the
+  // screen because the first pass consumed the frozen cache).
+  let confirmActiveInFlight = false
+  ipcMain.handle('window-pick:confirm-active', async () => {
+    const mode = getOverlayMode()
+    if (mode !== 'window-pick' && mode !== 'video-window') return null
+    if (confirmActiveInFlight) return null
+    confirmActiveInFlight = true
+    try {
+      const target = await getActivePickTarget()
+      if (!target) return null
+
+      if (mode === 'video-window') {
+        await beginWindowRecording(target.rect, target.displayId)
+        return null
+      }
+
+      lastWindowPickPhysical = null // supersedes any hover-cached rect
+      resetOverlayMode()
+      closeAllOverlays()
+      return await captureWindowTarget(target)
+    } finally {
+      confirmActiveInFlight = false
+    }
   })
 
   ipcMain.handle('region:cancel', () => {
@@ -490,11 +478,31 @@ async function captureAllScreen(): Promise<string> {
   return dataUrl
 }
 
+/** Capture a resolved pick target from the frozen snapshot and hand it to the
+ *  editor. Shared by the single-window fast path and Enter-to-confirm. */
+async function captureWindowTarget(target: PickTarget): Promise<string> {
+  const dataUrl = target.physRect
+    ? await capturePhysicalRect(target.physRect)
+    : await captureRect(target.rect, target.displayId)
+  clearFrozenCache()
+  await sendCaptureToEditor(dataUrl, 'window', target.displayId)
+  return dataUrl
+}
+
 async function captureWindow(): Promise<void> {
   setOverlayMode('window-pick')
   await hideMainWindow()
   try {
     await freezeAllDisplays()
+    // Exactly one app window showing → nothing to choose between; capture it
+    // outright instead of surfacing the picker. The freeze above already
+    // banked the pixels, so this is the same crop a click would produce.
+    const single = await getSinglePickTarget()
+    if (single) {
+      resetOverlayMode()
+      await captureWindowTarget(single)
+      return
+    }
     createOverlayWindows()
     // Capture happens after overlay fires window-pick:confirm
   } catch (err) {

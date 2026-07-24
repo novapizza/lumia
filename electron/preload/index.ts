@@ -139,6 +139,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   cancelRegion: () => ipcRenderer.invoke('region:cancel'),
   getWindowAt: (x: number, y: number) => ipcRenderer.invoke('window-pick:get-window-at', x, y),
   confirmWindowPick: (rect: { x: number; y: number; width: number; height: number }) => ipcRenderer.invoke('window-pick:confirm', rect),
+  // Enter shortcut: confirm the active (foreground) window. Main branches on
+  // the current overlay mode, so this covers both capture and record intents.
+  confirmActiveWindow: () => ipcRenderer.invoke('window-pick:confirm-active'),
   cancelWindowPick: () => ipcRenderer.invoke('window-pick:cancel'),
   confirmMonitorPick: () => ipcRenderer.invoke('monitor-pick:confirm'),
   cancelMonitorPick: () => ipcRenderer.invoke('monitor-pick:cancel'),

@@ -37,6 +37,11 @@ let _GetAncestor: (hwnd: any, flags: number) => any
 let _IsWindowVisible: (hwnd: any) => boolean
 let _GetWindowLongW: (hwnd: any, index: number) => number
 let _GetWindow: (hwnd: any, uCmd: number) => any
+let _GetTopWindow: (hwnd: any) => any
+let _GetForegroundWindow: () => any
+let _GetWindowThreadProcessId: (hwnd: any, pid: any) => number
+let _GetClassNameW: (hwnd: any, buf: any, maxCount: number) => number
+let _GetWindowTextLengthW: (hwnd: any) => number
 let _EnumWindows: (callback: any, lParam: any) => boolean
 let _DwmGetWindowAttribute: (hwnd: any, attr: number, pvAttribute: any, cbAttribute: number) => number
 // Same DWM API but with the output typed as a DWORD pointer — used for
@@ -45,6 +50,7 @@ let _DwmGetWindowAttribute: (hwnd: any, attr: number, pvAttribute: any, cbAttrib
 let _DwmGetWindowAttributeDword: (hwnd: any, attr: number, pvAttribute: any, cbAttribute: number) => number
 let _DwmSetWindowAttribute: (hwnd: any, attr: number, pvAttribute: any, cbAttribute: number) => number
 let _IsIconic: (hwnd: any) => boolean
+let _GetLayeredWindowAttributes: (hwnd: any, key: any, alpha: any, flags: any) => boolean
 let _SetThreadDpiAwarenessContext: (ctx: any) => any
 let _SetWindowDisplayAffinity: (hwnd: any, affinity: number) => boolean
 const DPI_AWARENESS_CONTEXT_SYSTEM_AWARE = -2       // passed as negative intptr_t handle
@@ -80,6 +86,11 @@ function ensureLoaded(): boolean {
     // is driven by the overlay's ~10/s hover poll — re-running koffi.load +
     // user32.func on every call was pure overhead.
     _GetWindow       = user32.func('intptr_t __stdcall GetWindow(intptr_t hWnd, uint32_t uCmd)')
+    _GetTopWindow    = user32.func('intptr_t __stdcall GetTopWindow(intptr_t hWnd)')
+    _GetForegroundWindow = user32.func('intptr_t __stdcall GetForegroundWindow()')
+    _GetWindowThreadProcessId = user32.func('uint32_t __stdcall GetWindowThreadProcessId(intptr_t hWnd, _Out_ uint32_t *lpdwProcessId)')
+    _GetClassNameW   = user32.func('int __stdcall GetClassNameW(intptr_t hWnd, _Out_ uint16_t *lpClassName, int nMaxCount)')
+    _GetWindowTextLengthW = user32.func('int __stdcall GetWindowTextLengthW(intptr_t hWnd)')
     _EnumWindows     = user32.func('bool __stdcall EnumWindows(intptr_t lpEnumFunc, intptr_t lParam)')
     // SetThreadDpiAwarenessContext is available on Win10 1607+. Used to force
     // GetWindowRect to return virtualized (primary-scale) DIP coords, dodging
@@ -94,6 +105,7 @@ function ensureLoaded(): boolean {
     _DwmGetWindowAttributeDword = dwmapi.func('int32_t __stdcall DwmGetWindowAttribute(intptr_t hwnd, uint32_t dwAttribute, _Out_ uint32_t *pvAttribute, uint32_t cbAttribute)')
     _DwmSetWindowAttribute = dwmapi.func('int32_t __stdcall DwmSetWindowAttribute(intptr_t hwnd, uint32_t dwAttribute, _In_ uint32_t *pvAttribute, uint32_t cbAttribute)')
     _IsIconic = user32.func('bool __stdcall IsIconic(intptr_t hWnd)')
+    _GetLayeredWindowAttributes = user32.func('bool __stdcall GetLayeredWindowAttributes(intptr_t hWnd, _Out_ uint32_t *pcrKey, _Out_ uint8_t *pbAlpha, _Out_ uint32_t *pdwFlags)')
     void RECT // suppress unused warning
 
     _loaded = true
@@ -257,6 +269,111 @@ export function getWindowAtPointPhysical(
     return null
   } catch (err: any) {
     return null
+  } finally {
+    if (prevCtx && _SetThreadDpiAwarenessContext) {
+      try { _SetThreadDpiAwarenessContext(prevCtx) } catch { /* ignore */ }
+    }
+  }
+}
+
+/** DWM visible-frame rect (falls back to GetWindowRect) in virtual-screen
+ *  physical pixels. Same preference order as getWindowAtPointPhysical. */
+function getWindowFrameRectPhysical(hwnd: any): { x: number; y: number; width: number; height: number } | null {
+  const DWMWA_EXTENDED_FRAME_BOUNDS = 9
+  const fr = { left: 0, top: 0, right: 0, bottom: 0 }
+  try {
+    const hr = _DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, fr, 16)
+    if (hr === 0 && fr.right > fr.left && fr.bottom > fr.top) {
+      return { x: fr.left, y: fr.top, width: fr.right - fr.left, height: fr.bottom - fr.top }
+    }
+  } catch { /* fall through to GetWindowRect */ }
+  const r = { left: 0, top: 0, right: 0, bottom: 0 }
+  if (!_GetWindowRect(hwnd, r)) return null
+  if (r.right <= r.left || r.bottom <= r.top) return null
+  return { x: r.left, y: r.top, width: r.right - r.left, height: r.bottom - r.top }
+}
+
+// Shell housekeeping windows that pass the visible/title/toolwindow filters but
+// aren't pickable app windows: the desktop (Progman reports title "Program
+// Manager"), wallpaper hosts, and the taskbars.
+const SHELL_CLASS_DENYLIST = new Set(['Progman', 'WorkerW', 'Shell_TrayWnd', 'Shell_SecondaryTrayWnd'])
+
+function isPickableAppWindow(hwnd: any, clsBuf: Uint16Array): boolean {
+  if (_overlayHwnds.has(hwnd)) return false
+  if (!isWindowReallyVisible(hwnd)) return false
+  const WS_EX_TOOLWINDOW = 0x80
+  const WS_EX_LAYERED = 0x80000
+  const exStyle = _GetWindowLongW(hwnd, -20)
+  if (exStyle & WS_EX_TOOLWINDOW) return false
+  // Fully transparent layered windows (SetLayeredWindowAttributes alpha 0 —
+  // e.g. another Electron app's parked setOpacity(0) windows) are on screen
+  // per WS_VISIBLE but show nothing — the macOS helper's kCGWindowAlpha
+  // filter equivalent.
+  if (exStyle & WS_EX_LAYERED) {
+    const key = [0], alpha = [0], flags = [0]
+    if (_GetLayeredWindowAttributes(hwnd, key, alpha, flags)) {
+      const LWA_ALPHA = 2
+      if ((flags[0] & LWA_ALPHA) && alpha[0] === 0) return false
+    }
+  }
+  // Own process (main window, editor, recorder chrome) never counts — the
+  // picker exists to grab OTHER apps' windows.
+  const pidOut = [0]
+  _GetWindowThreadProcessId(hwnd, pidOut)
+  if (pidOut[0] === process.pid) return false
+  // Untitled top-levels are shell plumbing / hidden hosts, not user windows.
+  if (_GetWindowTextLengthW(hwnd) <= 0) return false
+  const n = _GetClassNameW(hwnd, clsBuf, clsBuf.length)
+  const cls = String.fromCharCode(...clsBuf.subarray(0, Math.max(0, n)))
+  if (SHELL_CLASS_DENYLIST.has(cls)) return false
+  return true
+}
+
+/** The user-facing "active" window: root ancestor of GetForegroundWindow.
+ *  Returns the raw HWND with no eligibility filtering — callers match it
+ *  against listTopLevelWindowsPhysical() to validate. */
+export function getForegroundWindowHwnd(): any {
+  if (!ensureLoaded()) return 0
+  try {
+    const hwnd = _GetForegroundWindow()
+    if (!hwnd) return 0
+    return _GetAncestor(hwnd, 2) // GA_ROOT
+  } catch {
+    return 0
+  }
+}
+
+/** Enumerate visible top-level app windows in z-order (front-to-back), with
+ *  the same eligibility rules the point-picker applies (visible, not cloaked,
+ *  not a tool window, not one of ours) plus a titled-app-window requirement so
+ *  shell plumbing doesn't count. Rects are DWM visible frames in virtual-screen
+ *  physical pixels — same space as getWindowAtPointPhysical. */
+export function listTopLevelWindowsPhysical(): Array<{ hwnd: any; x: number; y: number; width: number; height: number }> {
+  if (!ensureLoaded()) return []
+  const prevCtx = _SetThreadDpiAwarenessContext
+    ? (() => { try { return _SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_V2) } catch { return null } })()
+    : null
+  try {
+    const GW_HWNDNEXT = 2
+    const clsBuf = new Uint16Array(256)
+    const results: Array<{ hwnd: any; x: number; y: number; width: number; height: number }> = []
+    let hwnd = _GetTopWindow(0)
+    let attempts = 0
+    while (hwnd && attempts < 2000) {
+      attempts++
+      if (isPickableAppWindow(hwnd, clsBuf)) {
+        const rect = getWindowFrameRectPhysical(hwnd)
+        // Skip degenerate slivers (offscreen helpers / 1px windows) — same
+        // threshold as the macOS helper.
+        if (rect && rect.width >= 8 && rect.height >= 8) {
+          results.push({ hwnd, ...rect })
+        }
+      }
+      hwnd = _GetWindow(hwnd, GW_HWNDNEXT)
+    }
+    return results
+  } catch {
+    return []
   } finally {
     if (prevCtx && _SetThreadDpiAwarenessContext) {
       try { _SetThreadDpiAwarenessContext(prevCtx) } catch { /* ignore */ }

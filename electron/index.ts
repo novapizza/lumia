@@ -14,6 +14,7 @@ import {
 import { uploadFilePathToDrive } from './google-drive-service'
 import { localTimestamp } from './utils'
 import { registerOverlayHwnd, unregisterOverlayHwnd, disableDwmTransitions } from './native-input'
+import { snapshotActivePickWindow } from './window-list'
 import { setupHotkeys, teardownHotkeys, getHotkeys, saveHotkeys, resetHotkeys, defaultHotkeys, type HotkeyConfig } from './hotkeys'
 import { setupTray, destroyTray } from './tray'
 import { setupScrollCapture, getOverlayMode } from './scroll-capture'
@@ -650,6 +651,9 @@ function revealOverlayWhenBgReady(win: BrowserWindow, displayId: number, isActiv
 
 export function createOverlayWindows(): Map<number, BrowserWindow> {
   closeAllOverlays()
+  // Remember the foreground window before any overlay grabs focus — it's the
+  // "active window" that Enter confirms while the window picker is up.
+  snapshotActivePickWindow()
   // Lazy fallback: caller might invoke this before whenReady has finished
   // wiring up the pool (e.g. tests, or display-added racing with first capture).
   if (!overlayPoolReady) setupOverlayPool()
