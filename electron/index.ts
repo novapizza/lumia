@@ -26,7 +26,7 @@ import { HistoryStore } from './history'
 import { makeThumbnail } from './thumbnail'
 import { showNotification, consumePendingNotificationClick } from './notify'
 import type { HistoryItem } from './types'
-import { getSettings, setSetting, resolveSaveStartDir, rememberSaveDir, type AppSettings } from './settings'
+import { getSettings, setSetting, isRememberedMode, resolveSaveStartDir, rememberSaveDir, type AppSettings } from './settings'
 import { applyLaunchAtStartup, wasLaunchedAtStartup } from './startup'
 import { ensureDevStartMenuShortcut } from './dev-shortcut'
 import { setSnippingHijack } from './printscreen-key'
@@ -1441,14 +1441,11 @@ app.whenReady().then(async () => {
     }
   })
   ipcMain.handle('settings:set', (_e, key: keyof AppSettings, value: unknown) => {
-    // 'screen' on a single-display system is equivalent to an all-monitors
-    // grab, so don't pin it — same one-shot policy as 'all-screen'. Lets
-    // the user's prior multi-monitor preference survive.
-    if (
-      key === 'lastImageMode' &&
-      value === 'screen' &&
-      screen.getAllDisplays().length <= 1
-    ) return
+    // Remember policy: only Region / Window picks update the replay modes —
+    // see isRememberedMode in settings.ts. This is the choke point for all
+    // renderer writers (Dashboard buttons, overlay ModeBar), so they can send
+    // every selection and the policy lives in one place.
+    if ((key === 'lastImageMode' || key === 'lastVideoMode') && !isRememberedMode(value)) return
     setSetting(key, value as AppSettings[typeof key])
     if (key === 'launchAtStartup') applyLaunchAtStartup(value as boolean)
     if (key === 'historyRetentionDays') runHistoryPrune()

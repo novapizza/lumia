@@ -1,9 +1,9 @@
-import { globalShortcut, app, screen } from 'electron'
+import { globalShortcut, app } from 'electron'
 import Store from 'electron-store'
 import { dispatchCapture, dispatchLastCapture } from './capture'
 import { createOverlayWindows, getMainWindow, getOverlayWindow, markQuitting } from './index'
 import { startVideoCapture, requestStop as requestVideoStop, isRecordingActive } from './video'
-import { setSetting, getSettings } from './settings'
+import { setSetting, getSettings, isRememberedMode } from './settings'
 import type { LastImageMode, LastVideoMode } from './settings'
 import { setOverlayMode } from './scroll-capture'
 
@@ -155,31 +155,22 @@ export function setupHotkeys() {
     try { await fn() } finally { isCapturing = false }
   }
 
-  // Persist the mode the user just triggered so subsequent "New Capture"
-  // entry points (tray, sidebar, AppMenu) replay the same mode. Without
-  // this, hotkey-driven captures don't update lastImage/VideoMode and
-  // dispatchLastCapture replays whatever the dashboard last saved.
-  // 'screen' on a single-display system captures the same pixels as
-  // 'all-screen', so we treat it the same way: kind flips to 'image',
-  // but lastImageMode isn't pinned — let the user's prior multi-monitor
-  // preference (or the default) survive.
+  // Persist what the user just triggered so subsequent "New Capture" entry
+  // points (tray, sidebar, AppMenu, PrtSc) replay the same context. The kind
+  // always flips; the replay mode only updates for Region / Window picks —
+  // see isRememberedMode in settings.ts for the policy.
   const rememberImage = (mode: LastImageMode) => {
     setSetting('lastCaptureKind', 'image')
-    if (mode === 'screen' && screen.getAllDisplays().length <= 1) return
-    setSetting('lastImageMode', mode)
+    if (isRememberedMode(mode)) setSetting('lastImageMode', mode)
   }
   const rememberVideo = (mode: LastVideoMode) => {
     setSetting('lastCaptureKind', 'video')
-    setSetting('lastVideoMode', mode)
+    if (isRememberedMode(mode)) setSetting('lastVideoMode', mode)
   }
 
   const handlers: Record<string, () => void> = {
     RectangleRegion: withLock(async () => { rememberImage('region'); await dispatchCapture('region') }),
-    // All Screens is treated as a one-shot — we update kind so the user's
-    // image/video context flips correctly, but don't pin lastImageMode to
-    // 'all-screen' since users typically don't want every subsequent New
-    // Capture to replay the all-monitors composite.
-    PrintScreen:     withLock(async () => { setSetting('lastCaptureKind', 'image'); await dispatchCapture('all-screen') }),
+    PrintScreen:     withLock(async () => { rememberImage('all-screen'); await dispatchCapture('all-screen') }),
     ActiveWindow:    withLock(async () => { rememberImage('window'); await dispatchCapture('window') }),
     ActiveMonitor:   withLock(async () => { rememberImage('screen'); await dispatchCapture('screen') }),
     ScrollingCapture: withLock(async () => {

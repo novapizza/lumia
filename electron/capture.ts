@@ -1,7 +1,7 @@
 import { desktopCapturer, ipcMain, screen, nativeImage, clipboard } from 'electron'
 import { homedir } from 'os'
 import { join } from 'path'
-import { getMainWindow, createOverlayWindows, closeAllOverlays, getHistoryStore, getOverlayDisplayId, broadcastToOverlays, restoreFromOverlayCancel, waitForViewMounted, openHistoryItemInEditor, isMainDismissed } from './index'
+import { getMainWindow, createOverlayWindows, closeAllOverlays, getHistoryStore, getOverlayDisplayId, getOverlayWindow, broadcastToOverlays, restoreFromOverlayCancel, waitForViewMounted, openHistoryItemInEditor, isMainDismissed } from './index'
 import { getWindowAtPointPhysical } from './native-input'
 import { getMacWindowAtPoint } from './mac-window-pick'
 import { resolveWin32PickRect, resolveMacPickRect, getSinglePickTarget, getActivePickTarget, PickTarget } from './window-list'
@@ -258,7 +258,17 @@ export async function dispatchLastCapture() {
 
 export function setupCapture() {
   ipcMain.handle('capture:screenshot', async (_e, mode: CaptureMode) => dispatchCapture(mode))
-  ipcMain.handle('capture:new', async () => dispatchLastCapture())
+
+  // Re-entrancy guards matching the hotkey path (hotkeys.ts withLock): ignore
+  // the click while a previous dispatch is still setting up or an overlay
+  // session is already open — a double-click on "New Capture" would otherwise
+  // race two freeze/overlay sessions against each other.
+  let newCaptureInFlight = false
+  ipcMain.handle('capture:new', async () => {
+    if (newCaptureInFlight || getOverlayWindow()) return
+    newCaptureInFlight = true
+    try { await dispatchLastCapture() } finally { newCaptureInFlight = false }
+  })
 
   ipcMain.handle('region:confirm', async (_e, payload: { dataUrl: string; rect: { x: number; y: number; width: number; height: number } }) => {
     const displayId = getOverlayDisplayId()
