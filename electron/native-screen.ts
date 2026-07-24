@@ -75,16 +75,26 @@ function ensureLoaded(): boolean {
   }
 }
 
+/** A native capture result: the NativeImage plus the raw BGRA it was built
+ *  from. Callers that need the raw pixels again (the frozen-snapshot cache
+ *  hands them to the overlay as its background) reuse `raw` instead of paying
+ *  NativeImage.toBitmap() — another full-frame copy (~59 MB on 5K Retina) on
+ *  the hotkey→overlay hot path. */
+export interface NativeCapture {
+  image: Electron.NativeImage
+  raw: { buffer: Buffer; width: number; height: number }
+}
+
 /**
  * Capture a physical-pixel rect from the virtual desktop using GDI BitBlt.
- * Returns a NativeImage (BGRA, fully opaque) or null if GDI is unavailable.
+ * Returns the capture (BGRA, fully opaque) or null if GDI is unavailable.
  *
  * Coordinates must be in virtual-screen physical pixels — i.e. the same space
  * that screen.dipToScreenPoint() returns on Windows.
  */
 export function captureRectGdi(
   physX: number, physY: number, physW: number, physH: number
-): Electron.NativeImage | null {
+): NativeCapture | null {
   if (!ensureLoaded()) return null
 
   const w = Math.max(1, Math.round(physW))
@@ -145,7 +155,8 @@ export function captureRectGdi(
 
     // createFromBitmap (NOT createFromBuffer) — the latter decodes PNG/JPEG.
     // createFromBitmap takes raw BGRA, which is exactly what GetDIBits produced.
-    return nativeImage.createFromBitmap(pixels, { width: w, height: h })
+    const image = nativeImage.createFromBitmap(pixels, { width: w, height: h })
+    return { image, raw: { buffer: pixels, width: w, height: h } }
   } finally {
     if (hOld)   _SelectObject(hdcMem, hOld)
     if (hbmp)   _DeleteObject(hbmp)
@@ -158,7 +169,7 @@ export function captureRectGdi(
  * Capture a full Electron Display using GDI.
  * Returns null if GDI is unavailable (non-Windows or load failure).
  */
-export function captureDisplayGdi(display: Electron.Display): Electron.NativeImage | null {
+export function captureDisplayGdi(display: Electron.Display): NativeCapture | null {
   const origin = screen.dipToScreenPoint({ x: display.bounds.x, y: display.bounds.y })
   const sf = display.scaleFactor || 1
   const physW = Math.round(display.size.width  * sf)
@@ -175,7 +186,7 @@ export function captureDisplayGdi(display: Electron.Display): Electron.NativeIma
  */
 export async function captureDisplayNative(
   display: Electron.Display
-): Promise<Electron.NativeImage | null> {
+): Promise<NativeCapture | null> {
   if (process.platform === 'win32') return captureDisplayGdi(display)
   if (process.platform === 'darwin') return captureDisplayMacSnap(display)
   return null

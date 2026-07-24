@@ -23,6 +23,7 @@ import { spawn, ChildProcessWithoutNullStreams } from 'child_process'
 import { app, nativeImage, screen } from 'electron'
 import { existsSync } from 'fs'
 import { resolve, join } from 'path'
+import type { NativeCapture } from './native-screen'
 
 interface SnapReply { width: number; height: number; data: Buffer }
 
@@ -174,7 +175,10 @@ function startHelper(): boolean {
   }
 
   try {
-    proc = spawn(bin, [], { stdio: ['pipe', 'pipe', 'pipe'] })
+    // argv[1]: our PID — the helper excludes this process's windows from the
+    // capture at the compositor level (window-at-point convention). Lets the
+    // freeze run without waiting for the main window's hide to settle.
+    proc = spawn(bin, [String(process.pid)], { stdio: ['pipe', 'pipe', 'pipe'] })
   } catch (err) {
     console.error('[mac-screen-snap] failed to spawn helper:', err)
     proc = null
@@ -232,7 +236,7 @@ function request(cmd: string): Promise<SnapReply | null> {
  *  failure so the caller falls back to desktopCapturer. */
 export async function captureDisplayMacSnap(
   display: Electron.Display
-): Promise<Electron.NativeImage | null> {
+): Promise<NativeCapture | null> {
   if (process.platform !== 'darwin' || unsupported) return null
   if (!startHelper() || !proc) return null
 
@@ -243,12 +247,24 @@ export async function captureDisplayMacSnap(
   if (!reply) return null
 
   try {
-    // createFromBitmap (NOT createFromBuffer) — raw BGRA in, no decode.
-    return nativeImage.createFromBitmap(reply.data, { width: reply.width, height: reply.height })
+    // createFromBitmap (NOT createFromBuffer) — raw BGRA in, no decode. The
+    // reply buffer rides along as `raw` so downstream consumers don't have to
+    // toBitmap() the pixels straight back out.
+    const image = nativeImage.createFromBitmap(reply.data, { width: reply.width, height: reply.height })
+    return { image, raw: { buffer: reply.data, width: reply.width, height: reply.height } }
   } catch (err) {
     console.error('[mac-screen-snap] createFromBitmap failed:', err)
     return null
   }
+}
+
+/** Cheap availability probe for capture-policy decisions (e.g. whether the
+ *  hide-before-freeze settle wait can be skipped because the snapshot excludes
+ *  Lumia's windows anyway). Optimistic: true until the helper proves unusable
+ *  (binary missing / macOS < 14 latch `unsupported`) — a transient failure
+ *  after an optimistic skip is compensated inside freezeAllDisplays(). */
+export function macSnapAvailable(): boolean {
+  return process.platform === 'darwin' && !unsupported
 }
 
 let displayListenersInstalled = false

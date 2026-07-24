@@ -133,6 +133,13 @@ function pump(): void {
   }
 }
 
+/** Spawn the helper ahead of first use so the first window-pick hotkey after
+ *  launch doesn't pay the process spawn on its critical path. Fire-and-forget
+ *  from app.whenReady(); no-op off macOS (startHelper platform-gates). */
+export function prewarmMacWindowPick(): void {
+  startHelper()
+}
+
 /**
  * Query the topmost non-Lumia window at (x, y) in macOS screen-DIP / points
  * (top-left origin). Returns the window's bounds in the same coord space, or

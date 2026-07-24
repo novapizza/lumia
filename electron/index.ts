@@ -3,6 +3,7 @@ import { join, dirname } from 'path'
 import fs from 'fs/promises'
 import { setupCapture, ORIGINALS_DIR, getFrozenBgrForDisplay, prewarmDesktopCapturer } from './capture'
 import { prewarmNativeCapture } from './native-screen'
+import { prewarmMacWindowPick } from './mac-window-pick'
 import { getIccFromPng, tagPngWithIcc } from './png-icc'
 import { setupVideo, isRecordingActive } from './video'
 import { uploadFileToR2 } from './uploaders/r2'
@@ -493,6 +494,12 @@ function createMainWindow(startHidden = false): BrowserWindow {
     // (one-shot) and never auto-cleared on show.
     cancelAutoInstall()
     showDock()
+    // macOS: refresh the screen-snap helper's shareable-content cache now
+    // that main is on screen — its window must be in that cache for the
+    // capture-time PID exclusion (which is what lets hideMainWindow skip
+    // its compositor-settle wait) to catch it. Cheap no-op-ish on Windows
+    // (1×1 BitBlt).
+    prewarmNativeCapture()
   })
 
   win.on('closed', () => { mainWindow = null })
@@ -901,6 +908,10 @@ app.whenReady().then(async () => {
   // shareable-content cache. Either would otherwise land on the first
   // hotkey's critical path.
   prewarmNativeCapture()
+
+  // Same idea for the macOS window-at-point helper (window-pick hover +
+  // window lists) — spawn it now instead of on the first pick hotkey.
+  prewarmMacWindowPick()
 
   // Pre-warm the overlay pool: one hidden BrowserWindow per display, with
   // the renderer already loaded. The first capture after boot drops from

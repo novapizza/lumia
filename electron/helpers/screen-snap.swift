@@ -8,6 +8,11 @@
 // it across captures, instead of paying it inside every getSources() call.
 //
 // Protocol (line-based control channel on stdin, mixed text/binary replies):
+//   argv[1] (optional): PID whose windows to exclude from captures (Lumia's
+//                       own — same convention as window-at-point). Excluding
+//                       at the compositor level means the parent doesn't have
+//                       to wait for its own windows' hide to settle before
+//                       freezing.
 //   stdin, one request per line:
 //     "prewarm"                      — fetch + cache SCShareableContent.
 //     "snap <displayID> <pxW> <pxH>" — capture one display. displayID is a
@@ -40,6 +45,10 @@ import ScreenCaptureKit
 
 let out = FileHandle.standardOutput
 let errOut = FileHandle.standardError
+
+let excludePid: Int32 = CommandLine.arguments.count >= 2
+    ? (Int32(CommandLine.arguments[1]) ?? -1)
+    : -1
 
 // All replies go through FileHandle (never stdio print) so header lines and
 // binary payloads can't be reordered by C-stdio buffering.
@@ -77,18 +86,28 @@ final class Snapper {
         return fetched
     }
 
-    private func display(for id: CGDirectDisplayID) -> SCDisplay? {
-        if let hit = content?.displays.first(where: { $0.displayID == id }) { return hit }
+    // Resolve the SCDisplay together with the content generation it came from,
+    // so the exclusion list below is built from the same window snapshot.
+    private func lookup(_ id: CGDirectDisplayID) -> (SCDisplay, SCShareableContent)? {
+        if let c = content, let d = c.displays.first(where: { $0.displayID == id }) { return (d, c) }
         // Cache miss (cold start or display hotplug) — refetch once.
-        return fetchContent()?.displays.first(where: { $0.displayID == id })
+        if let c = fetchContent(), let d = c.displays.first(where: { $0.displayID == id }) { return (d, c) }
+        return nil
     }
 
     func snap(displayID: CGDirectDisplayID, pxW: Int, pxH: Int) -> (w: Int, h: Int, bgra: Data)? {
-        guard let scDisplay = display(for: displayID) else {
+        guard let (scDisplay, c) = lookup(displayID) else {
             logErr("display \(displayID) not found")
             return nil
         }
-        let filter = SCContentFilter(display: scDisplay, excludingWindows: [])
+        // Exclude the parent app's own windows (main window mid-hide, tray
+        // popovers) so the frozen frame never contains Lumia UI regardless of
+        // hide timing. The opacity-0 overlay pool windows would be invisible
+        // in the capture anyway; excluding them too is harmless.
+        let excluded = excludePid >= 0
+            ? c.windows.filter { $0.owningApplication?.processID == excludePid }
+            : []
+        let filter = SCContentFilter(display: scDisplay, excludingWindows: excluded)
         let cfg = SCStreamConfiguration()
         cfg.width = max(1, pxW)
         cfg.height = max(1, pxH)

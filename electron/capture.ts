@@ -14,7 +14,8 @@ import { getSettings } from './settings'
 import { startVideoCapture, beginWindowRecording } from './video'
 import { getDisplayIcc } from './display-icc'
 import { tagPngWithIcc } from './png-icc'
-import { captureDisplayNative } from './native-screen'
+import { captureDisplayNative, type NativeCapture } from './native-screen'
+import { macSnapAvailable } from './mac-screen-snap'
 
 /** Canonical folder for original captures (both images and videos). Not
  *  user-configurable — user-chosen locations are for the Save-As dialog only,
@@ -60,8 +61,16 @@ export type CaptureMode = 'all-screen' | 'region' | 'window' | 'screen'
 
 const HIDE_DELAY_MS = process.platform === 'darwin' ? 250 : 200
 
+// True when the last hideMainWindow() skipped the compositor-settle wait
+// because the macOS native snapshot excludes Lumia's windows anyway (PID
+// filter in the screen-snap helper). freezeAllDisplays() consults this if it
+// unexpectedly lands on the desktopCapturer fallback — that path captures the
+// real screen and CAN bake a still-fading main window into the frame.
+let hideWaitSkipped = false
+
 function hideMainWindow(): Promise<void> {
   return new Promise(resolve => {
+    hideWaitSkipped = false
     const win = getMainWindow()
     if (!win || win.isDestroyed()) { resolve(); return }
     // Already hidden → no compositor work needed, skip the delay so we get
@@ -69,6 +78,15 @@ function hideMainWindow(): Promise<void> {
     // tooltips/popovers that auto-dismiss on focus change).
     if (!win.isVisible()) { resolve(); return }
     win.hide()
+    // macOS with the ScreenCaptureKit helper: the frozen snapshot excludes
+    // all of Lumia's windows at the compositor level, so there's nothing to
+    // wait for — freeze immediately. Trims ~250ms off dashboard-initiated
+    // captures and moves the frozen pixels closer to hotkey-press time.
+    if (process.platform === 'darwin' && macSnapAvailable()) {
+      hideWaitSkipped = true
+      resolve()
+      return
+    }
     setTimeout(resolve, HIDE_DELAY_MS)
   })
 }
@@ -79,20 +97,28 @@ function hideMainWindow(): Promise<void> {
 // auto-dismiss as soon as the overlay (or any other window) steals focus
 // from the source app.
 //
-// We only cache the NativeImage. Encoding to PNG via toDataURL() for a 4K
-// display takes ~500-1000ms and lands on the critical path before overlay
-// creation — so we hand the overlay raw BGRA bytes (free) instead, and only
-// PNG-encode when the user actually confirms a capture.
-const frozenImages = new Map<number, Electron.NativeImage>()
+// We never PNG-encode at freeze time: toDataURL() for a 4K display takes
+// ~500-1000ms and would land on the critical path before overlay creation —
+// so we hand the overlay raw BGRA bytes instead, and only PNG-encode when the
+// user actually confirms a capture. The native capture paths already have the
+// raw BGRA in hand, so it's cached alongside the NativeImage (`raw`) — the
+// overlay push then skips a full-frame toBitmap() copy (~59 MB on 5K Retina).
+interface FrozenFrame {
+  image: Electron.NativeImage
+  raw?: { buffer: Buffer; width: number; height: number }
+}
+const frozenImages = new Map<number, FrozenFrame>()
 
 /** Raw BGRA bitmap of the frozen snapshot for the given display, intended for
- *  the overlay window to render as background via canvas putImageData. The
- *  buffer comes straight from NativeImage.toBitmap() — no encode round-trip. */
+ *  the overlay window to render as background via canvas putImageData. No
+ *  encode round-trip; no pixel copy at all when the frame came from a native
+ *  capture path. */
 export function getFrozenBgrForDisplay(displayId: number): { buffer: Buffer; width: number; height: number } | null {
-  const img = frozenImages.get(displayId)
-  if (!img) return null
-  const size = img.getSize()
-  return { buffer: img.toBitmap(), width: size.width, height: size.height }
+  const frame = frozenImages.get(displayId)
+  if (!frame) return null
+  if (frame.raw) return frame.raw
+  const size = frame.image.getSize()
+  return { buffer: frame.image.toBitmap(), width: size.width, height: size.height }
 }
 
 function clearFrozenCache() {
@@ -111,13 +137,21 @@ async function freezeAllDisplays(): Promise<void> {
   // 14+ warm ScreenCaptureKit helper (~50–200 ms/display). See native-screen.ts.
   const fallbackDisplays: Electron.Display[] = []
   await Promise.all(allDisplays.map(async d => {
-    const nativeImg = await captureDisplayNative(d)
-    if (nativeImg) frozenImages.set(d.id, nativeImg)
+    const nat: NativeCapture | null = await captureDisplayNative(d)
+    if (nat) frozenImages.set(d.id, nat)
     else fallbackDisplays.push(d)
   }))
   if (fallbackDisplays.length === 0) {
     console.log(`[capture] freeze: ${Date.now() - t0}ms, ${allDisplays.length} display(s), all native`)
     return
+  }
+
+  // The native path failed under us. If hideMainWindow() skipped its settle
+  // wait on the assumption the native snapshot would exclude Lumia's windows,
+  // the fallback — which captures the real screen — needs that wait after all.
+  if (hideWaitSkipped) {
+    hideWaitSkipped = false
+    await new Promise(r => setTimeout(r, HIDE_DELAY_MS))
   }
 
   // Fallback: desktopCapturer (macOS ≤ 13, or native capture failure). One
@@ -143,7 +177,7 @@ async function freezeAllDisplays(): Promise<void> {
     })
     for (const d of group) {
       const src = findSourceForDisplay(sources, allDisplays, d.id)
-      if (src) frozenImages.set(d.id, src.thumbnail)
+      if (src) frozenImages.set(d.id, { image: src.thumbnail })
     }
   }))
   console.log(`[capture] freeze: ${Date.now() - t0}ms, ${allDisplays.length} display(s), ${fallbackDisplays.length} via desktopCapturer fallback`)
@@ -427,77 +461,74 @@ async function captureAllScreen(): Promise<string> {
   const allDisplays = screen.getAllDisplays()
   await hideMainWindow()
 
-  // Single-display fast path
+  // Single-display fast path — captureDisplay tries native capture first,
+  // then desktopCapturer.
   if (allDisplays.length <= 1) {
     const d = allDisplays[0] ?? screen.getPrimaryDisplay()
-    const sf = d.scaleFactor || 1
-    const sources = await desktopCapturer.getSources({
-      types: ['screen'],
-      thumbnailSize: {
-        width:  Math.max(1, Math.round(d.size.width  * sf)),
-        height: Math.max(1, Math.round(d.size.height * sf)),
-      }
-    })
-    const src = findSourceForDisplay(sources, allDisplays, d.id)
-    if (!src) throw new Error('no screen source available for capture')
-    const dataUrl = src.thumbnail.toDataURL()
+    const dataUrl = await captureDisplay(d, allDisplays)
     await sendCaptureToEditor(dataUrl, 'all-screen', d.id)
     return dataUrl
   }
 
-  // Keep each display at its native physical resolution. Position each display
-  // in physical-pixel space by scaling its OWN DIP origin (offset from the
-  // bounding box of all displays) by its scale factor — rather than summing the
-  // sizes of other displays. The old summing rule double-offset stacked columns
-  // and vertically-offset layouts (black bands / top-aligned content).
-  const grabs = await Promise.all(allDisplays.map(async d => {
-    const sf = d.scaleFactor || 1
-    const physW = Math.max(1, Math.round(d.size.width  * sf))
-    const physH = Math.max(1, Math.round(d.size.height * sf))
-    const srcs = await desktopCapturer.getSources({
-      types: ['screen'],
-      thumbnailSize: { width: physW, height: physH }
+  // Multi-display: grab every display through the same native-first freeze the
+  // overlay flows use (previously this issued one full-res getSources() per
+  // display — N× redundant captures, at seconds each on macOS), then composite.
+  await freezeAllDisplays()
+  try {
+    // Keep each display at its native physical resolution. Position each display
+    // in physical-pixel space by scaling its OWN DIP origin (offset from the
+    // bounding box of all displays) by its scale factor — rather than summing the
+    // sizes of other displays. The old summing rule double-offset stacked columns
+    // and vertically-offset layouts (black bands / top-aligned content).
+    const grabs = allDisplays.map(d => {
+      const sf = d.scaleFactor || 1
+      return {
+        display: d,
+        frame: frozenImages.get(d.id) ?? null,
+        physW: Math.max(1, Math.round(d.size.width  * sf)),
+        physH: Math.max(1, Math.round(d.size.height * sf)),
+      }
     })
-    const src = findSourceForDisplay(srcs, allDisplays, d.id)
-    return { display: d, thumb: src ? src.thumbnail : null, physW, physH }
-  }))
 
-  // Bounding box of all displays in DIP space.
-  const minX = Math.min(...grabs.map(g => g.display.bounds.x))
-  const minY = Math.min(...grabs.map(g => g.display.bounds.y))
+    // Bounding box of all displays in DIP space.
+    const minX = Math.min(...grabs.map(g => g.display.bounds.x))
+    const minY = Math.min(...grabs.map(g => g.display.bounds.y))
 
-  const phBounds = new Map<number, { x: number; y: number; w: number; h: number }>()
-  for (const { display: d, physW, physH } of grabs) {
-    const sf = d.scaleFactor || 1
-    const px = Math.round((d.bounds.x - minX) * sf)
-    const py = Math.round((d.bounds.y - minY) * sf)
-    phBounds.set(d.id, { x: px, y: py, w: physW, h: physH })
+    const phBounds = new Map<number, { x: number; y: number; w: number; h: number }>()
+    for (const { display: d, physW, physH } of grabs) {
+      const sf = d.scaleFactor || 1
+      const px = Math.round((d.bounds.x - minX) * sf)
+      const py = Math.round((d.bounds.y - minY) * sf)
+      phBounds.set(d.id, { x: px, y: py, w: physW, h: physH })
+    }
+
+    const totalW = Math.max(...[...phBounds.values()].map(b => b.x + b.w))
+    const totalH = Math.max(...[...phBounds.values()].map(b => b.y + b.h))
+
+    const items: CompositeItem[] = []
+    for (const { display: d, frame } of grabs) {
+      if (!frame) continue
+      const pb = phBounds.get(d.id)!
+      const size = frame.image.getSize()
+      items.push({
+        bitmap: frame.raw?.buffer ?? frame.image.toBitmap(),
+        srcW: frame.raw?.width  ?? size.width,
+        srcH: frame.raw?.height ?? size.height,
+        dx: pb.x,
+        dy: pb.y,
+      })
+    }
+
+    const dataUrl = compositeBGRA(items, totalW, totalH)
+    // Multi-display composite has mixed color spaces by construction (each
+    // display's pixels are in its own native space). Tag with the primary
+    // display's profile — accepts inaccuracy across non-primary regions in
+    // exchange for at least labeling the dominant color space.
+    await sendCaptureToEditor(dataUrl, 'all-screen', screen.getPrimaryDisplay().id)
+    return dataUrl
+  } finally {
+    clearFrozenCache()
   }
-
-  const totalW = Math.max(...[...phBounds.values()].map(b => b.x + b.w))
-  const totalH = Math.max(...[...phBounds.values()].map(b => b.y + b.h))
-
-  const items: CompositeItem[] = []
-  for (const { display: d, thumb } of grabs) {
-    if (!thumb) continue
-    const pb = phBounds.get(d.id)!
-    const ts = thumb.getSize()
-    items.push({
-      bitmap: thumb.toBitmap(),
-      srcW: ts.width,
-      srcH: ts.height,
-      dx: pb.x,
-      dy: pb.y,
-    })
-  }
-
-  const dataUrl = compositeBGRA(items, totalW, totalH)
-  // Multi-display composite has mixed color spaces by construction (each
-  // display's pixels are in its own native space). Tag with the primary
-  // display's profile — accepts inaccuracy across non-primary regions in
-  // exchange for at least labeling the dominant color space.
-  await sendCaptureToEditor(dataUrl, 'all-screen', screen.getPrimaryDisplay().id)
-  return dataUrl
 }
 
 /** Capture a resolved pick target from the frozen snapshot and hand it to the
@@ -567,7 +598,7 @@ async function capturePhysicalRect(rect: { x: number; y: number; width: number; 
   const physH = Math.max(1, Math.round(target.size.height * sf))
   // Frozen cache hit → use the snapshot taken at hotkey time (preserves
   // tooltips/popovers that the overlay would otherwise have dismissed).
-  let fullImg = frozenImages.get(target.id) ?? null
+  let fullImg = frozenImages.get(target.id)?.image ?? null
   if (!fullImg) {
     const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: physW, height: physH } })
     fullImg = findSourceForDisplay(sources, allDisplays, target.id)?.thumbnail ?? null
@@ -605,7 +636,7 @@ async function captureRect(rect: { x: number; y: number; width: number; height: 
   const physH = Math.max(1, Math.round(targetDisplay.size.height * scaleFactor))
   // Prefer the frozen snapshot captured at hotkey time. Falls through to a
   // live capture if cache is empty (legacy paths, scrolling capture).
-  let fullImg = frozenImages.get(targetDisplay.id) ?? null
+  let fullImg = frozenImages.get(targetDisplay.id)?.image ?? null
   if (!fullImg) {
     const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: physW, height: physH } })
     fullImg = findSourceForDisplay(sources, allDisplays, targetDisplay.id)?.thumbnail ?? null
@@ -631,8 +662,13 @@ async function captureDisplay(display: Electron.Display, allDisplays: Electron.D
   // PNG now. We deliberately don't pre-encode during freezeAllDisplays(): the
   // encode is ~500-1000ms on 4K and would block overlay creation. At confirm
   // time it's off the critical path (overlay already gone) so the cost is OK.
-  const cachedImg = frozenImages.get(display.id)
-  if (cachedImg) return cachedImg.toDataURL()
+  const cached = frozenImages.get(display.id)
+  if (cached) return cached.image.toDataURL()
+
+  // No frozen frame (fullscreen / single-display monitor capture — no overlay
+  // session) — same native fast path the freeze uses, then desktopCapturer.
+  const nat = await captureDisplayNative(display)
+  if (nat) return nat.image.toDataURL()
 
   const sf = display.scaleFactor || 1
   const sources = await desktopCapturer.getSources({
