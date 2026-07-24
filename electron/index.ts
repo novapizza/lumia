@@ -895,9 +895,11 @@ app.whenReady().then(async () => {
   // pay the ~300-500ms cold-start. Fire-and-forget — no consumer waits on it.
   void prewarmDesktopCapturer()
 
-  // Warm the GDI capture path too — it's the primary screenshot route on
-  // Windows now, and its first call does the koffi/user32/gdi32 binding. Warm
-  // it here so the first hotkey doesn't pay that load. No-op off Windows.
+  // Warm the native capture path too — the primary screenshot route on both
+  // platforms. Windows: the first GDI call does the koffi/user32/gdi32
+  // binding. macOS: spawns the ScreenCaptureKit helper and pre-fetches its
+  // shareable-content cache. Either would otherwise land on the first
+  // hotkey's critical path.
   prewarmNativeCapture()
 
   // Pre-warm the overlay pool: one hidden BrowserWindow per display, with

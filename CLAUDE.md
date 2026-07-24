@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Lumia is a cross-platform Electron desktop app for screen capture, screen recording, annotation, and sharing (Windows + macOS). Built with Electron 42, React 19, TypeScript, Tailwind CSS 4, and Konva.
 
 Headline features:
-- Image capture: region, active window, active monitor, fullscreen, scrolling capture. The screen is **frozen at hotkey time** (native GDI snapshot on Windows) so captures preserve transient UI like tooltips/popovers
+- Image capture: region, active window, active monitor, fullscreen, scrolling capture. The screen is **frozen at hotkey time** (native GDI snapshot on Windows, warm ScreenCaptureKit snapshot on macOS 14+) so captures preserve transient UI like tooltips/popovers
 - Video recording: region / window / fullscreen with floating toolbar + visible region border, plus a live drawing overlay during recording; output WebM is remuxed seekable via bundled ffmpeg
 - Annotation canvas (Konva) with re-editable vector layers stored alongside originals, R2-hosted stickers, and Unsplash background/wallpaper images
 - Workflow pipeline: after-capture → upload → after-upload, configurable per template
@@ -59,8 +59,9 @@ Releases are produced by **GitHub Actions** (`.github/workflows/release.yml`), n
 | File | Responsibility |
 |------|---------------|
 | `index.ts` | App lifecycle, main + multi-display overlay window factories, autoUpdater, top-level IPC |
-| `capture.ts` | desktopCapturer wrapper for image modes; auto-saves originals to `~/Pictures/Lumia/`. Freezes all displays at hotkey time (`freezeAllDisplays`, fast GDI path on Windows), hands the overlay raw BGRA for instant render, and PNG-encodes only on confirm. Tags PNG captures with the display's ICC profile |
-| `native-screen.ts` | Windows-only fast screen capture via GDI BitBlt (koffi FFI) — ~5–20 ms/display vs desktopCapturer. Powers the freeze-at-hotkey snapshot; `prewarmNativeCapture()` runs at startup to dodge cold-start. No macOS equivalent (falls back to desktopCapturer) |
+| `capture.ts` | desktopCapturer wrapper for image modes; auto-saves originals to `~/Pictures/Lumia/`. Freezes all displays at hotkey time (`freezeAllDisplays`, native fast path on both platforms), hands the overlay raw BGRA for instant render, and PNG-encodes only on confirm. Tags PNG captures with the display's ICC profile |
+| `native-screen.ts` | Fast native screen capture — Windows via GDI BitBlt (koffi FFI, ~5–20 ms/display), macOS via `mac-screen-snap.ts`. Powers the freeze-at-hotkey snapshot; `prewarmNativeCapture()` runs at startup to dodge cold-start. Falls back to desktopCapturer on failure |
+| `mac-screen-snap.ts` | macOS fast screen capture — long-running Swift `screen-snap` helper (ScreenCaptureKit `SCScreenshotManager`, macOS 14+) with a prewarmed `SCShareableContent` cache; ~50–200 ms/display vs 1–3 s for desktopCapturer at full res. Binary BGRA protocol over stdio; macOS ≤ 13 latches `err unsupported` → desktopCapturer fallback |
 | `display-icc.ts` | Reads the OS-attached ICC profile for a display (Windows via GDI `GetICMProfileW`; macOS via a Swift `get-display-icc` helper). Per-display cache invalidated on display changes |
 | `png-icc.ts` | Hand-rolled PNG `iCCP` chunk insert/extract — embeds the display ICC profile into captured PNGs and copies it onto downstream flattened/annotated PNGs |
 | `video.ts` | Recording orchestrator — RecorderHost, RecordingToolbar, RecordingBorder, annotation-overlay windows, getUserMedia stream lifecycle. Receives the recording blob in bounded ~16 MB IPC slices (`recorder:save-begin`/`save-chunk`/`save-end`), writes to `~/Pictures/Lumia/recording-{timestamp}.webm`, then calls `remuxWebmInPlace` to make it seekable. Serves local media to the renderer via the `lumia-media://` protocol with HTTP Range/206 support |
@@ -92,6 +93,7 @@ Releases are produced by **GitHub Actions** (`.github/workflows/release.yml`), n
 | `helpers/scroll-helper.swift` | macOS scroll-event helper (counterpart to Win32 `native-input`) |
 | `helpers/get-display-icc.swift` | macOS helper returning a display's ICC profile bytes (used by `display-icc.ts`) |
 | `helpers/window-at-point.swift` | macOS helper returning the topmost non-Lumia window under the cursor (used by `mac-window-pick.ts`) |
+| `helpers/screen-snap.swift` | macOS 14+ fast-screenshot helper — `SCScreenshotManager` one-shot captures with cached `SCShareableContent`, raw BGRA replies (used by `mac-screen-snap.ts`) |
 
 ### Renderer (`src/`)
 

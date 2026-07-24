@@ -1,15 +1,21 @@
 /**
- * Fast Windows screen capture via GDI32 BitBlt — ~5–20 ms per display vs
- * ~50–150 ms for desktopCapturer.getSources() (no WGC session setup per-call).
+ * Fast native screen capture.
  *
- * Windows-only. Returns null on other platforms or on FFI load failure so
- * callers fall back to desktopCapturer.
+ * Windows: GDI32 BitBlt via koffi — ~5–20 ms per display vs ~50–150 ms for
+ * desktopCapturer.getSources() (no WGC session setup per-call).
  *
- * macOS deliberately has no native path here: desktopCapturer already runs on
- * ScreenCaptureKit, and the legacy CGDisplayCreateImage fast-grab was obsoleted
- * (not just deprecated) in the macOS 15 SDK, so it no longer compiles.
+ * macOS: delegated to the screen-snap Swift helper (ScreenCaptureKit's
+ * SCScreenshotManager, macOS 14+ — see mac-screen-snap.ts). Electron's own
+ * desktopCapturer also runs on ScreenCaptureKit but re-enumerates shareable
+ * content per call, costing 1–3 s at full resolution on macOS 14/15; the
+ * helper keeps that enumeration warm. The legacy CGDisplayCreateImage
+ * fast-grab was obsoleted (not just deprecated) in the macOS 15 SDK, so SCK
+ * is the only native route left. macOS ≤ 13 falls back to desktopCapturer.
+ *
+ * Returns null on any failure so callers fall back to desktopCapturer.
  */
 import { nativeImage, screen } from 'electron'
+import { captureDisplayMacSnap, prewarmMacScreenSnap } from './mac-screen-snap'
 
 // ── Win32 constants ──────────────────────────────────────────────────────────
 const SRCCOPY    = 0x00CC0020
@@ -163,27 +169,33 @@ export function captureDisplayGdi(display: Electron.Display): Electron.NativeIma
 // ── Unified entry point ───────────────────────────────────────────────────────
 
 /**
- * Fast display capture. Windows uses synchronous GDI; every other platform
- * returns null so the caller falls back to desktopCapturer.
- *
- * Kept async so callers don't have to change shape if a macOS native path is
- * added later (e.g. a warm ScreenCaptureKit session).
+ * Fast display capture. Windows uses synchronous GDI; macOS goes through the
+ * warm ScreenCaptureKit helper; anything else (or any failure) returns null
+ * so the caller falls back to desktopCapturer.
  */
 export async function captureDisplayNative(
   display: Electron.Display
 ): Promise<Electron.NativeImage | null> {
   if (process.platform === 'win32') return captureDisplayGdi(display)
+  if (process.platform === 'darwin') return captureDisplayMacSnap(display)
   return null
 }
 
 /**
- * One-shot warm-up of the GDI capture path. The first call does koffi.load +
- * user32/gdi32 binding (~tens of ms) inside ensureLoaded(), which would
- * otherwise land on the critical path of the user's first hotkey capture.
- * Fire-and-forget from app.whenReady(). A 1×1 BitBlt is enough to force the
- * bindings without grabbing a full display. No-op off Windows.
+ * One-shot warm-up of the native capture path, fired from app.whenReady() so
+ * the cost never lands on the user's first hotkey capture.
+ *
+ * Windows: the first call does koffi.load + user32/gdi32 binding (~tens of
+ * ms) inside ensureLoaded() — a 1×1 BitBlt forces the bindings without
+ * grabbing a full display.
+ *
+ * macOS: spawns the screen-snap helper and pre-fetches its SCShareableContent
+ * cache (~200–500 ms), the slow part of a cold ScreenCaptureKit capture.
  */
 export function prewarmNativeCapture(): void {
-  if (process.platform !== 'win32') return
-  try { captureRectGdi(0, 0, 1, 1) } catch { /* silent — best-effort */ }
+  if (process.platform === 'win32') {
+    try { captureRectGdi(0, 0, 1, 1) } catch { /* silent — best-effort */ }
+    return
+  }
+  if (process.platform === 'darwin') prewarmMacScreenSnap()
 }

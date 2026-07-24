@@ -104,27 +104,49 @@ function clearFrozenCache() {
  *  into the cached frame). Runs all displays in parallel. */
 async function freezeAllDisplays(): Promise<void> {
   clearFrozenCache()
+  const t0 = Date.now()
   const allDisplays = screen.getAllDisplays()
+
+  // Fast path: native capture — Windows GDI BitBlt (~5–20 ms/display), macOS
+  // 14+ warm ScreenCaptureKit helper (~50–200 ms/display). See native-screen.ts.
+  const fallbackDisplays: Electron.Display[] = []
   await Promise.all(allDisplays.map(async d => {
-    // Fast path: native capture (Windows GDI BitBlt). ~5–20 ms vs ~50–150 ms
-    // for desktopCapturer, with no WGC session setup per-call. No-op on macOS
-    // (returns null) — see native-screen.ts.
     const nativeImg = await captureDisplayNative(d)
-    if (nativeImg) {
-      frozenImages.set(d.id, nativeImg)
-      return
-    }
-    // Fallback: desktopCapturer (if native capture fails for any reason).
+    if (nativeImg) frozenImages.set(d.id, nativeImg)
+    else fallbackDisplays.push(d)
+  }))
+  if (fallbackDisplays.length === 0) {
+    console.log(`[capture] freeze: ${Date.now() - t0}ms, ${allDisplays.length} display(s), all native`)
+    return
+  }
+
+  // Fallback: desktopCapturer (macOS ≤ 13, or native capture failure). One
+  // getSources() call per unique physical size instead of one per display —
+  // every getSources() call captures EVERY screen at the requested thumbnail
+  // size, so per-display calls did N× redundant capture work, and on macOS
+  // each call also pays a fresh ScreenCaptureKit session (up to seconds).
+  const bySize = new Map<string, Electron.Display[]>()
+  for (const d of fallbackDisplays) {
     const sf = d.scaleFactor || 1
     const physW = Math.max(1, Math.round(d.size.width * sf))
     const physH = Math.max(1, Math.round(d.size.height * sf))
+    const key = `${physW}x${physH}`
+    const group = bySize.get(key)
+    if (group) group.push(d)
+    else bySize.set(key, [d])
+  }
+  await Promise.all([...bySize.entries()].map(async ([key, group]) => {
+    const [physW, physH] = key.split('x').map(Number)
     const sources = await desktopCapturer.getSources({
       types: ['screen'],
       thumbnailSize: { width: physW, height: physH },
     })
-    const src = findSourceForDisplay(sources, allDisplays, d.id)
-    if (src) frozenImages.set(d.id, src.thumbnail)
+    for (const d of group) {
+      const src = findSourceForDisplay(sources, allDisplays, d.id)
+      if (src) frozenImages.set(d.id, src.thumbnail)
+    }
   }))
+  console.log(`[capture] freeze: ${Date.now() - t0}ms, ${allDisplays.length} display(s), ${fallbackDisplays.length} via desktopCapturer fallback`)
 }
 
 /** One-shot warm-up of the desktopCapturer pipeline. First call after launch
@@ -493,11 +515,15 @@ async function captureWindow(): Promise<void> {
   setOverlayMode('window-pick')
   await hideMainWindow()
   try {
-    await freezeAllDisplays()
+    // Freeze and the window-list query are independent (the query reads window
+    // rects, not pixels) — run them concurrently. On macOS the list goes
+    // through the Swift helper and would otherwise stack its latency on top of
+    // the freeze before the overlay can surface.
+    //
     // Exactly one app window showing → nothing to choose between; capture it
-    // outright instead of surfacing the picker. The freeze above already
-    // banked the pixels, so this is the same crop a click would produce.
-    const single = await getSinglePickTarget()
+    // outright instead of surfacing the picker. The freeze already banked the
+    // pixels, so this is the same crop a click would produce.
+    const [, single] = await Promise.all([freezeAllDisplays(), getSinglePickTarget()])
     if (single) {
       resetOverlayMode()
       await captureWindowTarget(single)
