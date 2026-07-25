@@ -109,7 +109,7 @@ declare global {
       onOverlayFrozenBgraChanged: (
         cb: (data: { buffer: Uint8Array; width: number; height: number } | null) => void
       ) => void
-      notifyOverlayBgReady: () => void
+      notifyOverlayBgReady: (paintMs?: number) => void
       overlayDrawing: (drawing: boolean) => void
       notifyRoute: (route: string) => void
 

@@ -2,6 +2,7 @@ import { app, BrowserWindow, ipcMain, shell, dialog, nativeImage, clipboard, scr
 import { join, dirname } from 'path'
 import fs from 'fs/promises'
 import { setupCapture, ORIGINALS_DIR, getFrozenBgrForDisplay, prewarmDesktopCapturer } from './capture'
+import { trace } from './capture-trace'
 import { prewarmNativeCapture } from './native-screen'
 import { prewarmMacWindowPick } from './mac-window-pick'
 import { getIccFromPng, tagPngWithIcc } from './png-icc'
@@ -642,18 +643,20 @@ const BG_READY_TIMEOUT_MS = 600
 
 function revealOverlayWhenBgReady(win: BrowserWindow, displayId: number, isActive: boolean): void {
   const wcId = win.webContents.id
-  const t0 = Date.now()
+  const tGate = Date.now()
   let done = false
 
-  const reveal = (via: 'ack' | 'timeout') => {
+  const reveal = (via: 'ack' | 'timeout', rendererMs?: number) => {
     if (done) return
     done = true
     clearTimeout(timer)
     ipcMain.off('overlay:bg-ready', handler)
-    // Field diagnostic (pairs with '[capture] freeze:'): 'timeout' means the
-    // renderer never acked — rAF stalled or the bg push failed — and the
+    // Field diagnostic (part of the capture-trace timeline): 'timeout' means
+    // the renderer never acked — rAF stalled or the bg push failed — and the
     // overlay surfaced via the fallback, adding BG_READY_TIMEOUT_MS of lag.
-    console.log(`[overlay] reveal display=${displayId} via=${via} +${Date.now() - t0}ms`)
+    // `renderer` is the ack's self-reported decode+paint+2rAF duration; the
+    // gate time minus it approximates the raw-BGRA IPC transfer cost.
+    trace(`reveal display=${displayId} via=${via} (gate ${Date.now() - tGate}ms${rendererMs != null ? `, renderer ${rendererMs}ms` : ''})`)
     if (win.isDestroyed() || !overlayWindows.has(displayId)) return
     if (isActive) {
       win.setIgnoreMouseEvents(false)
@@ -668,8 +671,8 @@ function revealOverlayWhenBgReady(win: BrowserWindow, displayId: number, isActiv
     win.setOpacity(1)
   }
 
-  const handler = (e: Electron.IpcMainEvent) => {
-    if (e.sender.id === wcId) reveal('ack')
+  const handler = (e: Electron.IpcMainEvent, paintMs?: unknown) => {
+    if (e.sender.id === wcId) reveal('ack', typeof paintMs === 'number' ? Math.round(paintMs) : undefined)
   }
 
   const timer = setTimeout(() => reveal('timeout'), BG_READY_TIMEOUT_MS)
@@ -677,6 +680,7 @@ function revealOverlayWhenBgReady(win: BrowserWindow, displayId: number, isActiv
 }
 
 export function createOverlayWindows(): Map<number, BrowserWindow> {
+  trace('overlay session start')
   closeAllOverlays()
   // Remember the foreground window before any overlay grabs focus — it's the
   // "active window" that Enter confirms while the window picker is up.
@@ -747,8 +751,11 @@ export function createOverlayWindows(): Map<number, BrowserWindow> {
         win.setIgnoreMouseEvents(true, { forward: true })
       }
       win.setOpacity(1)
+      trace(`reveal display=${display.id} immediate (no bg)`)
     }
   }
+
+  trace(`bg pushed to ${overlayWindows.size} overlay(s)`)
 
   // Poll cursor position to switch active overlay when mouse moves between
   // displays. Pointless with a single display — the active overlay is already

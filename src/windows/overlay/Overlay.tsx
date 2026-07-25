@@ -242,6 +242,10 @@ export default function Overlay() {
     if (!frozenBgr) { setFrozenBgReady(false); return }
     const canvas = frozenCanvasRef.current
     if (!canvas) return
+    // Timestamp for the ack's paintMs — everything from here to the second
+    // rAF (swizzle + putImageData + two composite frames). Main subtracts it
+    // from the gate time to isolate the raw-BGRA IPC transfer cost.
+    const tReceived = performance.now()
 
     canvas.width = frozenBgr.width
     canvas.height = frozenBgr.height
@@ -267,7 +271,7 @@ export default function Overlay() {
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
         setFrozenBgReady(true)
-        window.electronAPI?.notifyOverlayBgReady?.()
+        window.electronAPI?.notifyOverlayBgReady?.(Math.round(performance.now() - tReceived))
       })
     })
     // `mode` in deps: if the React tree shifts on mode change and the canvas

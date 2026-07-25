@@ -6,6 +6,7 @@ import { startVideoCapture, requestStop as requestVideoStop, isRecordingActive }
 import { setSetting, getSettings, isRememberedMode } from './settings'
 import type { LastImageMode, LastVideoMode } from './settings'
 import { setOverlayMode } from './scroll-capture'
+import { markCaptureStart } from './capture-trace'
 
 export interface HotkeyConfig {
   [action: string]: string
@@ -147,10 +148,12 @@ export function setupHotkeys() {
   // buttons invoke, so the behavior (overlay pickers, multi-display
   // compositing, etc.) stays consistent across entry points. The lock guards
   // against re-entrancy when the user mashes the hotkey or clicks during a
-  // running capture.
-  const withLock = (fn: () => Promise<void>) => async () => {
+  // running capture. `name` stamps the latency-trace t0 (capture-trace.ts)
+  // at the earliest observable moment of the trigger.
+  const withLock = (name: string, fn: () => Promise<void>) => async () => {
     if (isCapturing) return
     if (getOverlayWindow()) return
+    markCaptureStart(name)
     isCapturing = true
     try { await fn() } finally { isCapturing = false }
   }
@@ -169,11 +172,11 @@ export function setupHotkeys() {
   }
 
   const handlers: Record<string, () => void> = {
-    RectangleRegion: withLock(async () => { rememberImage('region'); await dispatchCapture('region') }),
-    PrintScreen:     withLock(async () => { rememberImage('all-screen'); await dispatchCapture('all-screen') }),
-    ActiveWindow:    withLock(async () => { rememberImage('window'); await dispatchCapture('window') }),
-    ActiveMonitor:   withLock(async () => { rememberImage('screen'); await dispatchCapture('screen') }),
-    ScrollingCapture: withLock(async () => {
+    RectangleRegion: withLock('hotkey:RectangleRegion', async () => { rememberImage('region'); await dispatchCapture('region') }),
+    PrintScreen:     withLock('hotkey:PrintScreen', async () => { rememberImage('all-screen'); await dispatchCapture('all-screen') }),
+    ActiveWindow:    withLock('hotkey:ActiveWindow', async () => { rememberImage('window'); await dispatchCapture('window') }),
+    ActiveMonitor:   withLock('hotkey:ActiveMonitor', async () => { rememberImage('screen'); await dispatchCapture('screen') }),
+    ScrollingCapture: withLock('hotkey:ScrollingCapture', async () => {
       rememberImage('scrolling')
       const main = getMainWindow()
       if (main && !main.isDestroyed()) main.hide()
@@ -183,9 +186,9 @@ export function setupHotkeys() {
     }),
     // All three video hotkeys toggle: pressing any of them while recording
     // stops (matches Snipping Tool's UX), otherwise starts in that mode.
-    ScreenRecorder:       () => { if (isRecordingActive()) requestVideoStop(); else { rememberVideo('region'); startVideoCapture('region') } },
-    ScreenRecorderWindow: () => { if (isRecordingActive()) requestVideoStop(); else { rememberVideo('window'); startVideoCapture('window') } },
-    ScreenRecorderScreen: () => { if (isRecordingActive()) requestVideoStop(); else { rememberVideo('screen'); startVideoCapture('screen') } },
+    ScreenRecorder:       () => { if (isRecordingActive()) requestVideoStop(); else { markCaptureStart('hotkey:ScreenRecorder'); rememberVideo('region'); startVideoCapture('region') } },
+    ScreenRecorderWindow: () => { if (isRecordingActive()) requestVideoStop(); else { markCaptureStart('hotkey:ScreenRecorderWindow'); rememberVideo('window'); startVideoCapture('window') } },
+    ScreenRecorderScreen: () => { if (isRecordingActive()) requestVideoStop(); else { markCaptureStart('hotkey:ScreenRecorderScreen'); rememberVideo('screen'); startVideoCapture('screen') } },
     ExitLumia: () => { markQuitting(); app.quit() }
   }
 
@@ -211,7 +214,7 @@ export function setupHotkeys() {
   // disabled via registry — that side of the toggle lives in
   // printscreen-key.ts and is invoked from the IPC handler / boot path.
   if (getSettings().printScreenAsCapture) {
-    const handler = withLock(async () => { await dispatchLastCapture() })
+    const handler = withLock('key:PrintScreen(new-capture)', async () => { await dispatchLastCapture() })
     try { globalShortcut.register('PrintScreen', handler) }
     catch { console.warn('Failed to register PrintScreen as New Capture') }
     // macOS keyboard driver maps HID PrintScreen (usage 0x46) on external PC

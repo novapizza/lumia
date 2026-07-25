@@ -16,6 +16,7 @@ import { getDisplayIcc } from './display-icc'
 import { tagPngWithIcc } from './png-icc'
 import { captureDisplayNative, type NativeCapture } from './native-screen'
 import { macSnapAvailable } from './mac-screen-snap'
+import { markCaptureStart, trace } from './capture-trace'
 
 /** Canonical folder for original captures (both images and videos). Not
  *  user-configurable — user-chosen locations are for the Save-As dialog only,
@@ -76,7 +77,7 @@ function hideMainWindow(): Promise<void> {
     // Already hidden → no compositor work needed, skip the delay so we get
     // closer to hotkey-press time when freezing (preserves transient UI like
     // tooltips/popovers that auto-dismiss on focus change).
-    if (!win.isVisible()) { resolve(); return }
+    if (!win.isVisible()) { trace('main already hidden'); resolve(); return }
     win.hide()
     // macOS with the ScreenCaptureKit helper: the frozen snapshot excludes
     // all of Lumia's windows at the compositor level, so there's nothing to
@@ -84,10 +85,11 @@ function hideMainWindow(): Promise<void> {
     // captures and moves the frozen pixels closer to hotkey-press time.
     if (process.platform === 'darwin' && macSnapAvailable()) {
       hideWaitSkipped = true
+      trace('main hidden (settle wait skipped)')
       resolve()
       return
     }
-    setTimeout(resolve, HIDE_DELAY_MS)
+    setTimeout(() => { trace(`main hidden (waited ${HIDE_DELAY_MS}ms)`); resolve() }, HIDE_DELAY_MS)
   })
 }
 
@@ -130,7 +132,7 @@ function clearFrozenCache() {
  *  into the cached frame). Runs all displays in parallel. */
 async function freezeAllDisplays(): Promise<void> {
   clearFrozenCache()
-  const t0 = Date.now()
+  const tFreeze = Date.now()
   const allDisplays = screen.getAllDisplays()
 
   // Fast path: native capture — Windows GDI BitBlt (~5–20 ms/display), macOS
@@ -142,7 +144,7 @@ async function freezeAllDisplays(): Promise<void> {
     else fallbackDisplays.push(d)
   }))
   if (fallbackDisplays.length === 0) {
-    console.log(`[capture] freeze: ${Date.now() - t0}ms, ${allDisplays.length} display(s), all native`)
+    trace(`freeze done — ${allDisplays.length} display(s), all native (${Date.now() - tFreeze}ms)`)
     return
   }
 
@@ -180,7 +182,7 @@ async function freezeAllDisplays(): Promise<void> {
       if (src) frozenImages.set(d.id, { image: src.thumbnail })
     }
   }))
-  console.log(`[capture] freeze: ${Date.now() - t0}ms, ${allDisplays.length} display(s), ${fallbackDisplays.length} via desktopCapturer fallback`)
+  trace(`freeze done — ${allDisplays.length} display(s), ${fallbackDisplays.length} via desktopCapturer fallback (${Date.now() - tFreeze}ms)`)
 }
 
 /** One-shot warm-up of the desktopCapturer pipeline. First call after launch
@@ -257,7 +259,10 @@ export async function dispatchLastCapture() {
 }
 
 export function setupCapture() {
-  ipcMain.handle('capture:screenshot', async (_e, mode: CaptureMode) => dispatchCapture(mode))
+  ipcMain.handle('capture:screenshot', async (_e, mode: CaptureMode) => {
+    markCaptureStart(`button:${mode}`)
+    return dispatchCapture(mode)
+  })
 
   // Re-entrancy guards matching the hotkey path (hotkeys.ts withLock): ignore
   // the click while a previous dispatch is still setting up or an overlay
@@ -266,6 +271,7 @@ export function setupCapture() {
   let newCaptureInFlight = false
   ipcMain.handle('capture:new', async () => {
     if (newCaptureInFlight || getOverlayWindow()) return
+    markCaptureStart('button:new-capture')
     newCaptureInFlight = true
     try { await dispatchLastCapture() } finally { newCaptureInFlight = false }
   })

@@ -237,7 +237,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   ) => {
     ipcRenderer.on('overlay:frozen-bgra-changed', (_e, data) => cb(data))
   },
-  notifyOverlayBgReady: () => ipcRenderer.send('overlay:bg-ready'),
+  // paintMs: renderer-side decode+paint+2rAF duration, forwarded into the
+  // main-process capture-trace timeline to split IPC cost from paint cost.
+  notifyOverlayBgReady: (paintMs?: number) => ipcRenderer.send('overlay:bg-ready', paintMs),
   overlayDrawing: (drawing: boolean) => ipcRenderer.send('overlay:drawing', drawing),
   notifyRoute: (route: string) => ipcRenderer.send('app:route-changed', route),
 
