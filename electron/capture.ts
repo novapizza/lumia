@@ -130,7 +130,6 @@ function clearFrozenCache() {
  *  into the cached frame). Runs all displays in parallel. */
 async function freezeAllDisplays(): Promise<void> {
   clearFrozenCache()
-  const t0 = Date.now()
   const allDisplays = screen.getAllDisplays()
 
   // Fast path: native capture — Windows GDI BitBlt (~5–20 ms/display), macOS
@@ -141,10 +140,7 @@ async function freezeAllDisplays(): Promise<void> {
     if (nat) frozenImages.set(d.id, nat)
     else fallbackDisplays.push(d)
   }))
-  if (fallbackDisplays.length === 0) {
-    console.log(`[capture] freeze: ${Date.now() - t0}ms, ${allDisplays.length} display(s), all native`)
-    return
-  }
+  if (fallbackDisplays.length === 0) return
 
   // The native path failed under us. If hideMainWindow() skipped its settle
   // wait on the assumption the native snapshot would exclude Lumia's windows,
@@ -180,7 +176,6 @@ async function freezeAllDisplays(): Promise<void> {
       if (src) frozenImages.set(d.id, { image: src.thumbnail })
     }
   }))
-  console.log(`[capture] freeze: ${Date.now() - t0}ms, ${allDisplays.length} display(s), ${fallbackDisplays.length} via desktopCapturer fallback`)
 }
 
 /** One-shot warm-up of the desktopCapturer pipeline. First call after launch
