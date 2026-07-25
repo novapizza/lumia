@@ -16,20 +16,24 @@
 import { release } from 'os'
 import type { Display } from 'electron'
 
-/** OS window corner radius in DIP, or 0 when the platform squares corners. */
+/** Mask radius in DIP, or 0 when the platform squares corners.
+ *
+ *  Values deliberately overshoot the OS's nominal radius by a hair: the OS
+ *  draws its corner curve with ~1–1.5px of anti-aliasing, so a mask at the
+ *  exact nominal radius leaves a glaring semi-transparent halo of background
+ *  along the curve, while overshooting only shaves an invisible sliver off
+ *  the window's own chrome (title-bar corners are uniformly colored). */
 function windowCornerRadiusDip(): number {
   if (process.platform === 'darwin') {
-    // Standard macOS window radius is ~10pt (Big Sur → Sequoia). macOS 26
-    // "Tahoe" rounds more aggressively, but a mask radius LARGER than the
-    // real one eats window content, while a smaller one only leaves a sliver
-    // of background at the extreme corner tips — so stay conservative and
-    // bump per-version once the Tahoe value is pinned down.
-    return 10
+    // Darwin 25 == macOS 26 "Tahoe", whose Liquid Glass windows round at
+    // ~26pt — far beyond the ~10–11pt of Big Sur → Sequoia.
+    const darwinMajor = Number(release().split('.')[0] ?? 0)
+    return darwinMajor >= 25 ? 26 : 12
   }
   if (process.platform === 'win32') {
-    // Windows 11 (build 22000+) rounds top-level windows at 8 DIP.
+    // Windows 11 (build 22000+) rounds top-level windows at a nominal 8 DIP.
     const build = Number(release().split('.')[2] ?? 0)
-    return build >= 22000 ? 8 : 0
+    return build >= 22000 ? 10 : 0
   }
   return 0
 }
