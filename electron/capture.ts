@@ -16,6 +16,7 @@ import { getDisplayIcc } from './display-icc'
 import { tagPngWithIcc } from './png-icc'
 import { captureDisplayNative, type NativeCapture } from './native-screen'
 import { macSnapAvailable } from './mac-screen-snap'
+import { pickCornerRadiusPhys, maskCornersInPlace } from './rounded-corners'
 
 /** Canonical folder for original captures (both images and videos). Not
  *  user-configurable — user-chosen locations are for the Save-As dialog only,
@@ -130,7 +131,6 @@ function clearFrozenCache() {
  *  into the cached frame). Runs all displays in parallel. */
 async function freezeAllDisplays(): Promise<void> {
   clearFrozenCache()
-  const t0 = Date.now()
   const allDisplays = screen.getAllDisplays()
 
   // Fast path: native capture — Windows GDI BitBlt (~5–20 ms/display), macOS
@@ -141,10 +141,7 @@ async function freezeAllDisplays(): Promise<void> {
     if (nat) frozenImages.set(d.id, nat)
     else fallbackDisplays.push(d)
   }))
-  if (fallbackDisplays.length === 0) {
-    console.log(`[capture] freeze: ${Date.now() - t0}ms, ${allDisplays.length} display(s), all native`)
-    return
-  }
+  if (fallbackDisplays.length === 0) return
 
   // The native path failed under us. If hideMainWindow() skipped its settle
   // wait on the assumption the native snapshot would exclude Lumia's windows,
@@ -180,7 +177,6 @@ async function freezeAllDisplays(): Promise<void> {
       if (src) frozenImages.set(d.id, { image: src.thumbnail })
     }
   }))
-  console.log(`[capture] freeze: ${Date.now() - t0}ms, ${allDisplays.length} display(s), ${fallbackDisplays.length} via desktopCapturer fallback`)
 }
 
 /** One-shot warm-up of the desktopCapturer pipeline. First call after launch
@@ -328,8 +324,9 @@ export function setupCapture() {
 
       // Native layer returns a rect in virtual-screen PHYSICAL pixels. The
       // resolver clips it to the overlay's display (maximized windows extend
-      // ~8px past monitor edges via DWM's invisible resize border), bites past
-      // Win11 rounded corners, and converts to display-local DIP.
+      // ~8px past monitor edges via DWM's invisible resize border) and
+      // converts to display-local DIP. Win11's rounded corners are erased to
+      // transparency at capture time (rounded-corners.ts).
       const raw = getWindowAtPointPhysical(physPt.x, physPt.y)
       if (!raw) return null
 
@@ -354,9 +351,14 @@ export function setupCapture() {
     lastWindowPickPhysical = null
     resetOverlayMode()
     closeAllOverlays()
+    // Erase the window's rounded corners to transparency so the crop matches
+    // what was actually on screen (macOS always rounds; Win11 when unmaximized).
+    const displayId = cached?.displayId ?? overlayId
+    const display = screen.getAllDisplays().find(d => d.id === displayId) ?? screen.getPrimaryDisplay()
+    const cornerRadius = pickCornerRadiusPhys(rect, display)
     const dataUrl = cached
-      ? await capturePhysicalRect(cached)
-      : await captureRect(rect, overlayId)
+      ? await capturePhysicalRect(cached, cornerRadius)
+      : await captureRect(rect, overlayId, cornerRadius)
     clearFrozenCache()
     await sendCaptureToEditor(dataUrl, 'window', cached?.displayId ?? overlayId ?? undefined)
     return dataUrl
@@ -544,9 +546,11 @@ async function captureAllScreen(): Promise<string> {
 /** Capture a resolved pick target from the frozen snapshot and hand it to the
  *  editor. Shared by the single-window fast path and Enter-to-confirm. */
 async function captureWindowTarget(target: PickTarget): Promise<string> {
+  const display = screen.getAllDisplays().find(d => d.id === target.displayId) ?? screen.getPrimaryDisplay()
+  const cornerRadius = pickCornerRadiusPhys(target.rect, display)
   const dataUrl = target.physRect
-    ? await capturePhysicalRect(target.physRect)
-    : await captureRect(target.rect, target.displayId)
+    ? await capturePhysicalRect(target.physRect, cornerRadius)
+    : await captureRect(target.rect, target.displayId, cornerRadius)
   clearFrozenCache()
   await sendCaptureToEditor(dataUrl, 'window', target.displayId)
   return dataUrl
@@ -597,10 +601,23 @@ async function captureRegion(): Promise<void> {
   }
 }
 
+/** PNG-encode a cropped capture. When `cornerRadiusPhys` > 0 (window captures
+ *  only — region/monitor crops stay square), the corners outside the window's
+ *  rounded outline are erased to transparency first. */
+function encodeCrop(cropped: Electron.NativeImage, cornerRadiusPhys?: number): string {
+  if (cornerRadiusPhys && cornerRadiusPhys > 0) {
+    const size = cropped.getSize()
+    const bmp = cropped.toBitmap()
+    maskCornersInPlace(bmp, size.width, size.height, cornerRadiusPhys)
+    return nativeImage.createFromBitmap(bmp, size).toDataURL()
+  }
+  return cropped.toDataURL()
+}
+
 // Crop directly in physical pixels against the target display's native
 // thumbnail. Takes a rect in virtual-screen physical coords (the same space
 // getWindowAtPointPhysical returns).
-async function capturePhysicalRect(rect: { x: number; y: number; width: number; height: number; displayId: number }): Promise<string> {
+async function capturePhysicalRect(rect: { x: number; y: number; width: number; height: number; displayId: number }, cornerRadiusPhys?: number): Promise<string> {
   const allDisplays = screen.getAllDisplays()
   const target = allDisplays.find(d => d.id === rect.displayId) ?? screen.getPrimaryDisplay()
   const sf = target.scaleFactor || 1
@@ -630,10 +647,10 @@ async function capturePhysicalRect(rect: { x: number; y: number; width: number; 
   const cropW = Math.max(1, Math.min(fullSize.width  - cropX, Math.round(rect.width  * sx)))
   const cropH = Math.max(1, Math.min(fullSize.height - cropY, Math.round(rect.height * sy)))
 
-  return fullImg.crop({ x: cropX, y: cropY, width: cropW, height: cropH }).toDataURL()
+  return encodeCrop(fullImg.crop({ x: cropX, y: cropY, width: cropW, height: cropH }), cornerRadiusPhys)
 }
 
-async function captureRect(rect: { x: number; y: number; width: number; height: number }, displayId?: number | null): Promise<string> {
+async function captureRect(rect: { x: number; y: number; width: number; height: number }, displayId?: number | null, cornerRadiusPhys?: number): Promise<string> {
   const allDisplays = screen.getAllDisplays()
   const overlayId = displayId ?? getOverlayDisplayId()
   const targetDisplay = allDisplays.find(d => d.id === overlayId) ?? screen.getPrimaryDisplay()
@@ -664,7 +681,7 @@ async function captureRect(rect: { x: number; y: number; width: number; height: 
   const cropH = Math.max(1, Math.min(fullSize.height - cropY, Math.round(rect.height * sy)))
 
   const cropped = fullImg.crop({ x: cropX, y: cropY, width: cropW, height: cropH })
-  return cropped.toDataURL()
+  return encodeCrop(cropped, cornerRadiusPhys)
 }
 
 async function captureDisplay(display: Electron.Display, allDisplays: Electron.Display[]): Promise<string> {

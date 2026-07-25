@@ -2,10 +2,11 @@
 node_modules/
 
 # Compiled native helpers (built from .swift source via build/compile-mac-helpers.sh
-# in CI, or locally before first dev run on macOS)
-electron/helpers/ocr-vision
-electron/helpers/scroll-helper
-electron/helpers/window-at-point
+# in CI, or locally before first dev run on macOS). Only the .swift sources are
+# tracked — ignoring everything else covers new helpers and the per-arch .tmp
+# intermediates automatically.
+electron/helpers/*
+!electron/helpers/*.swift
 
 # Build outputs
 out/

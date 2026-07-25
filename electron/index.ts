@@ -341,6 +341,19 @@ export function restoreFromOverlayCancel() {
   }
 }
 
+// Parked (between-captures) overlay opacity. Windows: 0 — its occlusion
+// tracker still treats alpha-0 layered windows as visible, so the renderer
+// keeps compositing. macOS: NSWindow documents fully-transparent (alpha 0)
+// windows as OCCLUDED, and Chromium halts the renderer's BeginFrame/rAF loop
+// for occluded windows (independent of backgroundThrottling). That deadlocks
+// the reveal: the bg-ready ack fires from inside a double-rAF, but frames only
+// resume once opacity lifts — which waits on the ack — so every capture used
+// to stall out the full fallback timeout (~1.5s perceived as "overlay takes
+// 2s to appear"). Park at a sub-perceptual alpha instead: WindowServer counts
+// any alpha > 0 as visible, the compositor keeps ticking, and the parked
+// frame (≤0.2% of the previous capture) is imperceptible.
+const PARKED_OPACITY = process.platform === 'darwin' ? 0.002 : 0
+
 export function closeAllOverlays() {
   if (overlayPollTimer) {
     clearInterval(overlayPollTimer)
@@ -350,15 +363,15 @@ export function closeAllOverlays() {
   // Snipping-Tool-style opacity trick: instead of win.hide() (which incurs
   // DWM fade-out + drops the alpha compositor for the renderer's frame,
   // causing the next show to flicker as the pipeline warms back up), keep
-  // the overlay "shown" in DWM at opacity 0 over its display. The renderer
-  // stays composited; ramping opacity back to 1 next capture is instant.
-  // We intentionally do NOT setBounds off-screen — Electron's per-monitor
-  // DPI tracking can get scrambled on Windows when a window is moved
-  // between monitors with different scale factors, manifesting as a
+  // the overlay "shown" in DWM at (near-)zero opacity over its display. The
+  // renderer stays composited; ramping opacity back to 1 next capture is
+  // instant. We intentionally do NOT setBounds off-screen — Electron's
+  // per-monitor DPI tracking can get scrambled on Windows when a window is
+  // moved between monitors with different scale factors, manifesting as a
   // mis-scaled snapshot when the overlay returns to its display.
   for (const [, win] of overlayWindows) {
     if (win.isDestroyed()) continue
-    win.setOpacity(0)
+    win.setOpacity(PARKED_OPACITY)
     // Drop `forward: true` while parked — with it set, Chromium keeps
     // dispatching mouse-move to the renderer, and the renderer's CSS
     // `cursor: 'crosshair'` then bleeds through over apps below the
@@ -568,7 +581,7 @@ function addOverlayToPool(display: Electron.Display): BrowserWindow {
       registerOverlayHwnd(hwnd)
       disableDwmTransitions(win)
     }
-    win.setOpacity(0)
+    win.setOpacity(PARKED_OPACITY)
     // No `forward` — pool windows are parked invisible at this point; we
     // want cursor hit-test to fall through (otherwise the renderer's
     // crosshair cursor leaks over apps below).
@@ -620,10 +633,12 @@ export function setupOverlayPool() {
 // Wait for the renderer to ack that the frozen bg is decoded + painted, then
 // ramp opacity to 1 in one shot. Without the gate, opacity flips before the
 // renderer has committed the new bg → user sees a stale frame from the
-// previous capture for one composite cycle. Falls back after a generous
-// timeout so a renderer hang doesn't strand the user with an invisible
-// overlay.
-const BG_READY_TIMEOUT_MS = 1500
+// previous capture for one composite cycle. Falls back after a timeout so a
+// renderer hang doesn't strand the user with an invisible overlay. The ack
+// normally lands within a few frames (parked overlays keep compositing — see
+// PARKED_OPACITY), so the timeout is pure safety net; keep it short enough
+// that even the degenerate path feels responsive.
+const BG_READY_TIMEOUT_MS = 600
 
 function revealOverlayWhenBgReady(win: BrowserWindow, displayId: number, isActive: boolean): void {
   const wcId = win.webContents.id

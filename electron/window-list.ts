@@ -27,8 +27,8 @@ export interface PickTarget {
 
 /**
  * Win32: clip a raw window rect (virtual-screen physical pixels, as returned
- * by getWindowAtPointPhysical / listTopLevelWindowsPhysical) to one display,
- * biting past Win11's rounded corners, and convert to display-local DIP.
+ * by getWindowAtPointPhysical / listTopLevelWindowsPhysical) to one display
+ * and convert to display-local DIP.
  * Extracted from the window-pick:get-window-at handler — behavior identical.
  */
 export function resolveWin32PickRect(
@@ -40,15 +40,15 @@ export function resolveWin32PickRect(
   const displayPhysW = Math.round(display.size.width  * sf)
   const displayPhysH = Math.round(display.size.height * sf)
 
-  // Win11 apps have ~8 DIP rounded corners; DWM's rectangular frame bounds
-  // encloses them so wallpaper pokes through the 4 corners of the crop.
-  // Inset by a couple physical px to bite past the corner curvature without
-  // eating visible window content.
-  const cornerInset = Math.max(1, Math.round(2 * sf))
-  const pLeft   = Math.max(displayPhysOrigin.x, raw.x + cornerInset)
-  const pTop    = Math.max(displayPhysOrigin.y, raw.y + cornerInset)
-  const pRight  = Math.min(displayPhysOrigin.x + displayPhysW, raw.x + raw.width  - cornerInset)
-  const pBottom = Math.min(displayPhysOrigin.y + displayPhysH, raw.y + raw.height - cornerInset)
+  // DWM's rectangular frame bounds encloses Win11's ~8 DIP rounded corners,
+  // so the crop's corners would show wallpaper. That used to be papered over
+  // with a 2px inset here (losing a sliver of content on every edge); the
+  // corners are now erased to transparency at capture time instead
+  // (rounded-corners.ts), so the rect stays exact.
+  const pLeft   = Math.max(displayPhysOrigin.x, raw.x)
+  const pTop    = Math.max(displayPhysOrigin.y, raw.y)
+  const pRight  = Math.min(displayPhysOrigin.x + displayPhysW, raw.x + raw.width)
+  const pBottom = Math.min(displayPhysOrigin.y + displayPhysH, raw.y + raw.height)
   if (pRight <= pLeft || pBottom <= pTop) return null
 
   // Convert clipped physical → DIP for the overlay highlight / DIP consumers.
