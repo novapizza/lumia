@@ -117,7 +117,9 @@ export default function Dashboard() {
       })
     }
     window.electronAPI?.getSettings().then(s => {
-      if (s?.lastCaptureKind === 'video' || s?.lastCaptureKind === 'image' || s?.lastCaptureKind === 'scroll') {
+      // Scroll is never remembered as the active kind (it's a deliberate
+      // capture), so only restore the Image / Video tab across launches.
+      if (s?.lastCaptureKind === 'video' || s?.lastCaptureKind === 'image') {
         setMediaKind(s.lastCaptureKind)
       }
       if (s?.scrollCaptureMethod === 'extension' || s?.scrollCaptureMethod === 'screen') {
@@ -167,7 +169,9 @@ export default function Dashboard() {
 
   const selectMediaKind = (kind: MediaKind) => {
     setMediaKind(kind)
-    window.electronAPI?.setSetting('lastCaptureKind', kind)
+    // Scroll is a deliberate, explicit capture — never remember it as the kind
+    // that "New Capture" / PrtSc replays. Only image/video are remembered.
+    if (kind !== 'scroll') window.electronAPI?.setSetting('lastCaptureKind', kind)
   }
 
   const handleCapture = async (mode: CaptureMode) => {
@@ -192,7 +196,9 @@ export default function Dashboard() {
 
   const handleScroll = async (method: ScrollMethod) => {
     setScrollMethod(method)
-    window.electronAPI?.setSetting('lastCaptureKind', 'scroll')
+    // Deliberately do NOT persist lastCaptureKind='scroll' — scroll must not
+    // become the mode that "New Capture" / PrtSc replays. Only the chosen
+    // method is remembered (for the next explicit scroll capture).
     window.electronAPI?.setSetting('scrollCaptureMethod', method)
     const r = await window.electronAPI?.launchScrollCapture?.(method)
     // Explicit extension request with no extension attached → open setup help

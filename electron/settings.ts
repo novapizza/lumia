@@ -11,10 +11,11 @@ export type ScrollCaptureMethod = 'extension' | 'screen'
 /** Deliberate remember policy: only explicit Region / Window picks update the
  *  IMAGE replay mode that "New Capture" / PrtSc re-run. Screen / all-screen
  *  are one-shots — they still flip lastCaptureKind, but New Capture should
- *  never replay an all-monitor grab. Scroll is its own capture kind
- *  (lastCaptureKind === 'scroll') and DOES replay — dispatchLastCapture
- *  routes it through launchScrollCapture, like video replays its mode.
- *  Enforced at every write site: the settings:set IPC handler (renderer
+ *  never replay an all-monitor grab. Scroll is a deliberate capture (Dashboard
+ *  Scroll tab / browser extension) and is NEVER remembered — the renderer
+ *  doesn't persist lastCaptureKind='scroll' and dispatchLastCapture ignores
+ *  it, so New Capture / PrtSc replay the last image/video capture instead of a
+ *  scroll. Enforced at every write site: the settings:set IPC handler (renderer
  *  writers — Dashboard, overlay ModeBar) and hotkeys' remember helpers, plus
  *  a load-time normalization below for values persisted by older builds. */
 export function isRememberedMode(mode: unknown): mode is 'region' | 'window' {

@@ -5,7 +5,7 @@ import { getMainWindow, createOverlayWindows, closeAllOverlays, getHistoryStore,
 import { getWindowAtPointPhysical } from './native-input'
 import { getMacWindowAtPoint } from './mac-window-pick'
 import { resolveWin32PickRect, resolveMacPickRect, getSinglePickTarget, getActivePickTarget, PickTarget } from './window-list'
-import { setOverlayMode, resetOverlayMode, getOverlayMode, launchScrollCapture } from './scroll-capture'
+import { setOverlayMode, resetOverlayMode, getOverlayMode } from './scroll-capture'
 import { localTimestamp } from './utils'
 import { makeThumbnail } from './thumbnail'
 import { showNotification } from './notify'
@@ -241,13 +241,11 @@ export async function dispatchLastCapture() {
     await startVideoCapture(s.lastVideoMode)
     return
   }
-  // Scroll is a first-class capture kind; `lastImageMode === 'scrolling'`
-  // covers values persisted by older builds before the split.
-  if (s.lastCaptureKind === 'scroll' || s.lastImageMode === 'scrolling') {
-    await launchScrollCapture()
-    return
-  }
-  dispatchCapture(s.lastImageMode)
+  // Scroll is a deliberate capture — started from the Dashboard Scroll tab or
+  // the browser extension — never a remembered mode, so "New Capture" / PrtSc
+  // must not replay it. Fall back to a normal image capture (legacy 'scrolling'
+  // values from older builds → region).
+  dispatchCapture(s.lastImageMode === 'scrolling' ? 'region' : s.lastImageMode)
 }
 
 export function setupCapture() {
