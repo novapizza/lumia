@@ -54,7 +54,14 @@ is hidden for the instant each frame is photographed (the blocker is
 transparent and never flickers), so nothing extension-drawn appears in the
 result.
 
-## Install (Load unpacked)
+## Install
+
+**From the Chrome Web Store (recommended)** — once the listing is public, use the
+**Add to Chrome** button on Lumia's Dashboard → Scroll → Browser Extension card
+(or the store page directly). Works in Chrome, Edge, Brave, Opera, and other
+Chromium browsers, and auto-updates.
+
+**Load unpacked (developer)** — for local builds / before the store listing is live:
 
 1. Open `chrome://extensions` (or `edge://extensions`).
 2. Turn on **Developer mode** (top-right toggle).

@@ -14,6 +14,12 @@ type ScrollMethod = 'extension' | 'screen'
 type FilterType = 'all' | 'screenshot' | 'recording'
 type ViewMode = 'grid' | 'list'
 
+// Public Chrome Web Store listing for the Lumia Scroll Capture extension.
+// Fill this in once the item is approved — the URL is
+// `https://chromewebstore.google.com/detail/<extension-id>`. While it's empty
+// the setup panel shows the manual "Load unpacked" flow only (no store button).
+const CHROME_WEB_STORE_URL = ''
+
 // Map capture mode → hotkey action name (from electron/hotkeys.ts)
 const MODE_ACTION: Record<CaptureMode, string> = {
   region: 'RectangleRegion',
@@ -491,29 +497,63 @@ export default function Dashboard() {
             </div>
 
             {showExtSetup && !extStatus.connected && (
-              <div className="max-w-xl p-4 rounded-xl bg-secondary/[0.06] border border-secondary/15 space-y-2">
+              <div className="max-w-xl p-4 rounded-xl bg-secondary/[0.06] border border-secondary/15 space-y-3">
                 <div className="flex items-center justify-between">
                   <p className="text-xs font-bold text-white" style={{ fontFamily: 'Manrope, sans-serif' }}>
-                    Set up the browser extension
+                    Install the browser extension
                   </p>
                   <button onClick={() => setShowExtSetup(false)} className="text-slate-500 hover:text-white transition-colors">
                     <span className="material-symbols-outlined text-sm">close</span>
                   </button>
                 </div>
-                <ol className="text-[11px] text-slate-400 space-y-1 list-decimal list-inside">
-                  <li>Open the extension folder below.</li>
-                  <li>Go to <span className="text-slate-300 font-mono">chrome://extensions</span> and enable <span className="text-slate-300">Developer mode</span>.</li>
-                  <li>Click <span className="text-slate-300">Load unpacked</span> and select the folder.</li>
-                  <li>Keep Lumia running — the status dot turns green within a few seconds.</li>
-                </ol>
-                <button
-                  onClick={() => window.electronAPI?.openScrollExtensionFolder?.()}
-                  className="mt-1 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-semibold bg-secondary/15 text-secondary hover:bg-secondary/25 transition-all"
-                  style={{ fontFamily: 'Manrope, sans-serif' }}
-                >
-                  <span className="material-symbols-outlined text-sm">folder_open</span>
-                  Open Extension Folder
-                </button>
+                <p className="text-[11px] text-slate-400 leading-relaxed">
+                  Capture scrolling screenshots straight from your browser. Install once — Lumia connects
+                  automatically and the dot above turns green.
+                </p>
+
+                {/* Primary: one-click Chrome Web Store install (Chromium browsers) */}
+                {CHROME_WEB_STORE_URL ? (
+                  <div className="space-y-1.5">
+                    <button
+                      onClick={() => window.electronAPI?.openExternal?.(CHROME_WEB_STORE_URL)}
+                      className="inline-flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs font-bold primary-gradient text-slate-900 hover:opacity-90 active:scale-[0.98] transition-all"
+                      style={{ fontFamily: 'Manrope, sans-serif' }}
+                    >
+                      <span className="material-symbols-outlined text-sm">extension</span>
+                      Add to Chrome
+                    </button>
+                    <p className="text-[10px] text-slate-500">Also works in Edge, Brave, Opera, and other Chromium browsers.</p>
+                  </div>
+                ) : (
+                  <p className="text-[10px] text-slate-500 italic">A one-click Chrome Web Store install is on the way. For now, load it manually:</p>
+                )}
+
+                {/* Secondary: manual load-unpacked, collapsed once the store link exists */}
+                <details open={!CHROME_WEB_STORE_URL} className="group">
+                  <summary className="cursor-pointer select-none text-[11px] font-semibold text-slate-300 hover:text-white transition-colors">
+                    Install manually (developer mode)
+                  </summary>
+                  <ol className="mt-2 text-[11px] text-slate-400 space-y-1 list-decimal list-inside">
+                    <li>Open the extension folder below.</li>
+                    <li>Go to <span className="text-slate-300 font-mono">chrome://extensions</span> and enable <span className="text-slate-300">Developer mode</span>.</li>
+                    <li>Click <span className="text-slate-300">Load unpacked</span> and select the folder.</li>
+                    <li>Keep Lumia running — the status dot turns green within a few seconds.</li>
+                  </ol>
+                  <button
+                    onClick={() => window.electronAPI?.openScrollExtensionFolder?.()}
+                    className="mt-2 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-semibold bg-secondary/15 text-secondary hover:bg-secondary/25 transition-all"
+                    style={{ fontFamily: 'Manrope, sans-serif' }}
+                  >
+                    <span className="material-symbols-outlined text-sm">folder_open</span>
+                    Open Extension Folder
+                  </button>
+                </details>
+
+                {/* Live connection status */}
+                <div className="flex items-center gap-1.5 pt-0.5">
+                  <span className="w-1.5 h-1.5 rounded-full bg-slate-600 animate-pulse flex-shrink-0" />
+                  <span className="text-[10px] text-slate-500">Waiting for the extension to connect…</span>
+                </div>
               </div>
             )}
           </div>
