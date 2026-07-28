@@ -89,6 +89,7 @@ export default function Dashboard() {
   const [scrollMethod, setScrollMethod] = useState<ScrollMethod>('screen')
   const [extStatus, setExtStatus] = useState<{ connected: boolean; browsers: string[] }>({ connected: false, browsers: [] })
   const [showExtSetup, setShowExtSetup] = useState(false)
+  const [storeUrlCopied, setStoreUrlCopied] = useState(false)
   const [showBrowserPicker, setShowBrowserPicker] = useState(false)
   const [viewMode, setViewMode] = useState<ViewMode>(() =>
     (localStorage.getItem('lumia:history-view') as ViewMode) || 'grid'
@@ -526,15 +527,32 @@ export default function Dashboard() {
                 {/* Primary: one-click Chrome Web Store install (Chromium browsers) */}
                 {CHROME_WEB_STORE_URL ? (
                   <div className="space-y-1.5">
-                    <button
-                      onClick={() => window.electronAPI?.openExternal?.(CHROME_WEB_STORE_URL)}
-                      className="inline-flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs font-bold primary-gradient text-slate-900 hover:opacity-90 active:scale-[0.98] transition-all"
-                      style={{ fontFamily: 'Manrope, sans-serif' }}
-                    >
-                      <span className="material-symbols-outlined text-sm">extension</span>
-                      Add to Chrome
-                    </button>
-                    <p className="text-[10px] text-slate-500">Also works in Edge, Brave, Opera, and other Chromium browsers.</p>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <button
+                        onClick={() => window.electronAPI?.openExternal?.(CHROME_WEB_STORE_URL)}
+                        className="inline-flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs font-bold primary-gradient text-slate-900 hover:opacity-90 active:scale-[0.98] transition-all"
+                        style={{ fontFamily: 'Manrope, sans-serif' }}
+                      >
+                        <span className="material-symbols-outlined text-sm">extension</span>
+                        Add to Chrome
+                      </button>
+                      <button
+                        onClick={async () => {
+                          await window.electronAPI?.writeClipboardText?.(CHROME_WEB_STORE_URL)
+                          setStoreUrlCopied(true)
+                          setTimeout(() => setStoreUrlCopied(false), 1600)
+                        }}
+                        className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold bg-white/[0.06] border border-white/10 text-slate-200 hover:bg-white/10 active:scale-[0.98] transition-all"
+                        style={{ fontFamily: 'Manrope, sans-serif' }}
+                      >
+                        <span className="material-symbols-outlined text-sm">{storeUrlCopied ? 'check' : 'content_copy'}</span>
+                        {storeUrlCopied ? 'Copied' : 'Copy link'}
+                      </button>
+                    </div>
+                    <p className="text-[10px] text-slate-500">
+                      Opens in your default browser — if that isn't Chrome, copy the link and paste it into the
+                      browser you want. Works in Edge, Brave, Opera, and other Chromium browsers.
+                    </p>
                   </div>
                 ) : (
                   <p className="text-[10px] text-slate-500 italic">A one-click Chrome Web Store install is on the way. For now, load it manually:</p>
