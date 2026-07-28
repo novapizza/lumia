@@ -496,7 +496,19 @@ export default function Dashboard() {
               </button>
             </div>
 
-            {showExtSetup && !extStatus.connected && (
+            {/* Always-available entry to the install guide — so you can add the
+                 extension to another browser or profile even when one is
+                 already connected. */}
+            <button
+              onClick={() => setShowExtSetup(v => !v)}
+              className="inline-flex items-center gap-1.5 text-[11px] font-medium text-slate-500 hover:text-secondary transition-colors"
+              style={{ fontFamily: 'Manrope, sans-serif' }}
+            >
+              <span className="material-symbols-outlined text-sm">{showExtSetup ? 'expand_less' : 'add'}</span>
+              {extStatus.connected ? 'Install on another browser or profile' : 'How to install the extension'}
+            </button>
+
+            {showExtSetup && (
               <div className="max-w-xl p-4 rounded-xl bg-secondary/[0.06] border border-secondary/15 space-y-3">
                 <div className="flex items-center justify-between">
                   <p className="text-xs font-bold text-white" style={{ fontFamily: 'Manrope, sans-serif' }}>
@@ -507,8 +519,8 @@ export default function Dashboard() {
                   </button>
                 </div>
                 <p className="text-[11px] text-slate-400 leading-relaxed">
-                  Capture scrolling screenshots straight from your browser. Install once — Lumia connects
-                  automatically and the dot above turns green.
+                  Capture scrolling screenshots straight from your browser. Install it in each browser or
+                  profile you want to use — Lumia connects automatically and the dot turns green.
                 </p>
 
                 {/* Primary: one-click Chrome Web Store install (Chromium browsers) */}
@@ -550,10 +562,21 @@ export default function Dashboard() {
                 </details>
 
                 {/* Live connection status */}
-                <div className="flex items-center gap-1.5 pt-0.5">
-                  <span className="w-1.5 h-1.5 rounded-full bg-slate-600 animate-pulse flex-shrink-0" />
-                  <span className="text-[10px] text-slate-500">Waiting for the extension to connect…</span>
-                </div>
+                {extStatus.connected ? (
+                  <div className="flex items-center gap-1.5 pt-0.5">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 flex-shrink-0" />
+                    <span className="text-[10px] text-emerald-400">
+                      Connected{extStatus.browsers.length
+                        ? ` · ${extStatus.browsers.length > 1 ? `${extStatus.browsers.length} browsers` : extStatus.browsers[0]}`
+                        : ''} — install it in another browser or profile above to add it there too.
+                    </span>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-1.5 pt-0.5">
+                    <span className="w-1.5 h-1.5 rounded-full bg-slate-600 animate-pulse flex-shrink-0" />
+                    <span className="text-[10px] text-slate-500">Waiting for the extension to connect…</span>
+                  </div>
+                )}
               </div>
             )}
           </div>
