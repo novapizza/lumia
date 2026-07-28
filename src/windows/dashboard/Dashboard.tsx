@@ -14,11 +14,11 @@ type ScrollMethod = 'extension' | 'screen'
 type FilterType = 'all' | 'screenshot' | 'recording'
 type ViewMode = 'grid' | 'list'
 
-// Public Chrome Web Store listing for the Lumia Scroll Capture extension.
-// Fill this in once the item is approved — the URL is
-// `https://chromewebstore.google.com/detail/<extension-id>`. While it's empty
-// the setup panel shows the manual "Load unpacked" flow only (no store button).
-const CHROME_WEB_STORE_URL = ''
+// Public Chrome Web Store listing for the Lumia Scroll Capture extension, from
+// RENDERER_VITE_CHROME_WEB_STORE_URL in .env (baked into the renderer at build
+// time; e.g. https://chromewebstore.google.com/detail/<extension-id>). When
+// unset the setup panel shows the manual "Load unpacked" flow only.
+const CHROME_WEB_STORE_URL = import.meta.env.RENDERER_VITE_CHROME_WEB_STORE_URL ?? ''
 
 // Map capture mode → hotkey action name (from electron/hotkeys.ts)
 const MODE_ACTION: Record<CaptureMode, string> = {

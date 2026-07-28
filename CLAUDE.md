@@ -189,4 +189,7 @@ Custom CSS design tokens in `src/index.css`. Key utility classes: `.glass-refrac
 - `MAIN_VITE_GDRIVE_API_KEY`, `MAIN_VITE_GDRIVE_PROJECT_NUMBER` — Google Picker API (in-app Drive folder browser)
 - `MAIN_VITE_UNSPLASH_ACCESS_KEY` — Unsplash API for the in-app Wallpapers browser
 
+`RENDERER_VITE_*` vars are baked into the **renderer** bundle instead (electron-vite exposes them via `import.meta.env`; typed in `src/vite-env.d.ts`):
+- `RENDERER_VITE_CHROME_WEB_STORE_URL` — public Chrome Web Store listing for the scroll-capture extension; the Dashboard's "Add to Chrome" setup button appears only when set.
+
 These are **not** user-facing settings — distributing the app means embedding R2/Drive credentials in the bundle. Per-user state (refresh tokens, folder IDs) lives in `settings.json`.
