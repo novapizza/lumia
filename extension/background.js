@@ -533,6 +533,14 @@ function lumiaPrep(maxFrames, mode) {
       for (let i = 0; i < n; i++) {
         const el = all[i]
         if (el === styleEl) continue
+        // Never neutralize the scroller itself or an ancestor that wraps it.
+        // Some scroll panes live inside a fixed/sticky container (the AWS EC2
+        // details drawer is fixed + bottom-anchored); hiding or flattening that
+        // container would blank out the very region we're capturing. `.contains`
+        // stops at frame boundaries, so the top-doc iframe host is guarded
+        // separately.
+        if (!isDoc && (el === scroller || el.contains(scroller) ||
+            (iframeEl && (el === iframeEl || el.contains(iframeEl))))) continue
         const cs = view.getComputedStyle(el)
         if (cs.position === 'fixed') {
           if (cs.display === 'none' || cs.visibility === 'hidden') continue
