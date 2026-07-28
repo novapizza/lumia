@@ -2,7 +2,7 @@ import { desktopCapturer, ipcMain, screen, nativeImage, clipboard } from 'electr
 import { homedir } from 'os'
 import { join } from 'path'
 import { getMainWindow, createOverlayWindows, closeAllOverlays, getHistoryStore, getOverlayDisplayId, getOverlayWindow, broadcastToOverlays, restoreFromOverlayCancel, waitForViewMounted, openHistoryItemInEditor, isMainDismissed } from './index'
-import { getWindowAtPointPhysical } from './native-input'
+import { getWindowAtPointPhysical, focusOwnWindowForeground } from './native-input'
 import { getMacWindowAtPoint } from './mac-window-pick'
 import { resolveWin32PickRect, resolveMacPickRect, getSinglePickTarget, getActivePickTarget, PickTarget } from './window-list'
 import { setOverlayMode, resetOverlayMode, getOverlayMode } from './scroll-capture'
@@ -197,6 +197,12 @@ function showMainWindow() {
   if (!win || win.isDestroyed()) return
   win.show()
   win.focus()
+  // win.focus() alone can't steal the foreground when another process holds it
+  // — e.g. after an extension scroll capture the browser is still foreground
+  // and Lumia hid itself during the capture (so it's a background process).
+  // A native AttachThreadInput + SetForegroundWindow lifts that lock. No-op on
+  // non-Windows / when we already hold the foreground.
+  focusOwnWindowForeground(win)
 }
 
 function findSourceForDisplay(

@@ -39,6 +39,9 @@ let _GetWindowLongW: (hwnd: any, index: number) => number
 let _GetWindow: (hwnd: any, uCmd: number) => any
 let _GetTopWindow: (hwnd: any) => any
 let _GetForegroundWindow: () => any
+let _AttachThreadInput: (idAttach: number, idAttachTo: number, fAttach: boolean) => boolean
+let _BringWindowToTop: (hwnd: any) => boolean
+let _GetCurrentThreadId: () => number
 let _GetWindowThreadProcessId: (hwnd: any, pid: any) => number
 let _GetClassNameW: (hwnd: any, buf: any, maxCount: number) => number
 let _GetWindowTextLengthW: (hwnd: any) => number
@@ -90,6 +93,9 @@ function ensureLoaded(): boolean {
     _GetWindow       = user32.func('intptr_t __stdcall GetWindow(intptr_t hWnd, uint32_t uCmd)')
     _GetTopWindow    = user32.func('intptr_t __stdcall GetTopWindow(intptr_t hWnd)')
     _GetForegroundWindow = user32.func('intptr_t __stdcall GetForegroundWindow()')
+    _AttachThreadInput = user32.func('bool __stdcall AttachThreadInput(uint32_t idAttach, uint32_t idAttachTo, bool fAttach)')
+    _BringWindowToTop = user32.func('bool __stdcall BringWindowToTop(intptr_t hWnd)')
+    _GetCurrentThreadId = koffi.load('kernel32.dll').func('uint32_t __stdcall GetCurrentThreadId()')
     _GetWindowThreadProcessId = user32.func('uint32_t __stdcall GetWindowThreadProcessId(intptr_t hWnd, _Out_ uint32_t *lpdwProcessId)')
     _GetClassNameW   = user32.func('int __stdcall GetClassNameW(intptr_t hWnd, _Out_ uint16_t *lpClassName, int nMaxCount)')
     _GetWindowTextLengthW = user32.func('int __stdcall GetWindowTextLengthW(intptr_t hWnd)')
@@ -425,6 +431,44 @@ export function focusWindowByTitlePrefix(titlePrefix: string): boolean {
     }
   } catch { /* fall through */ }
   return false
+}
+
+/** Force Lumia's OWN window to the foreground with keyboard focus.
+ *
+ *  Electron's win.focus() calls SetForegroundWindow, which Windows silently
+ *  ignores when another process holds the foreground — e.g. right after an
+ *  extension scroll capture, when the browser is still foreground and Lumia
+ *  hid itself during the capture (so it's a background process). Attaching our
+ *  input thread to the current foreground window's thread lifts that lock, so
+ *  SetForegroundWindow is honored; then we detach again. No synthetic input,
+ *  so the browser sees no stray keystroke. */
+export function focusOwnWindowForeground(win: { isDestroyed(): boolean; getNativeWindowHandle(): Buffer }): boolean {
+  if (process.platform !== 'win32') return false
+  if (!ensureLoaded()) return false
+  if (win.isDestroyed()) return false
+  try {
+    const SW_SHOW = 5, SW_RESTORE = 9
+    const buf = win.getNativeWindowHandle()
+    const hwnd = buf.length >= 8 ? buf.readBigInt64LE(0) : BigInt(buf.readInt32LE(0))
+    _ShowWindow(hwnd, _IsIconic(hwnd) ? SW_RESTORE : SW_SHOW)
+
+    const fg = _GetForegroundWindow()
+    const myThread = _GetCurrentThreadId()
+    let fgThread = 0
+    let attached = false
+    if (fg) {
+      const pidOut = [0]
+      fgThread = _GetWindowThreadProcessId(fg, pidOut)
+      if (fgThread && fgThread !== myThread) attached = _AttachThreadInput(myThread, fgThread, true)
+    }
+    _BringWindowToTop(hwnd)
+    const ok = _SetForegroundWindow(hwnd)
+    if (attached) _AttachThreadInput(myThread, fgThread, false)
+    return ok
+  } catch (err) {
+    console.warn('[native-input] focusOwnWindowForeground failed', err)
+    return false
+  }
 }
 
 /** Scroll to top: Ctrl+Home key + WM_VSCROLL SB_TOP to window under cursor */
