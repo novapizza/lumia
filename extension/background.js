@@ -346,10 +346,13 @@ async function runCapture(id, target, mode) {
     // without surfacing an error toast.
     const bail = () => { send({ type: 'capture-error', id, error: 'cancelled' }) }
 
+    // Frames overlap by meta.overlap CSS px (scroll advances by meta.step);
+    // the app discards the top strip of frames 1+ when stitching.
+    const stepY = meta.step || meta.vpH
     for (let index = 0; index < meta.totalFrames; index++) {
       if (activeCapture.cancelled) { bail(); return }
       const isLast = index === meta.totalFrames - 1
-      const targetY = Math.max(0, Math.min(index * meta.vpH, meta.scrollHeight - meta.vpH))
+      const targetY = Math.max(0, Math.min(index * stepY, meta.scrollHeight - meta.vpH))
       const scrollY = await exec(lumiaScrollTo, targetY, index, isLast, meta.totalFrames)
       await sleep(FRAME_DELAY_MS)
       if (activeCapture.cancelled) { bail(); return }
@@ -379,17 +382,19 @@ async function runCapture(id, target, mode) {
 // window.__lumiaCap, which persists in the extension's isolated world
 // across executeScript calls for the lifetime of the page.
 
-function lumiaPrep(maxFrames, mode) {
+async function lumiaPrep(maxFrames, mode) {
   try {
     const doc = document
     const de = doc.scrollingElement || doc.documentElement
 
     // 1. Freeze the environment: instant scrolling, paused animations,
     //    hidden scrollbars (hidden BEFORE measuring so layout is stable
-    //    across every frame).
+    //    across every frame). background-attachment:fixed → scroll so
+    //    parallax backgrounds scroll with the page instead of repeating
+    //    in every frame (GoFullPage does the same conversion).
     const freezeCss = [
       'html { scroll-behavior: auto !important; }',
-      '*, *::before, *::after { animation-play-state: paused !important; transition: none !important; scroll-behavior: auto !important; }',
+      '*, *::before, *::after { animation-play-state: paused !important; transition: none !important; scroll-behavior: auto !important; background-attachment: scroll !important; }',
       '::-webkit-scrollbar { display: none !important; }',
       '* { scrollbar-width: none !important; }'
     ].join('\n')
@@ -512,13 +517,36 @@ function lumiaPrep(maxFrames, mode) {
       } catch { /* cross-origin / detached — skip */ }
     }
 
+    // Save the user's scroll position BEFORE the warm-up moves it — restored
+    // by lumiaRestore.
+    const prevScrollTop = scroller.scrollTop
+    const prevScrollLeft = scroller.scrollLeft
+
+    // 2b. Warm-up scroll (GoFullPage technique): jump to the bottom and back
+    //     to the top BEFORE measuring, so lazy-loaded content/images mount
+    //     and scrollHeight reflects the real page. Also lets lazily-created
+    //     sticky/fixed overlays exist before the collection pass below.
+    if (!singleFrame) {
+      const warm = isDoc ? de : scroller
+      try {
+        warm.scrollTop = warm.scrollHeight
+        void warm.scrollTop
+        await new Promise((r) => setTimeout(r, 250))
+        warm.scrollTop = 0
+        void warm.scrollTop
+        await new Promise((r) => setTimeout(r, 120))
+      } catch { /* keep going with whatever loaded */ }
+    }
+
     // 3. Collect overlay elements (two passes: collect first, then mutate,
     //    so rect measurements aren't taken mid-reflow). Sticky elements are
-    //    flattened to static — they render once at their natural in-flow
-    //    position instead of repeating in every frame. Fixed elements are
-    //    hidden from the second frame on; bottom-anchored ones (floating
-    //    footers, cookie bars) are hidden for mid-page frames and restored
-    //    on the last frame so they land at the true page bottom.
+    //    flattened to relative (position preserved, offsets zeroed) — they
+    //    render once at their natural in-flow position instead of repeating
+    //    in every frame; relative (not static) keeps them a positioned box
+    //    so z-index/offsetParent-dependent layouts don't break. Fixed
+    //    elements are hidden from the second frame on; bottom-anchored ones
+    //    (floating footers, cookie bars) are hidden for mid-page frames and
+    //    restored on the last frame so they land at the true page bottom.
     //    Scan the top document AND the scroller's document (an iframe) so
     //    sticky/fixed bars inside the frame are neutralized too.
     const fixed = []
@@ -552,23 +580,26 @@ function lumiaPrep(maxFrames, mode) {
             bottomAnchored: r.top > (view.innerHeight || window.innerHeight) * 0.5
           })
         } else if (cs.position === 'sticky') {
-          sticky.push({ el, prevPosition: el.style.getPropertyValue('position') })
+          sticky.push({ el, prevCssText: el.style.cssText })
         }
       }
     }
-    // Flatten sticky → static only for multi-frame scroll captures (so sticky
-    // bars don't repeat down the stitch). A single-frame capture (viewport /
-    // non-scrolling selection / unscrollable fallback) must show exactly
-    // what's on screen, so leave positions untouched.
+    // Flatten sticky → relative + auto offsets only for multi-frame scroll
+    // captures (so sticky bars don't repeat down the stitch). A single-frame
+    // capture (viewport / non-scrolling selection / unscrollable fallback)
+    // must show exactly what's on screen, so leave positions untouched.
     if (!singleFrame) {
       for (const s of sticky) {
-        try { s.el.style.setProperty('position', 'static', 'important') } catch { /* ignore */ }
+        try {
+          s.el.style.setProperty('position', 'relative', 'important')
+          for (const p of ['top', 'left', 'right', 'bottom']) {
+            s.el.style.setProperty(p, 'auto', 'important')
+          }
+        } catch { /* ignore */ }
       }
     }
 
     // 4. Scroll to top and measure AFTER all mutations settled.
-    const prevScrollTop = scroller.scrollTop
-    const prevScrollLeft = scroller.scrollLeft
     if (!singleFrame) {
       scroller.scrollTop = 0
       void scroller.scrollTop // force layout
@@ -610,9 +641,20 @@ function lumiaPrep(maxFrames, mode) {
       return { error: 'Scrollable area is too small to capture' }
     }
 
+    // Overlap the scroll steps and let the app discard the top strip of every
+    // frame after the first (GoFullPage's core trick: 200px for the document,
+    // 100px for inner panes). Anything pinned to the viewport top that the
+    // neutralization above MISSED — JS/transform-pinned headers (AWS tables),
+    // shadow-DOM sticky — only ever pollutes the discarded strip, so it can't
+    // repeat down the stitch.
+    const overlap = singleFrame ? 0 : Math.min(isDoc ? 200 : 100, Math.floor(vpH / 3))
+    const step = Math.max(1, vpH - overlap)
     const rawScrollHeight = singleFrame ? vpH : scroller.scrollHeight
-    const scrollHeight = Math.min(rawScrollHeight, vpH * maxFrames)
-    const totalFrames = singleFrame ? 1 : Math.max(1, Math.ceil(scrollHeight / vpH))
+    // maxFrames cap: first frame covers vpH, each further frame adds `step`.
+    const scrollHeight = Math.min(rawScrollHeight, vpH + (maxFrames - 1) * step)
+    const totalFrames = singleFrame
+      ? 1
+      : 1 + Math.max(0, Math.ceil((scrollHeight - vpH) / step))
 
     if (totalFrames > 1) {
       for (const f of fixed) {
@@ -638,6 +680,10 @@ function lumiaPrep(maxFrames, mode) {
       scrollHeight,
       rect,
       totalFrames,
+      // Scroll advances by `step` (= vpH − overlap); the app crops the top
+      // `overlap` CSS px off every frame except the first when stitching.
+      overlap,
+      step,
       // 'region' tells the app to crop the stitched output to `rect` (just the
       // picked area, no page chrome). 'viewport'/'fullpage' keep chrome.
       mode: region ? 'region' : (mode || 'fullpage')
@@ -733,6 +779,12 @@ function lumiaScrollTo(y, index, isLast, total) {
   if (!sc) return null
   sc.scrollTop = y
   void sc.scrollTop // force layout so the read below is post-scroll
+  // Synthetic scroll event (GoFullPage does the same): virtualized lists and
+  // lazy-loaders that render off scroll handlers get an immediate kick
+  // instead of waiting for the async native event.
+  try {
+    (st.isDoc ? window : sc).dispatchEvent(new Event('scroll'))
+  } catch { /* ignore */ }
   return sc.scrollTop
 }
 
@@ -752,10 +804,9 @@ function lumiaRestore() {
       } catch { /* ignore */ }
     }
     for (const s of st.sticky) {
-      try {
-        s.el.style.removeProperty('position')
-        if (s.prevPosition) s.el.style.setProperty('position', s.prevPosition)
-      } catch { /* ignore */ }
+      // Flattening touched position + top/left/right/bottom — restore the
+      // element's whole inline style snapshot instead of unpicking each.
+      try { s.el.style.cssText = s.prevCssText || '' } catch { /* ignore */ }
     }
     const styleEl = document.getElementById('__lumia-cap-style')
     if (styleEl) styleEl.remove()

@@ -2,12 +2,15 @@
 
 Companion extension for the Lumia desktop app. When Lumia's Scroll capture is
 set to **Browser Extension** mode, the app asks this extension to photograph
-the active tab: the extension scrolls the page in exact viewport steps,
-captures each step, and streams the frames (with exact scroll offsets) back to
-Lumia over a localhost WebSocket. Because the offsets come from the DOM, the
-stitched result has none of the guesswork artifacts of screen-scrape scrolling
-capture — and it can hide sticky headers, floating footers, and paused
-animations while it works.
+the active tab: the extension warm-up scrolls to the bottom and back (so
+lazy-loaded content mounts before measuring), then scrolls the page in
+overlapping steps, captures each step, and streams the frames (with exact
+scroll offsets) back to Lumia over a localhost WebSocket. Because the offsets
+come from the DOM, the stitched result has none of the guesswork artifacts of
+screen-scrape scrolling capture — sticky headers, floating footers, parallax
+backgrounds, and animations are neutralized while it works, and anything
+pinned to the viewport that slips through only ever lands in the overlap
+strip, which is discarded at stitch time.
 
 For apps whose page doesn't scroll but a middle pane does (Gmail, Drive, Docs,
 and similar), the extension captures the pane's full content **and keeps the

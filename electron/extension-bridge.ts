@@ -57,6 +57,14 @@ interface ExtCaptureMeta {
    *  (frames are used whole, no crop). */
   rect: { x: number; y: number; w: number; h: number } | null
   totalFrames: number
+  /** Scroll steps overlap by this many CSS px (GoFullPage technique): the
+   *  top `overlap` strip of every frame after the first is discarded when
+   *  stitching, so viewport-pinned elements the page-side neutralization
+   *  missed (JS/transform-pinned headers) can't repeat down the output.
+   *  Absent/0 from older extensions → no crop. */
+  overlap?: number
+  /** Scroll advance per frame (= vpH − overlap). Informational. */
+  step?: number
   /** 'region' → crop the stitched output to `rect` (just the picked area).
    *  'viewport'/'fullpage' keep the surrounding page chrome. */
   mode?: 'viewport' | 'fullpage' | 'region'
@@ -535,15 +543,20 @@ function stitchExtensionFrames(
   // measured from the actual frame instead of trusting reported dpr.
   const scale = rawW / meta.winW
 
+  // Discard strip at the top of frames 1+ (scroll steps overlapped by
+  // meta.overlap CSS px). 2px slack absorbs scale rounding so the crop can
+  // never open a gap between consecutive frames.
+  const overlapPx = Math.max(0, Math.floor((meta.overlap ?? 0) * scale) - 2)
+
   // 'region': the user picked an element — output JUST that box (crop, no
   // page chrome). Otherwise keep chrome: element scrollers composite the
   // chrome in; whole-document pages stack full viewports.
   if (meta.mode === 'region' && meta.rect) {
-    return stitchCroppedRegion(images, ordered, meta.rect, scale, rawW, rawH)
+    return stitchCroppedRegion(images, ordered, meta.rect, scale, rawW, rawH, overlapPx)
   }
   return meta.rect
-    ? stitchElementScroller(images, ordered, meta.rect, scale, rawW, rawH)
-    : stitchDocumentScroller(images, ordered, scale, rawW, rawH)
+    ? stitchElementScroller(images, ordered, meta.rect, scale, rawW, rawH, overlapPx)
+    : stitchDocumentScroller(images, ordered, scale, rawW, rawH, overlapPx)
 }
 
 /** Region mode: crop every frame to `rect` and stack the crops by scroll
@@ -555,7 +568,8 @@ function stitchCroppedRegion(
   rect: { x: number; y: number; w: number; h: number },
   scale: number,
   rawW: number,
-  rawH: number
+  rawH: number,
+  overlapPx = 0
 ): string {
   const cropX = clamp(Math.round(rect.x * scale), 0, rawW - 1)
   const cropY = clamp(Math.round(rect.y * scale), 0, rawH - 1)
@@ -573,10 +587,13 @@ function stitchCroppedRegion(
     const { width: w, height: h } = images[i].getSize()
     if (w !== rawW || h !== rawH) continue // zoom changed mid-capture — skip
     const bmp = images[i].crop({ x: cropX, y: cropY, width: cropW, height: cropH }).toBitmap()
-    const dstY = clamp(Math.round(ordered[i].scrollY * scale), 0, totalHeight - 1)
-    const rows = Math.min(cropH, totalHeight - dstY)
+    // Frames 1+ drop their top overlap strip — anything pinned to the pane
+    // top that the page-side neutralization missed lives only there.
+    const skip = i === 0 ? 0 : Math.min(overlapPx, cropH - 1)
+    const dstY = clamp(Math.round(ordered[i].scrollY * scale) + skip, 0, totalHeight - 1)
+    const rows = Math.min(cropH - skip, totalHeight - dstY)
     if (rows <= 0) continue
-    bmp.copy(outBuf, dstY * rowBytes, 0, rows * rowBytes)
+    bmp.copy(outBuf, dstY * rowBytes, skip * rowBytes, (skip + rows) * rowBytes)
   }
   return finalize(outBuf, cropW, totalHeight)
 }
@@ -588,7 +605,8 @@ function stitchDocumentScroller(
   ordered: ExtFrameMsg[],
   scale: number,
   rawW: number,
-  rawH: number
+  rawH: number,
+  overlapPx = 0
 ): string {
   const rowBytes = rawW * 4
   const lastY = Math.round(ordered[ordered.length - 1].scrollY * scale)
@@ -600,10 +618,13 @@ function stitchDocumentScroller(
   for (let i = 0; i < images.length; i++) {
     const { width: w, height: h } = images[i].getSize()
     if (w !== rawW) continue // zoom changed mid-capture — skip frame
-    const dstY = clamp(Math.round(ordered[i].scrollY * scale), 0, totalHeight - 1)
-    const rows = Math.min(h, totalHeight - dstY)
+    // Frames 1+ drop their top overlap strip — viewport-pinned leftovers the
+    // page-side neutralization missed live only there.
+    const skip = i === 0 ? 0 : Math.min(overlapPx, h - 1)
+    const dstY = clamp(Math.round(ordered[i].scrollY * scale) + skip, 0, totalHeight - 1)
+    const rows = Math.min(h - skip, totalHeight - dstY)
     if (rows <= 0) continue
-    images[i].toBitmap().copy(outBuf, dstY * rowBytes, 0, rows * rowBytes)
+    images[i].toBitmap().copy(outBuf, dstY * rowBytes, skip * rowBytes, (skip + rows) * rowBytes)
   }
   return finalize(outBuf, rawW, totalHeight)
 }
@@ -625,7 +646,8 @@ function stitchElementScroller(
   rect: { x: number; y: number; w: number; h: number },
   scale: number,
   rawW: number,
-  rawH: number
+  rawH: number,
+  overlapPx = 0
 ): string {
   const rowBytes = rawW * 4
   const top = clamp(Math.round(rect.y * scale), 0, rawH - 2)
@@ -674,7 +696,9 @@ function stitchElementScroller(
     if (w !== rawW) continue // zoom changed mid-capture — skip frame
     const bmp = images[i].toBitmap()
     const yOff = clamp(Math.round(ordered[i].scrollY * scale), 0, contentH - bandH)
-    for (let br = 0; br < bandH; br++) {
+    // Frames 1+ drop the top overlap strip of the pane band (see meta.overlap).
+    const skip = i === 0 ? 0 : Math.min(overlapPx, bandH - 1)
+    for (let br = skip; br < bandH; br++) {
       const srcRow = top + br
       if (srcRow >= h) break
       const outRow = top + yOff + br
