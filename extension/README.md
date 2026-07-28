@@ -35,10 +35,11 @@ Works in Chrome, Edge, Brave, and other Chromium browsers (Chrome 116+).
     static). A small **d-pad** (or the **↑ ↓ ← →** keys) refines the
     selection along the DOM tree — **▲/↑** out a level (parent), **▼/↓** in a
     level (child), **◀ ▶/← →** between same-level siblings — so you can land on
-    a scroll pane that's covered by its children. Click (or Enter) captures
-    exactly that element: scroll-stitched if it's a scroll pane, otherwise a
-    single frame — with no surrounding page chrome. **Esc**, right-click, or
-    switching away cancels.
+    a scroll pane that's covered by its children. Elements inside **same-origin
+    iframes** (e.g. the AWS console content frame) can be picked too. Click (or
+    Enter) captures exactly that element: scroll-stitched if it's a scroll pane,
+    otherwise a single frame — with no surrounding page chrome. **Esc**,
+    right-click, or switching away cancels.
 
   A status dot on the icon shows connectivity: green when the Lumia app is
   reachable, red when it isn't.

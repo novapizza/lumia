@@ -444,7 +444,20 @@ function lumiaPrep(maxFrames, mode) {
         return { error: 'No area was selected' }
       }
       region = true
-      const oy = getComputedStyle(picked).overflowY
+      // The picked element may live in a same-origin iframe (AWS console). Find
+      // that frame so its rect is offset into top-viewport coords and scrollTop
+      // writes hit the right element (the same iframeEl offset the full-page
+      // path uses).
+      if (picked.ownerDocument !== doc) {
+        const frames = doc.querySelectorAll('iframe, frame')
+        for (let i = 0; i < frames.length; i++) {
+          let fdoc = null
+          try { fdoc = frames[i].contentDocument } catch { fdoc = null }
+          if (fdoc && fdoc === picked.ownerDocument) { iframeEl = frames[i]; break }
+        }
+      }
+      const view = (picked.ownerDocument && picked.ownerDocument.defaultView) || window
+      const oy = view.getComputedStyle(picked).overflowY
       const scrolls = picked.scrollHeight - picked.clientHeight > 8 &&
         (oy === 'auto' || oy === 'scroll' || oy === 'overlay')
       if (scrolls) { scroller = picked; isDoc = false }
@@ -732,11 +745,17 @@ function lumiaRestore() {
 // Click / Enter captures exactly that element; Esc / right-click / switching
 // away cancels. On pick it stashes the element on window.__lumiaPickedEl and
 // messages the service worker.
+//
+// Same-origin iframes (e.g. AWS console embeds content in a frame): the picker
+// attaches its listeners to every reachable same-origin child document too and
+// records each frame's offset into top-viewport coords, so elements *inside*
+// the frame can be highlighted and picked. Cross-origin frames can't be
+// scripted, so hovering inside one keeps the last highlight (the frame itself
+// is still pickable from its edges).
 function lumiaPickElement() {
   return new Promise((resolve) => {
     if (window.__lumiaPicking) { resolve({ ok: false }); return }
     window.__lumiaPicking = true
-    const prevCursor = document.body ? document.body.style.cursor : ''
     const hl = document.createElement('div')
     hl.style.cssText = 'position:fixed;z-index:2147483647;pointer-events:none;border:2px solid #00e3fd;background:rgba(0,227,253,0.12);box-sizing:border-box;transition:all .04s;'
     const tip = document.createElement('div')
@@ -779,12 +798,41 @@ function lumiaPickElement() {
     styleTag.textContent = '[data-lumia-nav]:hover{background:rgba(0,227,253,0.25)!important;border-color:rgba(0,227,253,0.6)!important}'
     document.documentElement.append(hl, tip, styleTag)
 
-    let current = null     // element currently highlighted (the one a click picks)
-    let armed = false      // set on first real move; guards blur/tab-hide cancel
+    // Collect same-origin documents (top + descendant frames) and each one's
+    // offset into TOP-viewport coords. Cross-origin frames throw on
+    // contentDocument and are skipped (can't be scripted).
+    const offsets = new Map()   // doc -> { ox, oy }
+    const listenerDocs = []
+    const addDoc = (doc, ox, oy) => {
+      offsets.set(doc, { ox, oy })
+      listenerDocs.push(doc)
+      let frames
+      try { frames = doc.querySelectorAll('iframe, frame') } catch { return }
+      for (const fr of frames) {
+        let fdoc = null
+        try { fdoc = fr.contentDocument } catch { fdoc = null }
+        if (!fdoc) continue
+        try {
+          const r = fr.getBoundingClientRect()
+          const cs = (fr.ownerDocument.defaultView || window).getComputedStyle(fr)
+          const bx = (parseFloat(cs.borderLeftWidth) || 0) + (parseFloat(cs.paddingLeft) || 0)
+          const by = (parseFloat(cs.borderTopWidth) || 0) + (parseFloat(cs.paddingTop) || 0)
+          addDoc(fdoc, ox + r.left + bx, oy + r.top + by)
+        } catch { /* frame not measurable — skip */ }
+      }
+    }
+    addDoc(document, 0, 0)
 
+    let current = null     // highlighted element (may live in a child frame doc)
+    let armed = false      // set on first real move; guards blur/tab-hide cancel
+    let finished = false
+    let lastX = -1, lastY = -1
+
+    const offOf = (doc) => offsets.get(doc) || { ox: 0, oy: 0 }
+    const viewOf = (el) => (el.ownerDocument && el.ownerDocument.defaultView) || window
     const isScrollable = (el) => {
       if (!el || el.nodeType !== 1) return false
-      const oy = getComputedStyle(el).overflowY
+      const oy = viewOf(el).getComputedStyle(el).overflowY
       return (oy === 'auto' || oy === 'scroll' || oy === 'overlay') &&
         el.scrollHeight - el.clientHeight > 8
     }
@@ -799,9 +847,10 @@ function lumiaPickElement() {
     const paint = (el) => {
       current = el
       if (!el) { hl.style.display = 'none'; tipMain.textContent = ''; return }
+      const { ox, oy } = offOf(el.ownerDocument)
       const r = el.getBoundingClientRect()
       hl.style.display = 'block'
-      hl.style.left = r.left + 'px'; hl.style.top = r.top + 'px'
+      hl.style.left = (r.left + ox) + 'px'; hl.style.top = (r.top + oy) + 'px'
       hl.style.width = r.width + 'px'; hl.style.height = r.height + 'px'
       const scr = isScrollable(el)
       hl.style.borderColor = scr ? '#22c55e' : '#00e3fd'
@@ -809,72 +858,65 @@ function lumiaPickElement() {
       tipMain.textContent = (scr ? '✓ scrolls · ' : 'static · ') + shortName(el) +
         '  ' + Math.round(r.width) + '×' + Math.round(r.height)
     }
-    const setFromPoint = (x, y) => {
-      hl.style.display = 'none'
-      const el = document.elementFromPoint(x, y)
-      hl.style.display = 'block'
-      // Over a native scrollbar elementFromPoint returns null — keep the
-      // current highlight instead of dropping it, so a scroll pane you've
-      // pointed at stays selected while the cursor grazes its scrollbar.
-      if (!el || el === tip || el === hl || tip.contains(el)) return
-      if (el !== current) paint(el)
-    }
-    // D-pad / arrow-key navigation: walk the DOM tree from the current element.
+    // D-pad / arrow-key navigation: walk the DOM tree from the current element
+    // (staying within its own document — never crosses a frame boundary).
     const isElem = (n) => !!n && n.nodeType === 1
     const navigate = (dir) => {
       if (!current) return
       let next = null
-      if (dir === 'up') { const p = current.parentElement; if (p && p !== document.documentElement) next = p }
+      if (dir === 'up') { const p = current.parentElement; if (p && p !== current.ownerDocument.documentElement) next = p }
       else if (dir === 'down') { if (isElem(current.firstElementChild)) next = current.firstElementChild }
       else if (dir === 'left') { if (isElem(current.previousElementSibling)) next = current.previousElementSibling }
       else if (dir === 'right') { if (isElem(current.nextElementSibling)) next = current.nextElementSibling }
       if (!next) return
       armed = true
-      // Bring it into view (in case a sibling/child is off-screen), then paint
-      // at the settled position.
       try { next.scrollIntoView({ block: 'nearest', inline: 'nearest' }) } catch { /* ignore */ }
       paint(next)
     }
-
-    let lastX = -1, lastY = -1
+    // Each doc gets its own mousemove; e.currentTarget is that doc and
+    // e.clientX/Y are in its viewport — convert to top coords via its offset.
     const move = (e) => {
       armed = true
-      // Ignore sub-pixel jitter so a d-pad / arrow-key selection isn't clobbered
-      // by a tiny mouse twitch before the click.
-      if (lastX >= 0 && Math.abs(e.clientX - lastX) < 4 && Math.abs(e.clientY - lastY) < 4) return
-      lastX = e.clientX; lastY = e.clientY
-      setFromPoint(e.clientX, e.clientY)
+      const doc = e.currentTarget
+      const { ox, oy } = offOf(doc)
+      const tx = e.clientX + ox, ty = e.clientY + oy
+      if (lastX >= 0 && Math.abs(tx - lastX) < 4 && Math.abs(ty - lastY) < 4) return
+      lastX = tx; lastY = ty
+      const el = doc.elementFromPoint(e.clientX, e.clientY)
+      // null over a scrollbar → keep the current highlight; ignore our overlay.
+      if (!el || el === tip || el === hl || tip.contains(el)) return
+      paint(el)
     }
-    let finished = false
     const finish = (targetEl, viaMouse) => {
       if (finished) return
       finished = true
-      document.removeEventListener('mousemove', move, true)
-      document.removeEventListener('mousedown', onDown, true)
-      document.removeEventListener('keydown', key, true)
-      document.removeEventListener('contextmenu', ctx, true)
+      for (const d of listenerDocs) {
+        try {
+          d.removeEventListener('mousemove', move, true)
+          d.removeEventListener('mousedown', onDown, true)
+          d.removeEventListener('keydown', key, true)
+          d.removeEventListener('contextmenu', ctx, true)
+          if (d.body) d.body.style.cursor = ''
+        } catch { /* frame gone */ }
+      }
       window.removeEventListener('blur', onBlur)
       document.removeEventListener('visibilitychange', onVis)
       hl.remove(); tip.remove(); styleTag.remove()
-      if (document.body) document.body.style.cursor = prevCursor
       delete window.__lumiaPicking
       // We commit on mousedown, so a mouseup (and maybe a click) still trail the
-      // pick gesture — swallow them briefly so the page doesn't act on it (link
-      // nav, button press), then unhook. Only needed for a mouse pick.
+      // pick gesture — swallow them across every doc briefly so the page (or a
+      // frame) doesn't act on it, then unhook. Only needed for a mouse pick.
       if (viaMouse) {
-        const trail = (e) => {
-          e.preventDefault(); e.stopPropagation()
-          if (e.type === 'click') { // click is the last of the trio — unhook
-            document.removeEventListener('mouseup', trail, true)
-            document.removeEventListener('click', trail, true)
+        const unhook = () => {
+          for (const d of listenerDocs) {
+            try { d.removeEventListener('mouseup', trail, true); d.removeEventListener('click', trail, true) } catch { /* frame gone */ }
           }
         }
-        document.addEventListener('mouseup', trail, true)
-        document.addEventListener('click', trail, true)
-        setTimeout(() => {
-          document.removeEventListener('mouseup', trail, true)
-          document.removeEventListener('click', trail, true)
-        }, 700) // fallback if no click follows the mousedown
+        const trail = (e) => { e.preventDefault(); e.stopPropagation(); if (e.type === 'click') unhook() }
+        for (const d of listenerDocs) {
+          try { d.addEventListener('mouseup', trail, true); d.addEventListener('click', trail, true) } catch { /* frame gone */ }
+        }
+        setTimeout(unhook, 700) // fallback if no click follows the mousedown
       }
       if (targetEl) {
         window.__lumiaPickedEl = targetEl
@@ -899,7 +941,7 @@ function lumiaPickElement() {
       }
       e.preventDefault(); e.stopPropagation()
       if (e.button !== 0) return // right = contextmenu cancels; ignore middle
-      if (!current) setFromPoint(e.clientX, e.clientY)
+      if (!current) { const el = e.currentTarget.elementFromPoint(e.clientX, e.clientY); if (el) paint(el) }
       finish(current || null, true)
     }
     const key = (e) => {
@@ -911,16 +953,25 @@ function lumiaPickElement() {
       else if (e.key === 'ArrowRight') { e.preventDefault(); navigate('right') }
     }
     const ctx = (e) => { e.preventDefault(); finish(null) }
-    // Switching away from the tab/window cancels the pick.
-    const onBlur = () => { if (armed) finish(null) }
+    // Switching away from the whole tab/window cancels the pick. Defer + check
+    // hasFocus so moving focus INTO a same-origin child frame (which blurs the
+    // top window but keeps the tab focused) doesn't cancel.
+    const onBlur = () => {
+      if (!armed) return
+      setTimeout(() => { if (!finished && !document.hasFocus()) finish(null) }, 0)
+    }
     const onVis = () => { if (document.hidden && armed) finish(null) }
 
-    document.addEventListener('mousemove', move, true)
-    document.addEventListener('mousedown', onDown, true)
-    document.addEventListener('keydown', key, true)
-    document.addEventListener('contextmenu', ctx, true)
+    for (const d of listenerDocs) {
+      try {
+        d.addEventListener('mousemove', move, true)
+        d.addEventListener('mousedown', onDown, true)
+        d.addEventListener('keydown', key, true)
+        d.addEventListener('contextmenu', ctx, true)
+        if (d.body) d.body.style.cursor = 'crosshair'
+      } catch { /* frame gone */ }
+    }
     window.addEventListener('blur', onBlur)
     document.addEventListener('visibilitychange', onVis)
-    if (document.body) document.body.style.cursor = 'crosshair'
   })
 }
