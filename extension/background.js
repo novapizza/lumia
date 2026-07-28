@@ -387,15 +387,19 @@ function lumiaPrep(maxFrames, mode) {
     // 1. Freeze the environment: instant scrolling, paused animations,
     //    hidden scrollbars (hidden BEFORE measuring so layout is stable
     //    across every frame).
-    const styleEl = doc.createElement('style')
-    styleEl.id = '__lumia-cap-style'
-    styleEl.textContent = [
+    const freezeCss = [
       'html { scroll-behavior: auto !important; }',
       '*, *::before, *::after { animation-play-state: paused !important; transition: none !important; scroll-behavior: auto !important; }',
       '::-webkit-scrollbar { display: none !important; }',
       '* { scrollbar-width: none !important; }'
     ].join('\n')
+    const styleEl = doc.createElement('style')
+    styleEl.id = '__lumia-cap-style'
+    styleEl.textContent = freezeCss
     doc.documentElement.appendChild(styleEl)
+    // Freeze <style> elements injected into same-origin child frames (region
+    // capture inside an iframe); tracked here so lumiaRestore can remove them.
+    const extraStyles = []
 
     // 2. Pick the scroller. The document when it scrolls; otherwise the inner
     //    element (or same-origin iframe's element) with the MOST scrollable
@@ -494,6 +498,20 @@ function lumiaPrep(maxFrames, mode) {
       }
     }
 
+    // When the scroller lives in a same-origin iframe (region capture inside
+    // e.g. the AWS console frame), freeze that document too — otherwise its
+    // scrollbars show and its sticky/fixed elements (collected below) can't be
+    // reached, so they'd repeat down the stitched crop.
+    if (!isDoc && scroller.ownerDocument && scroller.ownerDocument !== doc) {
+      try {
+        const fdoc = scroller.ownerDocument
+        const fstyle = fdoc.createElement('style')
+        fstyle.textContent = freezeCss
+        fdoc.documentElement.appendChild(fstyle)
+        extraStyles.push(fstyle)
+      } catch { /* cross-origin / detached — skip */ }
+    }
+
     // 3. Collect overlay elements (two passes: collect first, then mutate,
     //    so rect measurements aren't taken mid-reflow). Sticky elements are
     //    flattened to static — they render once at their natural in-flow
@@ -501,15 +519,21 @@ function lumiaPrep(maxFrames, mode) {
     //    hidden from the second frame on; bottom-anchored ones (floating
     //    footers, cookie bars) are hidden for mid-page frames and restored
     //    on the last frame so they land at the true page bottom.
+    //    Scan the top document AND the scroller's document (an iframe) so
+    //    sticky/fixed bars inside the frame are neutralized too.
     const fixed = []
     const sticky = []
-    {
-      const all = doc.querySelectorAll('*')
+    const scanDocs = [doc]
+    if (!isDoc && scroller.ownerDocument && scroller.ownerDocument !== doc) scanDocs.push(scroller.ownerDocument)
+    for (const sdoc of scanDocs) {
+      const view = sdoc.defaultView || window
+      let all
+      try { all = sdoc.querySelectorAll('*') } catch { continue }
       const n = Math.min(all.length, 30000)
       for (let i = 0; i < n; i++) {
         const el = all[i]
         if (el === styleEl) continue
-        const cs = getComputedStyle(el)
+        const cs = view.getComputedStyle(el)
         if (cs.position === 'fixed') {
           if (cs.display === 'none' || cs.visibility === 'hidden') continue
           const r = el.getBoundingClientRect()
@@ -517,7 +541,7 @@ function lumiaPrep(maxFrames, mode) {
           fixed.push({
             el,
             prevVisibility: el.style.getPropertyValue('visibility'),
-            bottomAnchored: r.top > window.innerHeight * 0.5
+            bottomAnchored: r.top > (view.innerHeight || window.innerHeight) * 0.5
           })
         } else if (cs.position === 'sticky') {
           sticky.push({ el, prevPosition: el.style.getPropertyValue('position') })
@@ -595,6 +619,7 @@ function lumiaPrep(maxFrames, mode) {
       isDoc,
       fixed,
       sticky,
+      extraStyles,
       prevScrollTop,
       prevScrollLeft
     }
@@ -726,6 +751,8 @@ function lumiaRestore() {
     }
     const styleEl = document.getElementById('__lumia-cap-style')
     if (styleEl) styleEl.remove()
+    // Remove any freeze <style> injected into same-origin child frames.
+    if (st.extraStyles) for (const s of st.extraStyles) { try { s.remove() } catch { /* frame gone */ } }
     const sc = st.isDoc ? (document.scrollingElement || document.documentElement) : st.scroller
     if (sc) {
       sc.scrollTop = st.prevScrollTop
