@@ -1,4 +1,4 @@
-import { desktopCapturer, ipcMain, screen, nativeImage, clipboard } from 'electron'
+import { desktopCapturer, ipcMain, screen, nativeImage, clipboard, app } from 'electron'
 import { homedir } from 'os'
 import { join } from 'path'
 import { getMainWindow, createOverlayWindows, closeAllOverlays, getHistoryStore, getOverlayDisplayId, getOverlayWindow, broadcastToOverlays, restoreFromOverlayCancel, waitForViewMounted, openHistoryItemInEditor, isMainDismissed } from './index'
@@ -200,9 +200,15 @@ function showMainWindow() {
   // win.focus() alone can't steal the foreground when another process holds it
   // — e.g. after an extension scroll capture the browser is still foreground
   // and Lumia hid itself during the capture (so it's a background process).
-  // A native AttachThreadInput + SetForegroundWindow lifts that lock. No-op on
-  // non-Windows / when we already hold the foreground.
-  focusOwnWindowForeground(win)
+  if (process.platform === 'darwin') {
+    // macOS: the extension AppleScript-`activate`d the browser, so Lumia is a
+    // background app — bring the whole app (not just the window) to the front.
+    app.focus({ steal: true })
+  } else {
+    // Windows: AttachThreadInput + SetForegroundWindow lifts the foreground
+    // lock. No-op when we already hold the foreground.
+    focusOwnWindowForeground(win)
+  }
 }
 
 function findSourceForDisplay(
