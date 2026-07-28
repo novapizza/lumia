@@ -14,9 +14,10 @@ interface AppSettings {
   googleDriveFolderId: string
   launchAtStartup: boolean
   historyRetentionDays: number
-  lastCaptureKind: 'image' | 'video'
+  lastCaptureKind: 'image' | 'video' | 'scroll'
   lastImageMode: 'region' | 'window' | 'all-screen' | 'screen' | 'scrolling'
   lastVideoMode: 'region' | 'window' | 'screen'
+  scrollCaptureMethod: 'extension' | 'screen'
   printScreenAsCapture: boolean
   printScreenPromptShown: boolean
   wallpaperCategories: string[]
@@ -241,6 +242,19 @@ declare global {
       onScrollCaptureError(cb: (data: { error: string }) => void): void
       confirmScrollRegion(rect: { x: number; y: number; width: number; height: number }): Promise<void>
       cancelScrollRegion(): Promise<void>
+      // Unified scroll launcher + extension-bridge status. `launchScrollCapture`
+      // with no method uses the saved scrollCaptureMethod; an explicit
+      // 'extension' returns { ok: false, error: 'extension-not-connected' }
+      // instead of falling back, so the UI can show setup help.
+      launchScrollCapture(method?: 'extension' | 'screen'): Promise<{ ok: boolean; error?: string }>
+      getScrollExtensionStatus(): Promise<{ connected: boolean; browsers: string[]; clients: Array<{ id: number; browser: string }> }>
+      onScrollExtensionStatus(cb: (status: { connected: boolean; browsers: string[]; clients: Array<{ id: number; browser: string }> }) => void): void
+      openScrollExtensionFolder(): Promise<string>
+      // Multi-browser picker: previews carry a downscaled JPEG of each
+      // browser's active tab (null when the tab can't be photographed).
+      getScrollExtensionPreviews(): Promise<Array<{ clientId: number; browser: string; title: string; url: string; dataUrl: string | null }>>
+      startScrollCaptureWith(clientId: number): Promise<{ ok: boolean; error?: string }>
+      onScrollExtensionPick(cb: () => void): void
       getOverlayMode(): Promise<'region' | 'scroll-region' | 'window-pick' | 'monitor-pick'>
     }
   }

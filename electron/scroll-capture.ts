@@ -4,6 +4,9 @@ import { existsSync, mkdirSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import { setTimeout as sleep } from 'timers/promises'
 import * as native from './native-input'
+import { getSettings } from './settings'
+import type { ScrollCaptureMethod } from './settings'
+import { isExtensionConnected, startExtensionCapture, cancelExtensionCapture } from './extension-bridge'
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const FFT = require('fft.js')
 
@@ -1290,6 +1293,41 @@ export function setOverlayMode(mode: OverlayMode) {
   overlayMode = mode
 }
 
+// ── Unified launcher (method routing) ──────────────────────────────────────
+
+// Captured at setup time so hotkeys / tray / dispatchLastCapture can launch a
+// scroll session without re-plumbing the overlay factories everywhere.
+let scrollDeps: { mainWindow: BrowserWindow; createOverlayWindows: () => void } | null = null
+
+/**
+ * Start a scroll capture using the given method, or the saved
+ * `scrollCaptureMethod` setting when none is passed.
+ *
+ * Fallback policy: an EXPLICIT 'extension' request (Dashboard card) with no
+ * extension connected fails fast with `extension-not-connected` so the UI can
+ * show setup help; the implicit path (hotkey / New Capture replay) silently
+ * falls back to the classic screen method so the hotkey always does something.
+ */
+export async function launchScrollCapture(
+  method?: ScrollCaptureMethod
+): Promise<{ ok: boolean; error?: string }> {
+  const resolved = method ?? getSettings().scrollCaptureMethod
+  if (resolved === 'extension') {
+    if (isExtensionConnected()) return startExtensionCapture()
+    if (method === 'extension') return { ok: false, error: 'extension-not-connected' }
+    console.log('[scroll-capture] extension method saved but not connected — falling back to screen scroll')
+  }
+
+  // Classic screen method: hide the main window, open the region overlay.
+  // Same dance as the hotkey path used to inline.
+  const main = scrollDeps?.mainWindow
+  if (main && !main.isDestroyed()) main.hide()
+  await sleep(200)
+  setOverlayMode('scroll-region')
+  scrollDeps?.createOverlayWindows()
+  return { ok: true }
+}
+
 // ── IPC setup ─────────────────────────────────────────────────────────────
 
 export function setupScrollCapture(
@@ -1299,11 +1337,18 @@ export function setupScrollCapture(
   getOverlayDisplayId: () => number | null,
   restoreFromOverlayCancel: () => void,
 ) {
+  scrollDeps = { mainWindow, createOverlayWindows }
+
   let cancelled = false
   let captureOpts: {
     delay: number; maxFrames: number;
     scrollMethod?: ScrollMethod; scrollToTopFirst?: boolean
   } = { delay: 600, maxFrames: 50 }
+
+  // Unified entry point: routes to the extension bridge or the classic
+  // screen pipeline based on the saved setting / explicit method.
+  ipcMain.handle('scroll-capture:launch', (_e, method?: ScrollCaptureMethod) =>
+    launchScrollCapture(method))
 
   // Step 1: User clicks "Scrolling" — hide main window, open overlay
   ipcMain.handle('scroll-capture:start', async (_e, opts?: {
@@ -1391,5 +1436,7 @@ export function setupScrollCapture(
 
   ipcMain.handle('scroll-capture:cancel', () => {
     cancelled = true
+    // Same dialog cancels both methods — stop an extension session too.
+    cancelExtensionCapture()
   })
 }

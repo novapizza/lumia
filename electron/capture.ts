@@ -5,7 +5,7 @@ import { getMainWindow, createOverlayWindows, closeAllOverlays, getHistoryStore,
 import { getWindowAtPointPhysical } from './native-input'
 import { getMacWindowAtPoint } from './mac-window-pick'
 import { resolveWin32PickRect, resolveMacPickRect, getSinglePickTarget, getActivePickTarget, PickTarget } from './window-list'
-import { setOverlayMode, resetOverlayMode, getOverlayMode } from './scroll-capture'
+import { setOverlayMode, resetOverlayMode, getOverlayMode, launchScrollCapture } from './scroll-capture'
 import { localTimestamp } from './utils'
 import { makeThumbnail } from './thumbnail'
 import { showNotification } from './notify'
@@ -241,12 +241,10 @@ export async function dispatchLastCapture() {
     await startVideoCapture(s.lastVideoMode)
     return
   }
-  if (s.lastImageMode === 'scrolling') {
-    const main = getMainWindow()
-    if (main && !main.isDestroyed()) main.hide()
-    await new Promise(r => setTimeout(r, 200))
-    setOverlayMode('scroll-region')
-    createOverlayWindows()
+  // Scroll is a first-class capture kind; `lastImageMode === 'scrolling'`
+  // covers values persisted by older builds before the split.
+  if (s.lastCaptureKind === 'scroll' || s.lastImageMode === 'scrolling') {
+    await launchScrollCapture()
     return
   }
   dispatchCapture(s.lastImageMode)
@@ -803,6 +801,7 @@ export async function sendCaptureToEditor(dataUrlIn: string, source: string, dis
     source === 'region' ? 'Region' :
     source === 'window' ? 'Window' :
     source === 'screen' || source === 'active-monitor' ? 'Screen' :
+    source === 'scrolling' ? 'Scrolling page' :
     'All Screens'
   // Snapshot tray state at notification fire time. The user clicking the
   // toast later (banner or Action Center) should produce the same

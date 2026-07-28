@@ -19,6 +19,7 @@ import { snapshotActivePickWindow } from './window-list'
 import { setupHotkeys, teardownHotkeys, getHotkeys, saveHotkeys, resetHotkeys, defaultHotkeys, type HotkeyConfig } from './hotkeys'
 import { setupTray, destroyTray } from './tray'
 import { setupScrollCapture, getOverlayMode } from './scroll-capture'
+import { setupExtensionBridge } from './extension-bridge'
 import { setupStickers } from './stickers'
 import { WorkflowEngine } from './workflow'
 import { TemplateStore } from './templates'
@@ -912,6 +913,10 @@ app.whenReady().then(async () => {
   setupHotkeys()
   setupTray()
   setupScrollCapture(mainWindow, createOverlayWindows, closeAllOverlays, getOverlayDisplayId, restoreFromOverlayCancel)
+  // Local WebSocket bridge for the companion browser extension (extension
+  // scroll-capture method). Starts listening immediately so the extension's
+  // service worker can attach whenever the browser is running.
+  setupExtensionBridge(getMainWindow)
 
   // Init the desktopCapturer pipeline now so the first hotkey press doesn't
   // pay the ~300-500ms cold-start. Fire-and-forget — no consumer waits on it.
