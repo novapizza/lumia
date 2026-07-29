@@ -495,11 +495,7 @@ async function captureAllScreen(): Promise<string> {
   // display — N× redundant captures, at seconds each on macOS), then composite.
   await freezeAllDisplays()
   try {
-    // Keep each display at its native physical resolution. Position each display
-    // in physical-pixel space by scaling its OWN DIP origin (offset from the
-    // bounding box of all displays) by its scale factor — rather than summing the
-    // sizes of other displays. The old summing rule double-offset stacked columns
-    // and vertically-offset layouts (black bands / top-aligned content).
+    // Keep each display at its native physical resolution.
     const grabs = allDisplays.map(d => {
       const sf = d.scaleFactor || 1
       return {
@@ -510,16 +506,34 @@ async function captureAllScreen(): Promise<string> {
       }
     })
 
-    // Bounding box of all displays in DIP space.
-    const minX = Math.min(...grabs.map(g => g.display.bounds.x))
-    const minY = Math.min(...grabs.map(g => g.display.bounds.y))
+    // Place each frame at the display's true physical origin on the virtual
+    // desktop. Windows: dipToScreenPoint() is the exact origin the GDI
+    // snapshot was BitBlt'd from (native-screen.ts) — deriving it as
+    // (dipOffset × own scaleFactor) instead diverges on mixed-DPI layouts
+    // (Windows arranges monitors in physical pixels; Electron's DIP space is
+    // a per-display warp of that), which shifted/overlapped displays in the
+    // composite. macOS/other: no global physical space exists — keep the
+    // scaled-DIP heuristic (exact whenever all displays share one scaleFactor).
+    const physOrigin = (d: Electron.Display): { x: number; y: number } => {
+      if (process.platform === 'win32') {
+        return screen.dipToScreenPoint({ x: d.bounds.x, y: d.bounds.y })
+      }
+      const sf = d.scaleFactor || 1
+      return { x: d.bounds.x * sf, y: d.bounds.y * sf }
+    }
+    const origins = new Map(grabs.map(g => [g.display.id, physOrigin(g.display)]))
+    const minX = Math.min(...[...origins.values()].map(o => o.x))
+    const minY = Math.min(...[...origins.values()].map(o => o.y))
 
     const phBounds = new Map<number, { x: number; y: number; w: number; h: number }>()
     for (const { display: d, physW, physH } of grabs) {
-      const sf = d.scaleFactor || 1
-      const px = Math.round((d.bounds.x - minX) * sf)
-      const py = Math.round((d.bounds.y - minY) * sf)
-      phBounds.set(d.id, { x: px, y: py, w: physW, h: physH })
+      const o = origins.get(d.id)!
+      phBounds.set(d.id, {
+        x: Math.round(o.x - minX),
+        y: Math.round(o.y - minY),
+        w: physW,
+        h: physH,
+      })
     }
 
     const totalW = Math.max(...[...phBounds.values()].map(b => b.x + b.w))
