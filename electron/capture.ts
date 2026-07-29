@@ -1,8 +1,8 @@
-import { desktopCapturer, ipcMain, screen, nativeImage, clipboard } from 'electron'
+import { desktopCapturer, ipcMain, screen, nativeImage, clipboard, app } from 'electron'
 import { homedir } from 'os'
 import { join } from 'path'
 import { getMainWindow, createOverlayWindows, closeAllOverlays, getHistoryStore, getOverlayDisplayId, getOverlayWindow, broadcastToOverlays, restoreFromOverlayCancel, waitForViewMounted, openHistoryItemInEditor, isMainDismissed } from './index'
-import { getWindowAtPointPhysical } from './native-input'
+import { getWindowAtPointPhysical, focusOwnWindowForeground } from './native-input'
 import { getMacWindowAtPoint } from './mac-window-pick'
 import { resolveWin32PickRect, resolveMacPickRect, getSinglePickTarget, getActivePickTarget, PickTarget } from './window-list'
 import { setOverlayMode, resetOverlayMode, getOverlayMode } from './scroll-capture'
@@ -197,6 +197,18 @@ function showMainWindow() {
   if (!win || win.isDestroyed()) return
   win.show()
   win.focus()
+  // win.focus() alone can't steal the foreground when another process holds it
+  // — e.g. after an extension scroll capture the browser is still foreground
+  // and Lumia hid itself during the capture (so it's a background process).
+  if (process.platform === 'darwin') {
+    // macOS: the extension AppleScript-`activate`d the browser, so Lumia is a
+    // background app — bring the whole app (not just the window) to the front.
+    app.focus({ steal: true })
+  } else {
+    // Windows: AttachThreadInput + SetForegroundWindow lifts the foreground
+    // lock. No-op when we already hold the foreground.
+    focusOwnWindowForeground(win)
+  }
 }
 
 function findSourceForDisplay(
@@ -241,15 +253,11 @@ export async function dispatchLastCapture() {
     await startVideoCapture(s.lastVideoMode)
     return
   }
-  if (s.lastImageMode === 'scrolling') {
-    const main = getMainWindow()
-    if (main && !main.isDestroyed()) main.hide()
-    await new Promise(r => setTimeout(r, 200))
-    setOverlayMode('scroll-region')
-    createOverlayWindows()
-    return
-  }
-  dispatchCapture(s.lastImageMode)
+  // Scroll is a deliberate capture — started from the Dashboard Scroll tab or
+  // the browser extension — never a remembered mode, so "New Capture" / PrtSc
+  // must not replay it. Fall back to a normal image capture (legacy 'scrolling'
+  // values from older builds → region).
+  dispatchCapture(s.lastImageMode === 'scrolling' ? 'region' : s.lastImageMode)
 }
 
 export function setupCapture() {
@@ -803,6 +811,7 @@ export async function sendCaptureToEditor(dataUrlIn: string, source: string, dis
     source === 'region' ? 'Region' :
     source === 'window' ? 'Window' :
     source === 'screen' || source === 'active-monitor' ? 'Screen' :
+    source === 'scrolling' ? 'Scrolling page' :
     'All Screens'
   // Snapshot tray state at notification fire time. The user clicking the
   // toast later (banner or Action Center) should produce the same

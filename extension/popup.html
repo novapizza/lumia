@@ -1,0 +1,62 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <style>
+    :root { color-scheme: light dark; }
+    * { box-sizing: border-box; }
+    body {
+      width: 260px; margin: 0; padding: 14px;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: #0f172a; color: #e2e8f0;
+    }
+    .head { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+    .head img { width: 20px; height: 20px; border-radius: 5px; }
+    .head .title { font-size: 13px; font-weight: 700; }
+    .status { display: flex; align-items: center; gap: 6px; margin-left: auto; font-size: 10px; font-weight: 600; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #64748b; }
+    .dot.on { background: #22c55e; } .dot.off { background: #ef4444; }
+    button.mode {
+      display: flex; align-items: center; gap: 10px; width: 100%;
+      padding: 10px 12px; margin-top: 8px; border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 10px; background: rgba(255,255,255,0.03); color: inherit;
+      cursor: pointer; text-align: left; transition: background .15s, border-color .15s;
+    }
+    button.mode:hover:not(:disabled) { background: rgba(0,227,253,0.10); border-color: rgba(0,227,253,0.35); }
+    button.mode:disabled { opacity: .45; cursor: not-allowed; }
+    .ic { width: 30px; height: 30px; flex: 0 0 auto; border-radius: 8px; display: flex; align-items: center; justify-content: center; background: rgba(0,227,253,0.12); }
+    .ic svg { width: 17px; height: 17px; stroke: #00e3fd; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+    .lbl { min-width: 0; display: flex; flex-direction: column; }
+    .lbl .t { display: block; font-size: 12.5px; font-weight: 650; }
+    .lbl .d { display: block; font-size: 10.5px; color: #94a3b8; margin-top: 1px; }
+    .hint { margin-top: 12px; font-size: 10.5px; color: #94a3b8; line-height: 1.45; }
+    .hint a { color: #00e3fd; cursor: pointer; text-decoration: none; }
+  </style>
+</head>
+<body>
+  <div class="head">
+    <img src="icon48.png" alt="" />
+    <span class="title">Lumia Scroll Capture</span>
+    <span class="status"><span id="dot" class="dot"></span><span id="statusText">…</span></span>
+  </div>
+
+  <button class="mode" id="viewport">
+    <span class="ic"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/></svg></span>
+    <span class="lbl"><span class="t">Visible area</span><span class="d">Just what's on screen now</span></span>
+  </button>
+
+  <button class="mode" id="fullpage">
+    <span class="ic"><svg viewBox="0 0 24 24"><rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 8h8M8 12h8M8 16h5"/></svg></span>
+    <span class="lbl"><span class="t">Full page</span><span class="d">Scroll and stitch the whole page</span></span>
+  </button>
+
+  <button class="mode" id="region">
+    <span class="ic"><svg viewBox="0 0 24 24"><path d="M4 8V5a1 1 0 0 1 1-1h3M16 4h3a1 1 0 0 1 1 1v3M20 16v3a1 1 0 0 1-1 1h-3M8 20H5a1 1 0 0 1-1-1v-3"/></svg></span>
+    <span class="lbl"><span class="t">Select area</span><span class="d">Pick an element or pane to capture</span></span>
+  </button>
+
+  <div class="hint" id="hint"></div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

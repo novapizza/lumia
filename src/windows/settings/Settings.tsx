@@ -490,7 +490,6 @@ const HOTKEY_ROWS: { action: string; label: string }[] = [
   { action: 'ActiveWindow',         label: 'Window (Screenshot)' },
   { action: 'ActiveMonitor',        label: 'Screen (Screenshot)' },
   { action: 'PrintScreen',          label: 'All Screens (Screenshot)' },
-  { action: 'ScrollingCapture',     label: 'Scrolling (Screenshot)' },
   { action: 'ScreenRecorder',       label: 'Region (Video)' },
   { action: 'ScreenRecorderWindow', label: 'Window (Video)' },
   { action: 'ScreenRecorderScreen', label: 'Screen (Video)' },

@@ -1,0 +1,79 @@
+# Publishes the Lumia Scroll Capture browser extension to the Chrome Web Store.
+#
+# One-time manual setup is required before this works — see extension/PUBLISHING.md
+# (create the store item, get its ID, set up API credentials, add repo secrets).
+#
+# Release an update:
+#   git tag ext-v1.0.1 && git push origin ext-v1.0.1
+# The tag version is stamped into manifest.json (each upload MUST have a new
+# version), the extension/ folder is zipped, and the new version is submitted
+# to the Chrome Web Store (Google still reviews it before it goes live).
+name: Publish extension
+
+on:
+  push:
+    tags: ['ext-v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish (e.g. 1.0.1)'
+        required: true
+      publish:
+        description: 'Submit for publishing (uncheck to only upload a draft)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-extension
+  cancel-in-progress: false
+
+jobs:
+  chrome:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: v
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            V="${GITHUB_REF_NAME#ext-v}"
+          else
+            V="${{ github.event.inputs.version }}"
+          fi
+          if ! echo "$V" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Version '$V' is not X.Y.Z"; exit 1
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Publishing version $V"
+
+      # The Web Store rejects re-uploading an existing version, so stamp the
+      # release version into the manifest right before zipping (CI workspace
+      # only — not committed back).
+      - name: Stamp manifest version
+        run: |
+          jq --arg v "${{ steps.v.outputs.version }}" '.version = $v' extension/manifest.json > manifest.tmp
+          mv manifest.tmp extension/manifest.json
+          cat extension/manifest.json
+
+      - name: Zip extension
+        run: |
+          cd extension
+          # screenshot-*.png are Web Store LISTING assets (uploaded via the
+          # dashboard), not extension files — keep them out of the package.
+          zip -r ../lumia-extension.zip . -x '*.md' '*.DS_Store' 'screenshot-*.png'
+
+      - name: Upload & publish to Chrome Web Store
+        uses: mnao305/chrome-extension-upload@v5.0.0
+        with:
+          file-path: lumia-extension.zip
+          extension-id: ${{ secrets.CWS_EXTENSION_ID }}
+          client-id: ${{ secrets.CWS_CLIENT_ID }}
+          client-secret: ${{ secrets.CWS_CLIENT_SECRET }}
+          refresh-token: ${{ secrets.CWS_REFRESH_TOKEN }}
+          # Push a tag → always submit for publishing. Manual run → honor the
+          # checkbox (uncheck to upload a reviewable draft without publishing).
+          publish: ${{ github.event_name == 'push' || github.event.inputs.publish == 'true' }}

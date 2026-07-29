@@ -1,11 +1,10 @@
 import { globalShortcut, app } from 'electron'
 import Store from 'electron-store'
 import { dispatchCapture, dispatchLastCapture } from './capture'
-import { createOverlayWindows, getMainWindow, getOverlayWindow, markQuitting } from './index'
+import { getOverlayWindow, markQuitting } from './index'
 import { startVideoCapture, requestStop as requestVideoStop, isRecordingActive } from './video'
 import { setSetting, getSettings, isRememberedMode } from './settings'
 import type { LastImageMode, LastVideoMode } from './settings'
-import { setOverlayMode } from './scroll-capture'
 
 export interface HotkeyConfig {
   [action: string]: string
@@ -16,7 +15,6 @@ export const defaultHotkeys: HotkeyConfig = {
   ActiveWindow:         'Ctrl+Shift+2',
   ActiveMonitor:        'Ctrl+Shift+3',
   PrintScreen:          'Ctrl+Shift+4',
-  ScrollingCapture:     'Ctrl+Shift+5',
   // `ScreenRecorder` kept as the "Region" video entry for backwards compat
   // with saved configs from older releases.
   ScreenRecorder:       'Ctrl+Shift+6',
@@ -32,7 +30,7 @@ export const ALL_ACTIONS = [
   // Screen Capture
   'PrintScreen', 'ActiveWindow', 'CustomWindow', 'ActiveMonitor',
   'RectangleRegion', 'RectangleLight', 'RectangleTransparent',
-  'CustomRegion', 'LastRegion', 'ScrollingCapture', 'AutoCapture',
+  'CustomRegion', 'LastRegion', 'AutoCapture',
   'StartAutoCapture', 'StopAutoCapture',
   // Screen Record
   'ScreenRecorder', 'ScreenRecorderActiveWindow', 'ScreenRecorderCustomRegion',
@@ -59,10 +57,9 @@ export const ALL_ACTIONS = [
 // should retake control from users who never hand-customized. On load, if the
 // stored version is stale we rewrite the capture/recorder bindings to the new
 // defaults while leaving app-level hotkeys alone (those have stable defaults).
-// NOTE: CLAUDE.md documents this as 5, but it's been bumped to 6.
-const HOTKEY_SCHEMA_VERSION = 6
+const HOTKEY_SCHEMA_VERSION = 7
 const CAPTURE_ACTIONS = [
-  'RectangleRegion', 'ActiveWindow', 'ActiveMonitor', 'PrintScreen', 'ScrollingCapture',
+  'RectangleRegion', 'ActiveWindow', 'ActiveMonitor', 'PrintScreen',
   'ScreenRecorder', 'ScreenRecorderWindow', 'ScreenRecorderScreen',
 ] as const
 
@@ -78,7 +75,6 @@ const PREVIOUS_CAPTURE_DEFAULTS: Record<string, readonly string[]> = {
   ActiveWindow:         ['Ctrl+Shift+2'],
   ActiveMonitor:        ['Ctrl+Shift+3'],
   PrintScreen:          ['Ctrl+Shift+4'],
-  ScrollingCapture:     ['Ctrl+Shift+5'],
   ScreenRecorder:       ['Ctrl+Shift+6'],
   ScreenRecorderWindow: ['Ctrl+Shift+7'],
   ScreenRecorderScreen: ['Ctrl+Shift+8'],
@@ -87,7 +83,9 @@ const PREVIOUS_CAPTURE_DEFAULTS: Record<string, readonly string[]> = {
 // saved config so stale bindings don't linger and accidentally block new keys
 // (e.g. S was `StopScreenRecording` and is now `ScreenRecorderScreen`).
 // `ExitShareAnywhere` was renamed to `ExitLumia` after the rebrand.
-const REMOVED_ACTIONS = ['StopScreenRecording', 'OpenMainWindow', 'WorkflowPicker', 'ExitShareAnywhere'] as const
+// `ScrollingCapture` (Ctrl+Shift+5) was retired — scroll capture starts from
+// the Dashboard Scroll tab or the browser extension's toolbar, not a hotkey.
+const REMOVED_ACTIONS = ['StopScreenRecording', 'OpenMainWindow', 'WorkflowPicker', 'ExitShareAnywhere', 'ScrollingCapture'] as const
 
 const store = new Store<{ hotkeys: HotkeyConfig; schemaVersion?: number }>({
   name: 'hotkeys',
@@ -173,14 +171,8 @@ export function setupHotkeys() {
     PrintScreen:     withLock(async () => { rememberImage('all-screen'); await dispatchCapture('all-screen') }),
     ActiveWindow:    withLock(async () => { rememberImage('window'); await dispatchCapture('window') }),
     ActiveMonitor:   withLock(async () => { rememberImage('screen'); await dispatchCapture('screen') }),
-    ScrollingCapture: withLock(async () => {
-      rememberImage('scrolling')
-      const main = getMainWindow()
-      if (main && !main.isDestroyed()) main.hide()
-      await new Promise(r => setTimeout(r, 200))
-      setOverlayMode('scroll-region')
-      createOverlayWindows()
-    }),
+    // Scroll capture has no global hotkey — it starts from the Dashboard Scroll
+    // tab or the browser extension's toolbar.
     // All three video hotkeys toggle: pressing any of them while recording
     // stops (matches Snipping Tool's UX), otherwise starts in that mode.
     ScreenRecorder:       () => { if (isRecordingActive()) requestVideoStop(); else { rememberVideo('region'); startVideoCapture('region') } },

@@ -7,7 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Lumia is a cross-platform Electron desktop app for screen capture, screen recording, annotation, and sharing (Windows + macOS). Built with Electron 42, React 19, TypeScript, Tailwind CSS 4, and Konva.
 
 Headline features:
-- Image capture: region, active window, active monitor, fullscreen, scrolling capture. The screen is **frozen at hotkey time** (native GDI snapshot on Windows, warm ScreenCaptureKit snapshot on macOS 14+) so captures preserve transient UI like tooltips/popovers
+- Image capture: region, active window, active monitor, fullscreen. The screen is **frozen at hotkey time** (native GDI snapshot on Windows, warm ScreenCaptureKit snapshot on macOS 14+) so captures preserve transient UI like tooltips/popovers
+- Scrolling capture: its own capture kind beside Image/Video, with two methods — a companion **browser extension** (exact DOM scroll offsets over a localhost WebSocket bridge, no stitch guessing; `extension/` at the repo root) and the classic **screen scroll** (synthetic wheel + FFT/SAD overlap stitching) that works on any app
 - Video recording: region / window / fullscreen with floating toolbar + visible region border, plus a live drawing overlay during recording; output WebM is remuxed seekable via bundled ffmpeg
 - Annotation canvas (Konva) with re-editable vector layers stored alongside originals, R2-hosted stickers, and Unsplash background/wallpaper images
 - Workflow pipeline: after-capture → upload → after-upload, configurable per template
@@ -64,10 +65,12 @@ Releases are produced by **GitHub Actions** (`.github/workflows/release.yml`), n
 | `mac-screen-snap.ts` | macOS fast screen capture — long-running Swift `screen-snap` helper (ScreenCaptureKit `SCScreenshotManager`, macOS 14+) with a prewarmed `SCShareableContent` cache; ~50–200 ms/display vs 1–3 s for desktopCapturer at full res. Captures exclude Lumia's own windows by PID (lets the freeze skip the hide-settle wait). Binary BGRA protocol over stdio; macOS ≤ 13 latches `err unsupported` → desktopCapturer fallback |
 | `display-icc.ts` | Reads the OS-attached ICC profile for a display (Windows via GDI `GetICMProfileW`; macOS via a Swift `get-display-icc` helper). Per-display cache invalidated on display changes |
 | `png-icc.ts` | Hand-rolled PNG `iCCP` chunk insert/extract — embeds the display ICC profile into captured PNGs and copies it onto downstream flattened/annotated PNGs |
+| `icc-to-srgb.ts` | Matrix-shaper ICC parser + in-place BGRA→sRGB pixel conversion. Used by the extension capture path: `captureVisibleTab` returns display-color-space pixels, so the stitched bitmap is converted to sRGB with the display's profile (clipboard/editor/uploads/file all agree); non-matrix (LUT) profiles fall back to iCCP tagging |
 | `video.ts` | Recording orchestrator — RecorderHost, RecordingToolbar, RecordingBorder, annotation-overlay windows, getUserMedia stream lifecycle. Receives the recording blob in bounded ~16 MB IPC slices (`recorder:save-begin`/`save-chunk`/`save-end`), writes to `~/Pictures/Lumia/recording-{timestamp}.webm`, then calls `remuxWebmInPlace` to make it seekable. Serves local media to the renderer via the `lumia-media://` protocol with HTTP Range/206 support |
 | `ffmpeg-remux.ts` | `remuxWebmInPlace(path)` — runs bundled ffmpeg `-c copy` (lossless) to rebuild Cues/Duration so MediaRecorder WebM becomes seekable; atomic temp-file replace. Replaced the old in-renderer `ts-ebml`/`webm-seekable.ts` approach (both removed) |
 | `annotation.ts` | Live drawing overlay during video recording — fullscreen click-capturing Konva canvas synced to the recording toolbar. IPC: `annotation:get-state`, `annotation:set-tool`, `annotation:set-color`, `annotation:set-stroke`, `annotation:clear`, `annotation:undo`, `annotation-overlay:set-interactive` |
-| `scroll-capture.ts` | Scrolling screenshot — multi-frame scroll loop with FFT-based overlap detection (`fft.js`) |
+| `scroll-capture.ts` | Classic scrolling screenshot — multi-frame scroll loop with FFT-based overlap detection (`fft.js`). Also owns `launchScrollCapture()`, the unified entry point that routes to the extension bridge or this pipeline based on the `scrollCaptureMethod` setting (implicit calls fall back to screen when the extension is offline; explicit `'extension'` requests fail fast so the UI can show setup help) |
+| `extension-bridge.ts` | Localhost WebSocket server (`ws`, ports 51763–65, extension-origin-only) for the companion browser extension. Runs extension full-page captures — the app hides for the duration (like every other capture mode; no app-side progress dialog), the extension focuses its window (with a native SetForegroundWindow / AppleScript assist from the app, since the OS denies foreground to background processes), locks page interaction behind an invisible blocker + a small status pill (progress + Stop & save button that exports the frames collected so far; only the pill toggles around each shot so nothing full-screen flickers), warm-up scrolls to the bottom and back (lazy-load settles before measuring), then scrolls in overlapped steps (GoFullPage-style: `meta.overlap` — 200 px doc / 100 px pane — is discarded off the top of every frame after the first at stitch time, so viewport-pinned elements the in-page neutralization missed — JS/transform-pinned headers, shadow-DOM sticky — can't repeat) and streams PNG frames + exact offsets back, so stitching is a plain buffer copy. For inner-pane apps (Gmail/Drive/Docs — page doesn't scroll, a middle `<div>` does) the stitch composites full-width: header/footer/side-margins come from frame 0 (chrome preserved, not cropped away — `stitchElementScroller`) while only the pane column is scroll-stitched; whole-document pages use `stitchDocumentScroller`. The finished image is delivered through `sendCaptureToEditor` (the shared capture path: watermark, clipboard, save-to-disk, history, editor navigation / notification) — NOT the classic scroll's `scroll-capture:*` dialog events. Captures also start from the extension's toolbar popup (`popup.html`) which offers three modes — **viewport** (one frame), **fullpage** (scroll + stitch), **region** (in-page element picker: hover highlights the element under the cursor — including inside same-origin iframes (the picker attaches to child docs + tracks each frame's offset) — a d-pad / arrow keys walk the DOM tree — ↑ parent, ↓ child, ←→ siblings — commit on mousedown, green outline = scrollable → crop to that element via `stitchCroppedRegion` — scroll-stitched if it scrolls, else a single frame, no chrome) — threaded through `capture-request`/`capture-start` as `mode`. With several browsers connected the app shows a picker with live tab previews (`scroll-extension:pick` event + `scroll-extension:previews` / `scroll-extension:start-with` IPC). Other IPC: `scroll-capture:launch` (in scroll-capture.ts), `scroll-extension:status`, `scroll-extension:open-folder` |
 | `hotkeys.ts` | `globalShortcut` registration, `HotkeyConfig` electron-store with schema migrations, ShareX-compatible action list |
 | `tray.ts` | System tray icon + context menu |
 | `notify.ts` | Single entry point for toast notifications; on Windows builds custom `toastXml` with hero image so the screenshot renders above the text |
@@ -100,7 +103,7 @@ Releases are produced by **GitHub Actions** (`.github/workflows/release.yml`), n
 - **Entry**: `src/main.tsx` → `HashRouter`
 - **Layout**: `App.tsx` wraps standard routes with `TitleBar` + `Sidebar`. The `/editor` route runs full-width (its own toolbars replace the sidebar).
 - **Routes** (each in `src/windows/<route>/<Pascal>.tsx`):
-  - `/dashboard` — capture launcher + history grid (legacy `/history` redirects here)
+  - `/dashboard` — capture launcher (Image / Video / Scroll kind toggle; the Scroll tab offers Browser Extension vs Screen Scroll method cards with live extension-connection status) + history grid (legacy `/history` redirects here)
   - `/editor` — annotation editor for both image and video (legacy `/video-annotator` redirects here)
   - `/workflow` — template manager
   - `/settings` — preferences + Google Drive auth
@@ -110,7 +113,7 @@ Releases are produced by **GitHub Actions** (`.github/workflows/release.yml`), n
     - `/recording-border` — border outline drawn around the recorded region
     - `/recorder-host` — hidden window that owns `MediaRecorder` and writes blobs
 - **Drawing**: `components/AnnotationCanvas/Canvas.tsx` — Konva stage; `tools.ts` defines the pen/shape/text/blur/sticker/select union; `ToolBar.tsx` is the in-canvas tool picker. Sticker objects store the manifest-relative path in `DrawObject.src` (not a data URL) so `history.json` stays small; the path resolves to a cached data URL at render time
-- **Shared components**: `Sidebar`, `TitleBar`, `AppMenu`, `ShareDialog`, `BackgroundPanel`, `StickerPicker`, `HistoryListRow`, `ScrollCaptureDialog`, `UpdateNotification`, `AboutDialog`, `WorkflowSelector`, `DateGroupedGrid` (the `ReleaseNotesDialog` / "What's New" dialog was removed)
+- **Shared components**: `Sidebar`, `TitleBar`, `AppMenu`, `ShareDialog`, `BackgroundPanel`, `StickerPicker`, `HistoryListRow`, `ScrollCaptureDialog`, `BrowserPickerDialog` (multi-browser chooser with live tab previews for extension scroll capture), `UpdateNotification`, `AboutDialog`, `WorkflowSelector`, `DateGroupedGrid` (the `ReleaseNotesDialog` / "What's New" dialog was removed)
 - **Hooks**: `hooks/useHistory.ts`, `hooks/useLocalVideoUrl.ts`
 - **Action helpers**: `lib/history-actions.ts`, `lib/workflow-actions.ts` — pure functions wrapping `electronAPI` calls so views stay slim
 - **State passing**: React Router `location.state` (e.g., captured `dataUrl` / `historyId` handed to the editor)
@@ -126,7 +129,7 @@ Releases are produced by **GitHub Actions** (`.github/workflows/release.yml`), n
 ### Persistence (electron-store)
 
 Four isolated stores under the OS userData dir:
-- `settings.json` — `AppSettings` (theme, default save path, active workflow, Google Drive tokens, last capture mode/kind, history retention)
+- `settings.json` — `AppSettings` (theme, default save path, active workflow, Google Drive tokens, last capture mode/kind — `lastCaptureKind` is `image | video | scroll` — scroll method (`scrollCaptureMethod`: `extension | screen`), history retention)
 - `templates.json` — user workflow templates (built-ins are code-defined, never persisted)
 - `history.json` — capture history (capped at 1000 entries; thumbnails inline as data URLs)
 - `hotkeys.json` — `HotkeyConfig` with `schemaVersion` for forward migrations of capture-mode bindings
@@ -141,9 +144,11 @@ Four isolated stores under the OS userData dir:
 
 ### Hotkey defaults (Ctrl+Shift+…)
 
-`1` Region · `2` Active Window · `3` Active Monitor · `4` Full Screen · `5` Scrolling · `6` Record Region · `7` Record Window · `8` Record Screen
+`1` Region · `2` Active Window · `3` Active Monitor · `4` Full Screen · `6` Record Region · `7` Record Window · `8` Record Screen
 
-`HOTKEY_SCHEMA_VERSION` (currently 5) gates capture/recorder defaults migration; user-customized app-level bindings are preserved across bumps. Removed actions are stripped via `REMOVED_ACTIONS`.
+Scroll capture has **no global hotkey** — it starts from the Dashboard Scroll tab or the browser extension's toolbar. (`5` was `ScrollingCapture` until schema v7 retired it; the old binding is stripped on migration.)
+
+`HOTKEY_SCHEMA_VERSION` (currently 7) gates capture/recorder defaults migration; user-customized app-level bindings are preserved across bumps. Removed actions are stripped via `REMOVED_ACTIONS`.
 
 ### Design System — Liquid Glass
 
@@ -155,7 +160,7 @@ Custom CSS design tokens in `src/index.css`. Key utility classes: `.glass-refrac
 - **Path alias**: `@/` → `src/` (renderer only)
 - **Tailwind CSS 4** via `@tailwindcss/vite` plugin
 - **electron-builder** packages to `release/`. Output: NSIS for Windows (x64 only — Windows-on-ARM runs it via emulation), DMG for macOS (x64 + arm64). `koffi` is `asarUnpack`ed so the FFI loader can read its native binaries at runtime; the `files` array drops koffi's prebuilt binaries for platforms we never package (keeps only win32_x64 + darwin_x64/arm64).
-- `extraResources`: `resources/tray/*.{png,ico}` copied to `tray/` so the tray module finds icons in packaged builds.
+- `extraResources`: `resources/tray/*.{png,ico}` copied to `tray/` so the tray module finds icons in packaged builds; `extension/` copied to `Resources/extension` so users can Load-unpacked the scroll-capture browser extension (the `scroll-extension:open-folder` IPC opens it).
 - **ffmpeg**: the afterPack hook (`build/embed-ffmpeg.cjs`) embeds a per-arch ffmpeg into Resources. Lumia only runs `ffmpeg -i in.webm -c copy -f webm out.webm`, so both platforms prefer a **minimal matroska-only build** (~2.5 MB vs ffmpeg-static's ~78–82 MB):
   - **Windows** — cross-compiled with mingw-w64 via `build/build-minimal-ffmpeg-win.sh` (locally: `pnpm ffmpeg:min:win` → Docker; in CI the `ffmpeg-win` job uploads it as an artifact `release-win` downloads to `build/minimal-ffmpeg/dist/`).
   - **macOS** — compiled with clang via `build/build-minimal-ffmpeg-mac.sh` per arch (locally: `pnpm ffmpeg:min:mac`; in CI the `release-mac` job builds both arms — macos-latest is arm64, so x64 is cross-built via `clang -arch x86_64` — into `build/minimal-ffmpeg/dist/ffmpeg-darwin-<arch>`).
@@ -184,5 +189,8 @@ Custom CSS design tokens in `src/index.css`. Key utility classes: `.glass-refrac
 - `MAIN_VITE_GDRIVE_CLIENT_ID`, `MAIN_VITE_GDRIVE_CLIENT_SECRET` — Google Drive OAuth
 - `MAIN_VITE_GDRIVE_API_KEY`, `MAIN_VITE_GDRIVE_PROJECT_NUMBER` — Google Picker API (in-app Drive folder browser)
 - `MAIN_VITE_UNSPLASH_ACCESS_KEY` — Unsplash API for the in-app Wallpapers browser
+
+`RENDERER_VITE_*` vars are baked into the **renderer** bundle instead (electron-vite exposes them via `import.meta.env`; typed in `src/vite-env.d.ts`):
+- `RENDERER_VITE_CHROME_WEB_STORE_URL` — public Chrome Web Store listing for the scroll-capture extension; the Dashboard's "Add to Chrome" setup button appears only when set.
 
 These are **not** user-facing settings — distributing the app means embedding R2/Drive credentials in the bundle. Per-user state (refresh tokens, folder IDs) lives in `settings.json`.

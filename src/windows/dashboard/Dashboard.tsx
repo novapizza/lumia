@@ -2,15 +2,23 @@ import { useState, useEffect, useMemo, useCallback, useRef, type MouseEvent as R
 import { useNavigate } from 'react-router-dom'
 import type { HistoryItem } from '../../types'
 import ScrollCaptureDialog from '../../components/ScrollCaptureDialog'
+import BrowserPickerDialog from '../../components/BrowserPickerDialog'
 import { DateGroupedGrid } from '../../components/DateGroupedGrid'
 import { HistoryListRow } from '../../components/HistoryListRow'
 import { copyHistoryItem, shareHistoryItem, shareHistoryGoogleDrive } from '../../lib/history-actions'
 
-type CaptureMode = 'region' | 'window' | 'all-screen' | 'screen' | 'scrolling'
+type CaptureMode = 'region' | 'window' | 'all-screen' | 'screen'
 type VideoMode = 'region' | 'window' | 'screen'
-type MediaKind = 'image' | 'video'
+type MediaKind = 'image' | 'video' | 'scroll'
+type ScrollMethod = 'extension' | 'screen'
 type FilterType = 'all' | 'screenshot' | 'recording'
 type ViewMode = 'grid' | 'list'
+
+// Public Chrome Web Store listing for the Lumia Scroll Capture extension, from
+// RENDERER_VITE_CHROME_WEB_STORE_URL in .env (baked into the renderer at build
+// time; e.g. https://chromewebstore.google.com/detail/<extension-id>). When
+// unset the setup panel shows the manual "Load unpacked" flow only.
+const CHROME_WEB_STORE_URL = import.meta.env.RENDERER_VITE_CHROME_WEB_STORE_URL ?? ''
 
 // Map capture mode → hotkey action name (from electron/hotkeys.ts)
 const MODE_ACTION: Record<CaptureMode, string> = {
@@ -18,7 +26,6 @@ const MODE_ACTION: Record<CaptureMode, string> = {
   window: 'ActiveWindow',
   'all-screen': 'PrintScreen',
   screen: 'ActiveMonitor',
-  scrolling: 'ScrollingCapture',
 }
 
 const VIDEO_MODE_ACTION: Record<VideoMode, string> = {
@@ -79,6 +86,11 @@ export default function Dashboard() {
   const [filter, setFilter] = useState<FilterType>('all')
   const [hotkeys, setHotkeys] = useState<Record<string, string>>({})
   const [mediaKind, setMediaKind] = useState<MediaKind>('image')
+  const [scrollMethod, setScrollMethod] = useState<ScrollMethod>('screen')
+  const [extStatus, setExtStatus] = useState<{ connected: boolean; browsers: string[] }>({ connected: false, browsers: [] })
+  const [showExtSetup, setShowExtSetup] = useState(false)
+  const [storeUrlCopied, setStoreUrlCopied] = useState(false)
+  const [showBrowserPicker, setShowBrowserPicker] = useState(false)
   const [viewMode, setViewMode] = useState<ViewMode>(() =>
     (localStorage.getItem('lumia:history-view') as ViewMode) || 'grid'
   )
@@ -105,11 +117,23 @@ export default function Dashboard() {
       })
     }
     window.electronAPI?.getSettings().then(s => {
+      // Scroll is never remembered as the active kind (it's a deliberate
+      // capture), so only restore the Image / Video tab across launches.
       if (s?.lastCaptureKind === 'video' || s?.lastCaptureKind === 'image') {
         setMediaKind(s.lastCaptureKind)
       }
+      if (s?.scrollCaptureMethod === 'extension' || s?.scrollCaptureMethod === 'screen') {
+        setScrollMethod(s.scrollCaptureMethod)
+      }
       setGdriveReady(!!(s?.googleDriveConnected && s?.googleDriveFolderId))
     })
+    // Extension-bridge status for the Scroll tab: initial pull + live push
+    // whenever the browser extension attaches or drops off.
+    window.electronAPI?.getScrollExtensionStatus?.().then(st => { if (st) setExtStatus(st) })
+    window.electronAPI?.onScrollExtensionStatus?.(st => setExtStatus(st))
+    // Main asks for the browser picker when an extension capture starts with
+    // several browsers connected (Dashboard card, hotkey, or New Capture).
+    window.electronAPI?.onScrollExtensionPick?.(() => setShowBrowserPicker(true))
     // Settings can change while we're on this view (user goes to Settings,
     // connects Drive, comes back) — refresh on connect events + window focus.
     window.electronAPI?.onGdriveConnected(refreshGdriveReady)
@@ -136,6 +160,8 @@ export default function Dashboard() {
       window.electronAPI?.removeAllListeners('capture:ready')
       window.electronAPI?.removeAllListeners('recorder:open')
       window.electronAPI?.removeAllListeners('scroll-capture:open')
+      window.electronAPI?.removeAllListeners('scroll-extension:status')
+      window.electronAPI?.removeAllListeners('scroll-extension:pick')
       window.electronAPI?.removeAllListeners('gdrive:connected')
       window.removeEventListener('focus', onWindowFocus)
     }
@@ -143,31 +169,43 @@ export default function Dashboard() {
 
   const selectMediaKind = (kind: MediaKind) => {
     setMediaKind(kind)
-    window.electronAPI?.setSetting('lastCaptureKind', kind)
+    // Scroll is a deliberate, explicit capture — never remember it as the kind
+    // that "New Capture" / PrtSc replays. Only image/video are remembered.
+    if (kind !== 'scroll') window.electronAPI?.setSetting('lastCaptureKind', kind)
   }
 
   const handleCapture = async (mode: CaptureMode) => {
     // Send every selection; the remember policy lives in main's settings:set
     // handler (isRememberedMode): only Region / Window update the replay mode
-    // that "New Capture" / PrtSc re-run — screen / all-screen / scrolling are
-    // one-shots that just flip the kind back to image.
+    // that "New Capture" / PrtSc re-run — screen / all-screen are one-shots
+    // that just flip the kind back to image.
     window.electronAPI?.setSetting('lastCaptureKind', 'image')
     window.electronAPI?.setSetting('lastImageMode', mode)
-    if (mode === 'scrolling') {
-      await window.electronAPI?.startScrollCapture()
-    } else {
-      // Main drives navigation via `sendCaptureToEditor` (sends a `navigate`
-      // event with historyId so subsequent uploads merge into the new entry
-      // instead of creating a duplicate). Don't navigate again here — that
-      // overwrites the state and drops the historyId.
-      await window.electronAPI?.captureScreenshot(mode)
-    }
+    // Main drives navigation via `sendCaptureToEditor` (sends a `navigate`
+    // event with historyId so subsequent uploads merge into the new entry
+    // instead of creating a duplicate). Don't navigate again here — that
+    // overwrites the state and drops the historyId.
+    await window.electronAPI?.captureScreenshot(mode)
   }
 
   const handleVideo = (mode: VideoMode) => {
     window.electronAPI?.setSetting('lastCaptureKind', 'video')
     window.electronAPI?.setSetting('lastVideoMode', mode)
     window.electronAPI?.startVideoCapture?.(mode)
+  }
+
+  const handleScroll = async (method: ScrollMethod) => {
+    setScrollMethod(method)
+    // Deliberately do NOT persist lastCaptureKind='scroll' — scroll must not
+    // become the mode that "New Capture" / PrtSc replays. Only the chosen
+    // method is remembered (for the next explicit scroll capture).
+    window.electronAPI?.setSetting('scrollCaptureMethod', method)
+    const r = await window.electronAPI?.launchScrollCapture?.(method)
+    // Explicit extension request with no extension attached → open setup help
+    // instead of silently falling back.
+    if (method === 'extension' && r && !r.ok && r.error === 'extension-not-connected') {
+      setShowExtSetup(true)
+    }
   }
 
   const screenshots = recentItems.filter(i => i.type === 'screenshot')
@@ -373,29 +411,8 @@ export default function Dashboard() {
                 </button>
               )
             })}
-            <button
-              onClick={() => handleCapture('scrolling')}
-              className="group w-44 flex items-center gap-3 px-3 py-3 rounded-xl
-                         bg-white/[0.03] border border-white/[0.05]
-                         hover:bg-primary/[0.08] hover:border-primary/20
-                         active:scale-[0.98] transition-all duration-200 cursor-pointer"
-            >
-              <div className="w-9 h-9 rounded-lg bg-primary/10 flex items-center justify-center flex-shrink-0
-                              group-hover:bg-primary/20 transition-colors duration-200">
-                <span className="material-symbols-outlined text-primary text-lg">swipe_down</span>
-              </div>
-              <div className="text-left min-w-0">
-                <span
-                  className="block text-xs font-semibold text-slate-200 group-hover:text-white transition-colors truncate"
-                  style={{ fontFamily: 'Manrope, sans-serif' }}
-                >
-                  Scrolling
-                </span>
-                {hotkeys.ScrollingCapture && <KeyCombo keys={parseShortcut(hotkeys.ScrollingCapture)} />}
-              </div>
-            </button>
           </div>
-        ) : (
+        ) : mediaKind === 'video' ? (
           <div className="flex flex-wrap gap-2">
             {VIDEO_MODES.map(({ mode, icon, label }) => {
               const hotkey = hotkeys[VIDEO_MODE_ACTION[mode]]
@@ -424,6 +441,168 @@ export default function Dashboard() {
                 </button>
               )
             })}
+          </div>
+        ) : (
+          <div className="space-y-3">
+            <div className="flex flex-wrap gap-2">
+              {/* Browser Extension — exact DOM offsets, no stitch guessing */}
+              <button
+                onClick={() => handleScroll('extension')}
+                className="group w-64 flex items-center gap-3 px-3 py-3 rounded-xl
+                           bg-white/[0.03] border border-white/[0.05]
+                           hover:bg-secondary/[0.08] hover:border-secondary/20
+                           active:scale-[0.98] transition-all duration-200 cursor-pointer"
+              >
+                <div className="w-9 h-9 rounded-lg bg-secondary/10 flex items-center justify-center flex-shrink-0
+                                group-hover:bg-secondary/20 transition-colors duration-200">
+                  <span className="material-symbols-outlined text-secondary text-lg">extension</span>
+                </div>
+                <div className="text-left min-w-0 flex-1">
+                  <span
+                    className="block text-xs font-semibold text-slate-200 group-hover:text-white transition-colors truncate"
+                    style={{ fontFamily: 'Manrope, sans-serif' }}
+                  >
+                    Browser Extension
+                  </span>
+                  <span className="flex items-center gap-1.5 mt-1">
+                    <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${extStatus.connected ? 'bg-emerald-400' : 'bg-slate-600'}`} />
+                    <span className={`text-[10px] font-medium truncate ${extStatus.connected ? 'text-emerald-400' : 'text-slate-500'}`}>
+                      {extStatus.connected
+                        ? `Connected · ${extStatus.browsers.length > 1
+                            ? `${extStatus.browsers.length} browsers`
+                            : extStatus.browsers[0] ?? 'browser'}`
+                        : 'Not connected — click to set up'}
+                    </span>
+                  </span>
+                </div>
+              </button>
+
+              {/* Classic screen scroll — synthetic wheel + stitch, any app */}
+              <button
+                onClick={() => handleScroll('screen')}
+                className="group w-64 flex items-center gap-3 px-3 py-3 rounded-xl
+                           bg-white/[0.03] border border-white/[0.05]
+                           hover:bg-secondary/[0.08] hover:border-secondary/20
+                           active:scale-[0.98] transition-all duration-200 cursor-pointer"
+              >
+                <div className="w-9 h-9 rounded-lg bg-secondary/10 flex items-center justify-center flex-shrink-0
+                                group-hover:bg-secondary/20 transition-colors duration-200">
+                  <span className="material-symbols-outlined text-secondary text-lg">swipe_down</span>
+                </div>
+                <div className="text-left min-w-0 flex-1">
+                  <span
+                    className="block text-xs font-semibold text-slate-200 group-hover:text-white transition-colors truncate"
+                    style={{ fontFamily: 'Manrope, sans-serif' }}
+                  >
+                    Screen Scroll
+                  </span>
+                  <span className="block text-[10px] font-medium text-slate-500 mt-1 truncate">
+                    Works with any app or window
+                  </span>
+                </div>
+              </button>
+            </div>
+
+            {/* Always-available entry to the install guide — so you can add the
+                 extension to another browser or profile even when one is
+                 already connected. */}
+            <button
+              onClick={() => setShowExtSetup(v => !v)}
+              className="inline-flex items-center gap-1.5 text-[11px] font-medium text-slate-500 hover:text-secondary transition-colors"
+              style={{ fontFamily: 'Manrope, sans-serif' }}
+            >
+              <span className="material-symbols-outlined text-sm">{showExtSetup ? 'expand_less' : 'add'}</span>
+              {extStatus.connected ? 'Install on another browser or profile' : 'How to install the extension'}
+            </button>
+
+            {showExtSetup && (
+              <div className="max-w-xl p-4 rounded-xl bg-secondary/[0.06] border border-secondary/15 space-y-3">
+                <div className="flex items-center justify-between">
+                  <p className="text-xs font-bold text-white" style={{ fontFamily: 'Manrope, sans-serif' }}>
+                    Install the browser extension
+                  </p>
+                  <button onClick={() => setShowExtSetup(false)} className="text-slate-500 hover:text-white transition-colors">
+                    <span className="material-symbols-outlined text-sm">close</span>
+                  </button>
+                </div>
+                <p className="text-[11px] text-slate-400 leading-relaxed">
+                  Capture scrolling screenshots straight from your browser. Install it in each browser or
+                  profile you want to use — Lumia connects automatically and the dot turns green.
+                </p>
+
+                {/* Primary: one-click Chrome Web Store install (Chromium browsers) */}
+                {CHROME_WEB_STORE_URL ? (
+                  <div className="space-y-1.5">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <button
+                        onClick={() => window.electronAPI?.openExternal?.(CHROME_WEB_STORE_URL)}
+                        className="inline-flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs font-bold primary-gradient text-slate-900 hover:opacity-90 active:scale-[0.98] transition-all"
+                        style={{ fontFamily: 'Manrope, sans-serif' }}
+                      >
+                        <span className="material-symbols-outlined text-sm">extension</span>
+                        Add to Chrome
+                      </button>
+                      <button
+                        onClick={async () => {
+                          await window.electronAPI?.writeClipboardText?.(CHROME_WEB_STORE_URL)
+                          setStoreUrlCopied(true)
+                          setTimeout(() => setStoreUrlCopied(false), 1600)
+                        }}
+                        className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold bg-white/[0.06] border border-white/10 text-slate-200 hover:bg-white/10 active:scale-[0.98] transition-all"
+                        style={{ fontFamily: 'Manrope, sans-serif' }}
+                      >
+                        <span className="material-symbols-outlined text-sm">{storeUrlCopied ? 'check' : 'content_copy'}</span>
+                        {storeUrlCopied ? 'Copied' : 'Copy link'}
+                      </button>
+                    </div>
+                    <p className="text-[10px] text-slate-500">
+                      Opens in your default browser — if that isn't Chrome, copy the link and paste it into the
+                      browser you want. Works in Edge, Brave, Opera, and other Chromium browsers.
+                    </p>
+                  </div>
+                ) : (
+                  <p className="text-[10px] text-slate-500 italic">A one-click Chrome Web Store install is on the way. For now, load it manually:</p>
+                )}
+
+                {/* Secondary: manual load-unpacked, collapsed once the store link exists */}
+                <details open={!CHROME_WEB_STORE_URL} className="group">
+                  <summary className="cursor-pointer select-none text-[11px] font-semibold text-slate-300 hover:text-white transition-colors">
+                    Install manually (developer mode)
+                  </summary>
+                  <ol className="mt-2 text-[11px] text-slate-400 space-y-1 list-decimal list-inside">
+                    <li>Open the extension folder below.</li>
+                    <li>Go to <span className="text-slate-300 font-mono">chrome://extensions</span> and enable <span className="text-slate-300">Developer mode</span>.</li>
+                    <li>Click <span className="text-slate-300">Load unpacked</span> and select the folder.</li>
+                    <li>Keep Lumia running — the status dot turns green within a few seconds.</li>
+                  </ol>
+                  <button
+                    onClick={() => window.electronAPI?.openScrollExtensionFolder?.()}
+                    className="mt-2 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-semibold bg-secondary/15 text-secondary hover:bg-secondary/25 transition-all"
+                    style={{ fontFamily: 'Manrope, sans-serif' }}
+                  >
+                    <span className="material-symbols-outlined text-sm">folder_open</span>
+                    Open Extension Folder
+                  </button>
+                </details>
+
+                {/* Live connection status */}
+                {extStatus.connected ? (
+                  <div className="flex items-center gap-1.5 pt-0.5">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 flex-shrink-0" />
+                    <span className="text-[10px] text-emerald-400">
+                      Connected{extStatus.browsers.length
+                        ? ` · ${extStatus.browsers.length > 1 ? `${extStatus.browsers.length} browsers` : extStatus.browsers[0]}`
+                        : ''} — install it in another browser or profile above to add it there too.
+                    </span>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-1.5 pt-0.5">
+                    <span className="w-1.5 h-1.5 rounded-full bg-slate-600 animate-pulse flex-shrink-0" />
+                    <span className="text-[10px] text-slate-500">Waiting for the extension to connect…</span>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         )}
       </section>
@@ -608,6 +787,7 @@ export default function Dashboard() {
       </section>
 
       {showScrollCapture && <ScrollCaptureDialog onClose={() => setShowScrollCapture(false)} />}
+      {showBrowserPicker && <BrowserPickerDialog onClose={() => setShowBrowserPicker(false)} />}
     </div>
   )
 }
@@ -631,6 +811,14 @@ function MediaKindToggle({ value, onChange }: { value: MediaKind; onChange: (v: 
       activeBg: 'bg-tertiary/15',
       activeBorder: 'border-tertiary/25',
       activeIcon: 'text-tertiary',
+    },
+    {
+      kind: 'scroll',
+      icon: 'swipe_down',
+      label: 'Scroll',
+      activeBg: 'bg-secondary/15',
+      activeBorder: 'border-secondary/25',
+      activeIcon: 'text-secondary',
     },
   ]
   return (

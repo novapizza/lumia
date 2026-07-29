@@ -39,9 +39,14 @@ let _GetWindowLongW: (hwnd: any, index: number) => number
 let _GetWindow: (hwnd: any, uCmd: number) => any
 let _GetTopWindow: (hwnd: any) => any
 let _GetForegroundWindow: () => any
+let _AttachThreadInput: (idAttach: number, idAttachTo: number, fAttach: boolean) => boolean
+let _BringWindowToTop: (hwnd: any) => boolean
+let _GetCurrentThreadId: () => number
 let _GetWindowThreadProcessId: (hwnd: any, pid: any) => number
 let _GetClassNameW: (hwnd: any, buf: any, maxCount: number) => number
 let _GetWindowTextLengthW: (hwnd: any) => number
+let _GetWindowTextW: (hwnd: any, buf: any, maxCount: number) => number
+let _ShowWindow: (hwnd: any, nCmdShow: number) => boolean
 let _EnumWindows: (callback: any, lParam: any) => boolean
 let _DwmGetWindowAttribute: (hwnd: any, attr: number, pvAttribute: any, cbAttribute: number) => number
 // Same DWM API but with the output typed as a DWORD pointer — used for
@@ -88,9 +93,14 @@ function ensureLoaded(): boolean {
     _GetWindow       = user32.func('intptr_t __stdcall GetWindow(intptr_t hWnd, uint32_t uCmd)')
     _GetTopWindow    = user32.func('intptr_t __stdcall GetTopWindow(intptr_t hWnd)')
     _GetForegroundWindow = user32.func('intptr_t __stdcall GetForegroundWindow()')
+    _AttachThreadInput = user32.func('bool __stdcall AttachThreadInput(uint32_t idAttach, uint32_t idAttachTo, bool fAttach)')
+    _BringWindowToTop = user32.func('bool __stdcall BringWindowToTop(intptr_t hWnd)')
+    _GetCurrentThreadId = koffi.load('kernel32.dll').func('uint32_t __stdcall GetCurrentThreadId()')
     _GetWindowThreadProcessId = user32.func('uint32_t __stdcall GetWindowThreadProcessId(intptr_t hWnd, _Out_ uint32_t *lpdwProcessId)')
     _GetClassNameW   = user32.func('int __stdcall GetClassNameW(intptr_t hWnd, _Out_ uint16_t *lpClassName, int nMaxCount)')
     _GetWindowTextLengthW = user32.func('int __stdcall GetWindowTextLengthW(intptr_t hWnd)')
+    _GetWindowTextW  = user32.func('int __stdcall GetWindowTextW(intptr_t hWnd, _Out_ uint16_t *lpString, int nMaxCount)')
+    _ShowWindow      = user32.func('bool __stdcall ShowWindow(intptr_t hWnd, int nCmdShow)')
     _EnumWindows     = user32.func('bool __stdcall EnumWindows(intptr_t lpEnumFunc, intptr_t lParam)')
     // SetThreadDpiAwarenessContext is available on Win10 1607+. Used to force
     // GetWindowRect to return virtualized (primary-scale) DIP coords, dodging
@@ -378,6 +388,86 @@ export function listTopLevelWindowsPhysical(): Array<{ hwnd: any; x: number; y: 
     if (prevCtx && _SetThreadDpiAwarenessContext) {
       try { _SetThreadDpiAwarenessContext(prevCtx) } catch { /* ignore */ }
     }
+  }
+}
+
+/** Bring the first visible top-level window whose title starts with (or
+ *  contains) `titlePrefix` to the foreground, restoring it if minimized.
+ *
+ *  Used by the extension scroll capture: the browser's own
+ *  `chrome.windows.update({focused:true})` is denied foreground by Windows
+ *  when another app (Lumia) holds it — but Lumia, AS the foreground process,
+ *  is always allowed to hand foreground to another window. The prefix comes
+ *  from the tab title the extension reports; browser window titles are
+ *  "<tab title> - Google Chrome" etc., so startsWith matches. */
+export function focusWindowByTitlePrefix(titlePrefix: string): boolean {
+  if (!ensureLoaded()) return false
+  // Clamp long titles (GetWindowTextW output is capped by our 512-char buffer)
+  // and reject too-short needles ("X", "•") that would false-positive across
+  // unrelated apps.
+  const needle = titlePrefix.trim().slice(0, 200)
+  if (needle.length < 5) return false
+  try {
+    const GW_HWNDNEXT = 2
+    const SW_RESTORE = 9
+    const textBuf = new Uint16Array(512)
+    let hwnd = _GetTopWindow(0)
+    let attempts = 0
+    while (hwnd && attempts < 2000) {
+      attempts++
+      if (_IsWindowVisible(hwnd) && _GetWindowTextLengthW(hwnd) > 0) {
+        const pidOut = [0]
+        _GetWindowThreadProcessId(hwnd, pidOut)
+        if (pidOut[0] !== process.pid) {
+          const n = _GetWindowTextW(hwnd, textBuf, textBuf.length)
+          const text = String.fromCharCode(...textBuf.subarray(0, Math.max(0, n)))
+          if (text.startsWith(needle) || text.includes(needle)) {
+            if (_IsIconic(hwnd)) _ShowWindow(hwnd, SW_RESTORE)
+            return _SetForegroundWindow(hwnd)
+          }
+        }
+      }
+      hwnd = _GetWindow(hwnd, GW_HWNDNEXT)
+    }
+  } catch { /* fall through */ }
+  return false
+}
+
+/** Force Lumia's OWN window to the foreground with keyboard focus.
+ *
+ *  Electron's win.focus() calls SetForegroundWindow, which Windows silently
+ *  ignores when another process holds the foreground — e.g. right after an
+ *  extension scroll capture, when the browser is still foreground and Lumia
+ *  hid itself during the capture (so it's a background process). Attaching our
+ *  input thread to the current foreground window's thread lifts that lock, so
+ *  SetForegroundWindow is honored; then we detach again. No synthetic input,
+ *  so the browser sees no stray keystroke. */
+export function focusOwnWindowForeground(win: { isDestroyed(): boolean; getNativeWindowHandle(): Buffer }): boolean {
+  if (process.platform !== 'win32') return false
+  if (!ensureLoaded()) return false
+  if (win.isDestroyed()) return false
+  try {
+    const SW_SHOW = 5, SW_RESTORE = 9
+    const buf = win.getNativeWindowHandle()
+    const hwnd = buf.length >= 8 ? buf.readBigInt64LE(0) : BigInt(buf.readInt32LE(0))
+    _ShowWindow(hwnd, _IsIconic(hwnd) ? SW_RESTORE : SW_SHOW)
+
+    const fg = _GetForegroundWindow()
+    const myThread = _GetCurrentThreadId()
+    let fgThread = 0
+    let attached = false
+    if (fg) {
+      const pidOut = [0]
+      fgThread = _GetWindowThreadProcessId(fg, pidOut)
+      if (fgThread && fgThread !== myThread) attached = _AttachThreadInput(myThread, fgThread, true)
+    }
+    _BringWindowToTop(hwnd)
+    const ok = _SetForegroundWindow(hwnd)
+    if (attached) _AttachThreadInput(myThread, fgThread, false)
+    return ok
+  } catch (err) {
+    console.warn('[native-input] focusOwnWindowForeground failed', err)
+    return false
   }
 }
 

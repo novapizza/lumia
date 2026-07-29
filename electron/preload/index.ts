@@ -128,6 +128,25 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.invoke('scroll-region:confirm', rect),
   cancelScrollRegion: () =>
     ipcRenderer.invoke('scroll-region:cancel'),
+  // Unified scroll launcher (routes to extension bridge or classic screen
+  // pipeline) + extension-bridge status for the Dashboard's Scroll tab
+  launchScrollCapture: (method?: 'extension' | 'screen') =>
+    ipcRenderer.invoke('scroll-capture:launch', method),
+  getScrollExtensionStatus: () =>
+    ipcRenderer.invoke('scroll-extension:status'),
+  onScrollExtensionStatus: (cb: (status: { connected: boolean; browsers: string[] }) => void) =>
+    ipcRenderer.on('scroll-extension:status', (_e, status) => cb(status)),
+  openScrollExtensionFolder: () =>
+    ipcRenderer.invoke('scroll-extension:open-folder'),
+  // Multi-browser picker: live tab previews from every connected browser,
+  // session start pinned to the picked one, and the main-pushed event that
+  // tells the Dashboard to open the picker.
+  getScrollExtensionPreviews: () =>
+    ipcRenderer.invoke('scroll-extension:previews'),
+  startScrollCaptureWith: (clientId: number) =>
+    ipcRenderer.invoke('scroll-extension:start-with', clientId),
+  onScrollExtensionPick: (cb: () => void) =>
+    ipcRenderer.on('scroll-extension:pick', cb),
   getOverlayMode: () =>
     ipcRenderer.invoke('overlay:get-mode'),
 

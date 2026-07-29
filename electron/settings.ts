@@ -3,15 +3,19 @@ import { access } from 'fs/promises'
 import { homedir } from 'os'
 import { join } from 'path'
 
-export type CaptureKind = 'image' | 'video'
+export type CaptureKind = 'image' | 'video' | 'scroll'
 export type LastImageMode = 'region' | 'window' | 'all-screen' | 'screen' | 'scrolling'
 export type LastVideoMode = 'region' | 'window' | 'screen'
+export type ScrollCaptureMethod = 'extension' | 'screen'
 
 /** Deliberate remember policy: only explicit Region / Window picks update the
- *  replay mode that "New Capture" / PrtSc re-run. Everything else (screen,
- *  all-screen, scrolling) is a one-shot — it still flips lastCaptureKind, but
- *  New Capture should never replay an all-monitor grab or a scroll session.
- *  Enforced at every write site: the settings:set IPC handler (renderer
+ *  IMAGE replay mode that "New Capture" / PrtSc re-run. Screen / all-screen
+ *  are one-shots — they still flip lastCaptureKind, but New Capture should
+ *  never replay an all-monitor grab. Scroll is a deliberate capture (Dashboard
+ *  Scroll tab / browser extension) and is NEVER remembered — the renderer
+ *  doesn't persist lastCaptureKind='scroll' and dispatchLastCapture ignores
+ *  it, so New Capture / PrtSc replay the last image/video capture instead of a
+ *  scroll. Enforced at every write site: the settings:set IPC handler (renderer
  *  writers — Dashboard, overlay ModeBar) and hotkeys' remember helpers, plus
  *  a load-time normalization below for values persisted by older builds. */
 export function isRememberedMode(mode: unknown): mode is 'region' | 'window' {
@@ -31,6 +35,11 @@ export interface AppSettings {
   lastCaptureKind: CaptureKind
   lastImageMode: LastImageMode
   lastVideoMode: LastVideoMode
+  /** How the Scroll capture kind runs: 'extension' drives the companion
+   *  browser extension over the local WebSocket bridge (exact DOM offsets,
+   *  no stitch guessing); 'screen' is the classic synthetic-wheel +
+   *  screen-grab + stitch pipeline that works on any app. */
+  scrollCaptureMethod: ScrollCaptureMethod
   /** When true, the physical PrintScreen key is bound to "New Capture" via a
    *  globalShortcut, and on Windows the "PrintScreen opens Snipping Tool"
    *  registry hijack is turned off so the keystroke reaches us. The binding
@@ -89,6 +98,7 @@ const store = new Store<AppSettings>({
     lastCaptureKind: 'image',
     lastImageMode: 'region',
     lastVideoMode: 'region',
+    scrollCaptureMethod: 'screen',
     printScreenAsCapture: PRINT_SCREEN_DEFAULT,
     printScreenPromptShown: PRINT_SCREEN_DEFAULT,
     wallpaperCategories: [],
@@ -126,6 +136,7 @@ export function getSettings(): AppSettings {
     lastCaptureKind: store.get('lastCaptureKind'),
     lastImageMode: store.get('lastImageMode'),
     lastVideoMode: store.get('lastVideoMode'),
+    scrollCaptureMethod: store.get('scrollCaptureMethod'),
     printScreenAsCapture: store.get('printScreenAsCapture'),
     printScreenPromptShown: store.get('printScreenPromptShown'),
     wallpaperCategories: store.get('wallpaperCategories'),
