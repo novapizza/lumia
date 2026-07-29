@@ -34,8 +34,8 @@ There is **no test framework, linter, or formatter** configured. Type-check via 
 
 ### Releases
 
-Releases are produced by **GitHub Actions** (`.github/workflows/release.yml`), not local scripts. Both `build:win` and `build:mac` skip code-signing locally (`CSC_IDENTITY_AUTO_DISCOVERY=false`); CI provides certs via repo secrets:
-- Windows: `WIN_CSC_LINK` (base64 .pfx) + `WIN_CSC_KEY_PASSWORD`
+Releases are produced by **GitHub Actions** (`.github/workflows/release.yml`), not local scripts. Both `build:win` and `build:mac` skip code-signing locally (`CSC_IDENTITY_AUTO_DISCOVERY=false`); CI signs via repo secrets:
+- Windows: **Azure Trusted Signing** — `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET` (CLI auth) + `AZURE_PUBLISHER_NAME`, `AZURE_TRUSTED_SIGNING_ENDPOINT`, `AZURE_CODE_SIGNING_ACCOUNT_NAME`, `AZURE_CERT_PROFILE_NAME` (injected into `azureSignOptions` by `electron-builder.cjs`; if any is missing the config omits `azureSignOptions` and the build proceeds unsigned)
 - macOS: `CSC_LINK` (base64 .p12) + `CSC_KEY_PASSWORD`, plus `APPLE_*` env vars for notarization
 
 `build/notarize.cjs` exits cleanly when notarization credentials are absent (so local unsigned builds still succeed). Published artifacts go to a Cloudflare R2 bucket served at `https://release.lumia.asia` (S3 publisher uploads, `generic` provider for client downloads). `electron-updater` polls `latest.yml` / `latest-mac.yml` from that origin every 4 hours. The 1.2.x line published to GitHub Releases as well; 2.0.0+ is R2-only — see `electron-builder.cjs` for the publish array.
