@@ -1,4 +1,4 @@
-import { ipcMain, app, nativeImage, shell, type BrowserWindow } from 'electron'
+import { ipcMain, app, nativeImage, screen, shell, type BrowserWindow } from 'electron'
 import { WebSocketServer, WebSocket } from 'ws'
 import { join } from 'path'
 import { setTimeout as sleep } from 'timers/promises'
@@ -509,9 +509,18 @@ async function runExtensionSession(
 
     if (!result.meta) throw new Error('Extension did not report page metrics')
     const dataUrl = stitchExtensionFrames(result.frames, result.meta)
+    // captureVisibleTab returns the compositor's output — pixels in the
+    // DISPLAY's color space, with no embedded profile. Untagged they get
+    // interpreted as sRGB and show a slight cast on color-managed /
+    // wide-gamut screens, so tag the saved PNG with the display's ICC
+    // profile exactly like the classic screen captures do. The browser's
+    // display isn't directly knowable; the cursor's display is the best
+    // proxy — the user just interacted with the capture pill there (and on
+    // single-monitor setups it's trivially right).
+    const displayId = screen.getDisplayNearestPoint(screen.getCursorScreenPoint()).id
     // Deliver like a normal capture: this surfaces the editor (or, if the
     // app was dismissed to tray, just a notification) and handles history.
-    await sendCaptureToEditor(dataUrl, 'scrolling')
+    await sendCaptureToEditor(dataUrl, 'scrolling', displayId)
     return { ok: true }
   } catch (err) {
     if (wasCancelled) return { ok: false, error: 'cancelled' }
