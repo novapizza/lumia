@@ -21,6 +21,24 @@ chrome.runtime.sendMessage({ type: 'lumia-get-status' }, (res) => {
   setConnected(!!(res && res.connected))
 })
 
+// Popup-started captures ride on activeTab (granted by opening this popup).
+// App-started captures + live tab previews need the optional <all_urls>
+// grant — offer it here, once.
+const perm = document.getElementById('perm')
+async function refreshPerm() {
+  try {
+    const granted = await chrome.permissions.contains({ origins: ['<all_urls>'] })
+    perm.style.display = granted ? 'none' : 'block'
+  } catch { /* leave hidden */ }
+}
+refreshPerm()
+document.getElementById('grant').addEventListener('click', async () => {
+  try {
+    await chrome.permissions.request({ origins: ['<all_urls>'] })
+  } catch { /* user dismissed */ }
+  refreshPerm()
+})
+
 function start(mode) {
   chrome.runtime.sendMessage({ type: 'lumia-ui-start', mode }, (res) => {
     if (res && res.ok) {
