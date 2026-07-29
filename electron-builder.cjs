@@ -66,7 +66,8 @@ module.exports = {
     // Companion browser extension for the Scroll capture "Browser Extension"
     // method — users load it unpacked from Resources/extension (the
     // scroll-extension:open-folder IPC opens this directory for them).
-    { from: 'extension', to: 'extension' },
+    // screenshot-*.png are Web Store listing assets, not extension files.
+    { from: 'extension', to: 'extension', filter: ['**/*', '!screenshot-*.png'] },
     // macOS Swift helpers — looked up at runtime via process.resourcesPath.
     // CI compiles them as universal (arm64 + x86_64) before packaging via
     // build/compile-mac-helpers.sh. The same script is what local devs run.

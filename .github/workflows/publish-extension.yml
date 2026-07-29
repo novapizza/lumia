@@ -62,7 +62,9 @@ jobs:
       - name: Zip extension
         run: |
           cd extension
-          zip -r ../lumia-extension.zip . -x '*.md' '*.DS_Store'
+          # screenshot-*.png are Web Store LISTING assets (uploaded via the
+          # dashboard), not extension files — keep them out of the package.
+          zip -r ../lumia-extension.zip . -x '*.md' '*.DS_Store' 'screenshot-*.png'
 
       - name: Upload & publish to Chrome Web Store
         uses: mnao305/chrome-extension-upload@v5.0.0
