@@ -230,6 +230,21 @@ async function handleMessage(sock, data) {
       send({ type: 'capture-error', id: msg.id, error: 'A capture is already running' })
       return
     }
+    // Permission model: captures started from the extension popup carry a
+    // `target` and ride on activeTab (granted by the popup click). Captures
+    // started from the Lumia app have no user gesture in this browser, so
+    // they need the optional <all_urls> grant (one click in the popup).
+    if (!msg.target) {
+      const granted = await chrome.permissions.contains({ origins: ['<all_urls>'] })
+      if (!granted) {
+        send({
+          type: 'capture-error',
+          id: msg.id,
+          error: 'One-time browser permission needed — click the Lumia extension icon in the browser toolbar and press "Allow captures from the app"'
+        })
+        return
+      }
+    }
     activeCapture = { id: msg.id, cancelled: false, stopRequested: false }
     try {
       await runCapture(msg.id, msg.target, msg.mode)

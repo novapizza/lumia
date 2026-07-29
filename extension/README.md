@@ -87,9 +87,10 @@ Chromium browsers, and auto-updates.
 
 | Permission | Why |
 |---|---|
-| `tabs` + `<all_urls>` | `captureVisibleTab` screenshots of the active tab |
+| `activeTab` | screenshot + scroll the tab you start a capture on from the toolbar popup (granted by the click itself — no broad access) |
 | `scripting` | scroll the page and neutralize sticky/fixed overlays during capture |
 | `alarms` | reconnect to Lumia if the connection drops |
+| `<all_urls>` *(optional)* | only needed for captures **started from the Lumia app** and for live tab previews in the multi-browser picker — granted with one click in the popup ("Allow captures from the app") |
 
 Browser-internal pages (`chrome://…`, the Web Store, `about:…`) cannot be
 captured — use Lumia's classic Screen scroll mode for those.

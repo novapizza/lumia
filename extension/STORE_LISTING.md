@@ -80,20 +80,20 @@ for stitching, annotation, and saving.
 
 **Permission justifications**
 
-`host_permissions` (`<all_urls>`)
+`activeTab`
 ```
-Users can take a scrolling screenshot on any website, so the extension must be
-able to capture and script whichever tab they start a capture on, regardless of
-its URL. It only acts on the specific tab the user explicitly triggers a capture
-on — never in the background.
+Captures started from the toolbar popup act on exactly the tab the user clicked
+on: the extension calls chrome.tabs.captureVisibleTab and injects the scroll
+script into that tab only, under the activeTab grant from the user's click.
 ```
 
-`tabs`
+`optional_host_permissions` (`<all_urls>`)
 ```
-To produce the screenshot the extension calls chrome.tabs.captureVisibleTab on
-the active tab, and reads that tab's title/URL to label the capture and re-focus
-the correct tab. It also watches for the user switching tabs mid-capture so it
-can cancel safely instead of photographing the wrong page.
+Optional, off by default. Only needed when the user starts a capture from the
+Lumia DESKTOP APP instead of the popup (there is no browser gesture in that
+flow, so activeTab cannot apply) and for the live tab preview shown in Lumia's
+multi-browser picker. Requested with a single explicit opt-in button in the
+popup ("Allow captures from the app"); every capture is still user-initiated.
 ```
 
 `scripting`

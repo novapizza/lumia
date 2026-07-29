@@ -528,6 +528,9 @@ export default function Dashboard() {
                 <p className="text-[11px] text-slate-400 leading-relaxed">
                   Capture scrolling screenshots straight from your browser. Install it in each browser or
                   profile you want to use — Lumia connects automatically and the dot turns green.
+                  To start captures from <span className="text-slate-300">this app</span> (instead of the
+                  extension's own menu), click the extension icon once and press{' '}
+                  <span className="text-slate-300">"Allow captures from the app"</span>.
                 </p>
 
                 {/* Primary: one-click Chrome Web Store install (Chromium browsers) */}
