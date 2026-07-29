@@ -7,6 +7,8 @@ import { execFile } from 'child_process'
 import { focusWindowByTitlePrefix } from './native-input'
 import { sendCaptureToEditor } from './capture'
 import { showNotification } from './notify'
+import { getDisplayIcc } from './display-icc'
+import { convertBgraToSrgbInPlace } from './icc-to-srgb'
 
 /**
  * Local WebSocket bridge for the Lumia browser extension (extension/ at the
@@ -508,19 +510,23 @@ async function runExtensionSession(
     })
 
     if (!result.meta) throw new Error('Extension did not report page metrics')
-    const dataUrl = stitchExtensionFrames(result.frames, result.meta)
     // captureVisibleTab returns the compositor's output — pixels in the
-    // DISPLAY's color space, with no embedded profile. Untagged they get
-    // interpreted as sRGB and show a slight cast on color-managed /
-    // wide-gamut screens, so tag the saved PNG with the display's ICC
-    // profile exactly like the classic screen captures do. The browser's
-    // display isn't directly knowable; the cursor's display is the best
-    // proxy — the user just interacted with the capture pill there (and on
-    // single-monitor setups it's trivially right).
+    // DISPLAY's color space, with no embedded profile. Read as sRGB they
+    // show a color cast (violet AWS-console links on one wide-gamut
+    // laptop), so convert the stitched bitmap to sRGB using the display's
+    // ICC profile — then the clipboard, editor, uploads, and saved file all
+    // agree. The browser's display isn't directly knowable; the cursor's
+    // display is the best proxy — the user just interacted with the capture
+    // pill there (and on single-monitor setups it's trivially right). When
+    // the profile can't be expressed as matrix-shaper math, fall back to
+    // tagging the saved PNG with the profile (color-managed viewers still
+    // render it right).
     const displayId = screen.getDisplayNearestPoint(screen.getCursorScreenPoint()).id
+    const icc = await getDisplayIcc(displayId).catch(() => null)
+    const { dataUrl, srgb } = stitchExtensionFrames(result.frames, result.meta, icc)
     // Deliver like a normal capture: this surfaces the editor (or, if the
     // app was dismissed to tray, just a notification) and handles history.
-    await sendCaptureToEditor(dataUrl, 'scrolling', displayId)
+    await sendCaptureToEditor(dataUrl, 'scrolling', srgb ? undefined : displayId)
     return { ok: true }
   } catch (err) {
     if (wasCancelled) return { ok: false, error: 'cancelled' }
@@ -539,8 +545,9 @@ function clamp(v: number, lo: number, hi: number): number {
 
 function stitchExtensionFrames(
   frames: ExtFrameMsg[],
-  meta: Omit<ExtCaptureMeta, 'type' | 'id'>
-): string {
+  meta: Omit<ExtCaptureMeta, 'type' | 'id'>,
+  icc: Buffer | null = null
+): { dataUrl: string; srgb: boolean } {
   if (frames.length === 0) throw new Error('No frames were captured')
   const ordered = [...frames].sort((a, b) => a.index - b.index)
 
@@ -561,11 +568,11 @@ function stitchExtensionFrames(
   // page chrome). Otherwise keep chrome: element scrollers composite the
   // chrome in; whole-document pages stack full viewports.
   if (meta.mode === 'region' && meta.rect) {
-    return stitchCroppedRegion(images, ordered, meta.rect, scale, rawW, rawH, overlapPx)
+    return stitchCroppedRegion(images, ordered, meta.rect, scale, rawW, rawH, overlapPx, icc)
   }
   return meta.rect
-    ? stitchElementScroller(images, ordered, meta.rect, scale, rawW, rawH, overlapPx)
-    : stitchDocumentScroller(images, ordered, scale, rawW, rawH, overlapPx)
+    ? stitchElementScroller(images, ordered, meta.rect, scale, rawW, rawH, overlapPx, icc)
+    : stitchDocumentScroller(images, ordered, scale, rawW, rawH, overlapPx, icc)
 }
 
 /** Region mode: crop every frame to `rect` and stack the crops by scroll
@@ -578,8 +585,9 @@ function stitchCroppedRegion(
   scale: number,
   rawW: number,
   rawH: number,
-  overlapPx = 0
-): string {
+  overlapPx = 0,
+  icc: Buffer | null = null
+): { dataUrl: string; srgb: boolean } {
   const cropX = clamp(Math.round(rect.x * scale), 0, rawW - 1)
   const cropY = clamp(Math.round(rect.y * scale), 0, rawH - 1)
   const cropW = clamp(Math.round(rect.w * scale), 1, rawW - cropX)
@@ -604,7 +612,7 @@ function stitchCroppedRegion(
     if (rows <= 0) continue
     bmp.copy(outBuf, dstY * rowBytes, skip * rowBytes, (skip + rows) * rowBytes)
   }
-  return finalize(outBuf, cropW, totalHeight)
+  return finalize(outBuf, cropW, totalHeight, icc)
 }
 
 /** Whole-document scroll: frames are full viewports; stack them by scroll
@@ -615,8 +623,9 @@ function stitchDocumentScroller(
   scale: number,
   rawW: number,
   rawH: number,
-  overlapPx = 0
-): string {
+  overlapPx = 0,
+  icc: Buffer | null = null
+): { dataUrl: string; srgb: boolean } {
   const rowBytes = rawW * 4
   const lastY = Math.round(ordered[ordered.length - 1].scrollY * scale)
   const totalHeight = lastY + rawH
@@ -635,7 +644,7 @@ function stitchDocumentScroller(
     if (rows <= 0) continue
     images[i].toBitmap().copy(outBuf, dstY * rowBytes, skip * rowBytes, (skip + rows) * rowBytes)
   }
-  return finalize(outBuf, rawW, totalHeight)
+  return finalize(outBuf, rawW, totalHeight, icc)
 }
 
 /**
@@ -656,8 +665,9 @@ function stitchElementScroller(
   scale: number,
   rawW: number,
   rawH: number,
-  overlapPx = 0
-): string {
+  overlapPx = 0,
+  icc: Buffer | null = null
+): { dataUrl: string; srgb: boolean } {
   const rowBytes = rawW * 4
   const top = clamp(Math.round(rect.y * scale), 0, rawH - 2)
   const bottom = clamp(Math.round((rect.y + rect.h) * scale), top + 1, rawH)
@@ -717,12 +727,18 @@ function stitchElementScroller(
     }
   }
 
-  return finalize(out, rawW, outH)
+  return finalize(out, rawW, outH, icc)
 }
 
 /** captureVisibleTab PNGs can carry alpha — force opaque like the classic
- *  path — then encode. */
-function finalize(buf: Buffer, width: number, height: number): string {
+ *  path. Convert display-space pixels to sRGB when the display profile
+ *  allows (see icc-to-srgb.ts) — `srgb: false` tells the caller to fall
+ *  back to iCCP-tagging the saved file instead. Then encode. */
+function finalize(buf: Buffer, width: number, height: number, icc: Buffer | null = null): { dataUrl: string; srgb: boolean } {
   for (let i = 3; i < buf.length; i += 4) buf[i] = 255
-  return nativeImage.createFromBitmap(buf, { width, height }).toDataURL()
+  let srgb = false
+  if (icc) {
+    try { srgb = convertBgraToSrgbInPlace(buf, icc) } catch { srgb = false }
+  }
+  return { dataUrl: nativeImage.createFromBitmap(buf, { width, height }).toDataURL(), srgb }
 }
