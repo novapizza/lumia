@@ -50,6 +50,10 @@ jobs:
           MAIN_VITE_GDRIVE_CLIENT_SECRET: ${{ secrets.MAIN_VITE_GDRIVE_CLIENT_SECRET }}
           MAIN_VITE_GDRIVE_API_KEY: ${{ secrets.MAIN_VITE_GDRIVE_API_KEY }}
           MAIN_VITE_GDRIVE_PROJECT_NUMBER: ${{ secrets.MAIN_VITE_GDRIVE_PROJECT_NUMBER }}
+          # Public Chrome Web Store listing URL (not sensitive — kept with the
+          # other build-time vars). Baked into the *renderer*; the Dashboard's
+          # "Add to Chrome" button only appears when this is set.
+          RENDERER_VITE_CHROME_WEB_STORE_URL: ${{ secrets.RENDERER_VITE_CHROME_WEB_STORE_URL }}
 
       # Rebuild Swift helpers as universal binaries so the same DMG works on
       # both arm64 and x86_64 Macs. Committed binaries (if any) are only used
@@ -174,6 +178,8 @@ jobs:
           MAIN_VITE_GDRIVE_CLIENT_SECRET: ${{ secrets.MAIN_VITE_GDRIVE_CLIENT_SECRET }}
           MAIN_VITE_GDRIVE_API_KEY: ${{ secrets.MAIN_VITE_GDRIVE_API_KEY }}
           MAIN_VITE_GDRIVE_PROJECT_NUMBER: ${{ secrets.MAIN_VITE_GDRIVE_PROJECT_NUMBER }}
+          # Public Chrome Web Store listing URL — see the macOS job note.
+          RENDERER_VITE_CHROME_WEB_STORE_URL: ${{ secrets.RENDERER_VITE_CHROME_WEB_STORE_URL }}
 
       - name: Verify R2 publish env
         shell: pwsh
