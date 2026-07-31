@@ -372,6 +372,12 @@ async function runCapture(id, target, mode) {
       await sleep(FRAME_DELAY_MS)
       if (activeCapture.cancelled) { bail(); return }
 
+      // Late-overlay sweep AFTER the scroll settled: sticky bars, "Back to
+      // top" buttons, and chat bubbles that mount (or turn position:fixed)
+      // only in reaction to scrolling didn't exist when lumiaPrep scanned —
+      // catch and hide them before photographing this frame.
+      if (meta.totalFrames > 1) await exec(lumiaNeutralizeLate, index, isLast)
+
       // If the user switched tabs mid-capture, captureVisibleTab would start
       // photographing the wrong page — abort silently.
       const [nowActive] = await chrome.tabs.query({ active: true, windowId: win.id })
@@ -568,43 +574,63 @@ async function lumiaPrep(maxFrames, mode) {
     const sticky = []
     const scanDocs = [doc]
     if (!isDoc && scroller.ownerDocument && scroller.ownerDocument !== doc) scanDocs.push(scroller.ownerDocument)
-    for (const sdoc of scanDocs) {
-      const view = sdoc.defaultView || window
-      let all
-      try { all = sdoc.querySelectorAll('*') } catch { continue }
-      const n = Math.min(all.length, 30000)
-      for (let i = 0; i < n; i++) {
-        const el = all[i]
-        if (el === styleEl) continue
-        // Never neutralize the scroller itself or an ancestor that wraps it.
-        // Some scroll panes live inside a fixed/sticky container (the AWS EC2
-        // details drawer is fixed + bottom-anchored); hiding or flattening that
-        // container would blank out the very region we're capturing. `.contains`
-        // stops at frame boundaries, so the top-doc iframe host is guarded
-        // separately.
-        if (!isDoc && (el === scroller || el.contains(scroller) ||
-            (iframeEl && (el === iframeEl || el.contains(iframeEl))))) continue
-        const cs = view.getComputedStyle(el)
-        if (cs.position === 'fixed') {
-          if (cs.display === 'none' || cs.visibility === 'hidden') continue
-          const r = el.getBoundingClientRect()
-          if (r.width < 4 || r.height < 4) continue
-          fixed.push({
-            el,
-            prevVisibility: el.style.getPropertyValue('visibility'),
-            bottomAnchored: r.top > (view.innerHeight || window.innerHeight) * 0.5
-          })
-        } else if (cs.position === 'sticky') {
-          sticky.push({ el, prevCssText: el.style.cssText })
+
+    // The scan is a closure so it can run AGAIN before every frame (via
+    // st.neutralizeLate below): sticky add-to-cart bars, "Back to top"
+    // buttons, and chat bubbles often mount — or only BECOME fixed/sticky via
+    // a scroll handler — after the page scrolls, so a single up-front pass
+    // misses them. Elements already classified are skipped via `seenOverlays`
+    // (invisible fixed elements are deliberately NOT marked seen — they may
+    // show later); new finds are also registered on fixed/sticky so
+    // lumiaRestore unwinds them.
+    const seenOverlays = new WeakSet()
+    const scanOverlays = () => {
+      const newFixed = []
+      const newSticky = []
+      for (const sdoc of scanDocs) {
+        const view = sdoc.defaultView || window
+        let all
+        try { all = sdoc.querySelectorAll('*') } catch { continue }
+        const n = Math.min(all.length, 30000)
+        for (let i = 0; i < n; i++) {
+          const el = all[i]
+          if (seenOverlays.has(el)) continue
+          if (el === styleEl) continue
+          // Skip our own capture UI (blocker + status pill, added after prep).
+          if (el.id === '__lumia-cap-blocker' || el.id === '__lumia-cap-dim') continue
+          // Never neutralize the scroller itself or an ancestor that wraps it.
+          // Some scroll panes live inside a fixed/sticky container (the AWS EC2
+          // details drawer is fixed + bottom-anchored); hiding or flattening that
+          // container would blank out the very region we're capturing. `.contains`
+          // stops at frame boundaries, so the top-doc iframe host is guarded
+          // separately.
+          if (!isDoc && (el === scroller || el.contains(scroller) ||
+              (iframeEl && (el === iframeEl || el.contains(iframeEl))))) continue
+          const cs = view.getComputedStyle(el)
+          if (cs.position === 'fixed') {
+            if (cs.display === 'none' || cs.visibility === 'hidden') continue
+            const r = el.getBoundingClientRect()
+            if (r.width < 4 || r.height < 4) continue
+            seenOverlays.add(el)
+            const entry = {
+              el,
+              prevVisibility: el.style.getPropertyValue('visibility'),
+              bottomAnchored: r.top > (view.innerHeight || window.innerHeight) * 0.5
+            }
+            fixed.push(entry)
+            newFixed.push(entry)
+          } else if (cs.position === 'sticky') {
+            seenOverlays.add(el)
+            const entry = { el, prevCssText: el.style.cssText }
+            sticky.push(entry)
+            newSticky.push(entry)
+          }
         }
       }
+      return { newFixed, newSticky }
     }
-    // Flatten sticky → relative + auto offsets only for multi-frame scroll
-    // captures (so sticky bars don't repeat down the stitch). A single-frame
-    // capture (viewport / non-scrolling selection / unscrollable fallback)
-    // must show exactly what's on screen, so leave positions untouched.
-    if (!singleFrame) {
-      for (const s of sticky) {
+    const flattenSticky = (entries) => {
+      for (const s of entries) {
         try {
           s.el.style.setProperty('position', 'relative', 'important')
           for (const p of ['top', 'left', 'right', 'bottom']) {
@@ -613,6 +639,12 @@ async function lumiaPrep(maxFrames, mode) {
         } catch { /* ignore */ }
       }
     }
+    scanOverlays()
+    // Flatten sticky → relative + auto offsets only for multi-frame scroll
+    // captures (so sticky bars don't repeat down the stitch). A single-frame
+    // capture (viewport / non-scrolling selection / unscrollable fallback)
+    // must show exactly what's on screen, so leave positions untouched.
+    if (!singleFrame) flattenSticky(sticky)
 
     // 4. Scroll to top and measure AFTER all mutations settled.
     if (!singleFrame) {
@@ -656,13 +688,17 @@ async function lumiaPrep(maxFrames, mode) {
       return { error: 'Scrollable area is too small to capture' }
     }
 
-    // Overlap the scroll steps and let the app discard the top strip of every
-    // frame after the first (GoFullPage's core trick: 200px for the document,
-    // 100px for inner panes). Anything pinned to the viewport top that the
+    // Overlap the scroll steps and let the app discard strips when stitching
+    // (GoFullPage's core trick, extended to BOTH edges): the top `topOverlap`
+    // of every frame after the first, and the bottom `bottomCrop` of every
+    // frame except the last. Anything pinned to the viewport that the
     // neutralization above MISSED — JS/transform-pinned headers (AWS tables),
-    // shadow-DOM sticky — only ever pollutes the discarded strip, so it can't
-    // repeat down the stitch.
-    const overlap = singleFrame ? 0 : Math.min(isDoc ? 200 : 100, Math.floor(vpH / 3))
+    // shadow-DOM sticky, and scroll-triggered overlays like "Back to top"
+    // buttons that were hidden or absent during the collection pass — only
+    // ever pollutes a discarded strip, so it can't repeat down the stitch.
+    const topOverlap = singleFrame ? 0 : Math.min(isDoc ? 200 : 100, Math.floor(vpH / 3))
+    const bottomCrop = singleFrame ? 0 : Math.min(isDoc ? 120 : 80, Math.floor(vpH / 4))
+    const overlap = topOverlap + bottomCrop
     const step = Math.max(1, vpH - overlap)
     const rawScrollHeight = singleFrame ? vpH : scroller.scrollHeight
     // maxFrames cap: first frame covers vpH, each further frame adds `step`.
@@ -686,7 +722,27 @@ async function lumiaPrep(maxFrames, mode) {
       sticky,
       extraStyles,
       prevScrollTop,
-      prevScrollLeft
+      prevScrollLeft,
+      // Mid-capture rescan, run right before each frame is photographed (a
+      // closure survives across executeScript calls in the isolated world —
+      // same trick as overlayKeyHandler). Frame 0 mirrors the initial pass
+      // (top-pinned chrome stays visible for the first frame, bottom-anchored
+      // hides unless this is also the last frame); later frames hide every
+      // new fixed element immediately — except bottom-anchored ones found on
+      // the last frame, which render once at the true page bottom like every
+      // other bottom-anchored element.
+      neutralizeLate: (frameIndex, isLast) => {
+        const { newFixed, newSticky } = scanOverlays()
+        flattenSticky(newSticky)
+        for (const f of newFixed) {
+          const keep = frameIndex === 0
+            ? (!f.bottomAnchored || isLast)
+            : (isLast && f.bottomAnchored)
+          if (!keep) {
+            try { f.el.style.setProperty('visibility', 'hidden', 'important') } catch { /* ignore */ }
+          }
+        }
+      }
     }
 
     return {
@@ -695,9 +751,13 @@ async function lumiaPrep(maxFrames, mode) {
       scrollHeight,
       rect,
       totalFrames,
-      // Scroll advances by `step` (= vpH − overlap); the app crops the top
-      // `overlap` CSS px off every frame except the first when stitching.
+      // Scroll advances by `step` (= vpH − overlap). When stitching, the app
+      // crops `overlap − bottomCrop` CSS px off the top of frames 1+ and
+      // `bottomCrop` off the bottom of every frame but the last. (Older apps
+      // that predate bottomCrop crop the full `overlap` off the top instead —
+      // still seamless, just without the bottom-pinned-overlay guard.)
       overlap,
+      bottomCrop,
       step,
       // 'region' tells the app to crop the stitched output to `rect` (just the
       // picked area, no page chrome). 'viewport'/'fullpage' keep chrome.
@@ -752,6 +812,16 @@ function lumiaShowOverlay() {
   }
   window.addEventListener('keydown', keyHandler, true)
   st.overlayKeyHandler = keyHandler
+}
+
+function lumiaNeutralizeLate(index, isLast) {
+  const st = window.__lumiaCap
+  if (st && st.neutralizeLate) {
+    // Never let a page-side surprise kill the capture — the stitch-time
+    // overlap crops still guard the top/bottom strips if this pass fails.
+    try { st.neutralizeLate(index, isLast) } catch { /* ignore */ }
+  }
+  return true
 }
 
 function lumiaSetDimVisible(visible) {
