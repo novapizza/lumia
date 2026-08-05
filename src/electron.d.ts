@@ -247,8 +247,11 @@ declare global {
       // 'extension' returns { ok: false, error: 'extension-not-connected' }
       // instead of falling back, so the UI can show setup help.
       launchScrollCapture(method?: 'extension' | 'screen'): Promise<{ ok: boolean; error?: string }>
-      getScrollExtensionStatus(): Promise<{ connected: boolean; browsers: string[]; clients: Array<{ id: number; browser: string }> }>
-      onScrollExtensionStatus(cb: (status: { connected: boolean; browsers: string[]; clients: Array<{ id: number; browser: string }> }) => void): void
+      // `outdated` lists browsers whose connected extension is older than the
+      // copy this app ships (`bundledVersion`) — the app and extension update
+      // on independent schedules, so the Dashboard nudges instead of assuming.
+      getScrollExtensionStatus(): Promise<{ connected: boolean; browsers: string[]; clients: Array<{ id: number; browser: string; version: string; outdated: boolean }>; bundledVersion: string | null; outdated: string[] }>
+      onScrollExtensionStatus(cb: (status: { connected: boolean; browsers: string[]; clients: Array<{ id: number; browser: string; version: string; outdated: boolean }>; bundledVersion: string | null; outdated: string[] }) => void): void
       openScrollExtensionFolder(): Promise<string>
       // Multi-browser picker: previews carry a downscaled JPEG of each
       // browser's active tab (null when the tab can't be photographed).

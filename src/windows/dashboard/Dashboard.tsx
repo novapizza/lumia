@@ -87,7 +87,7 @@ export default function Dashboard() {
   const [hotkeys, setHotkeys] = useState<Record<string, string>>({})
   const [mediaKind, setMediaKind] = useState<MediaKind>('image')
   const [scrollMethod, setScrollMethod] = useState<ScrollMethod>('screen')
-  const [extStatus, setExtStatus] = useState<{ connected: boolean; browsers: string[] }>({ connected: false, browsers: [] })
+  const [extStatus, setExtStatus] = useState<{ connected: boolean; browsers: string[]; outdated?: string[]; bundledVersion?: string | null }>({ connected: false, browsers: [] })
   const [showExtSetup, setShowExtSetup] = useState(false)
   const [storeUrlCopied, setStoreUrlCopied] = useState(false)
   const [showBrowserPicker, setShowBrowserPicker] = useState(false)
@@ -465,12 +465,14 @@ export default function Dashboard() {
                     Browser Extension
                   </span>
                   <span className="flex items-center gap-1.5 mt-1">
-                    <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${extStatus.connected ? 'bg-emerald-400' : 'bg-slate-600'}`} />
-                    <span className={`text-[10px] font-medium truncate ${extStatus.connected ? 'text-emerald-400' : 'text-slate-500'}`}>
+                    <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${extStatus.connected ? (extStatus.outdated?.length ? 'bg-amber-400' : 'bg-emerald-400') : 'bg-slate-600'}`} />
+                    <span className={`text-[10px] font-medium truncate ${extStatus.connected ? (extStatus.outdated?.length ? 'text-amber-400' : 'text-emerald-400') : 'text-slate-500'}`}>
                       {extStatus.connected
-                        ? `Connected · ${extStatus.browsers.length > 1
-                            ? `${extStatus.browsers.length} browsers`
-                            : extStatus.browsers[0] ?? 'browser'}`
+                        ? extStatus.outdated?.length
+                          ? 'Connected · extension update available'
+                          : `Connected · ${extStatus.browsers.length > 1
+                              ? `${extStatus.browsers.length} browsers`
+                              : extStatus.browsers[0] ?? 'browser'}`
                         : 'Not connected — click to set up'}
                     </span>
                   </span>
@@ -589,6 +591,17 @@ export default function Dashboard() {
                 </details>
 
                 {/* Live connection status */}
+                {extStatus.connected && !!extStatus.outdated?.length && (
+                  <div className="flex items-start gap-1.5 pt-0.5">
+                    <span className="w-1.5 h-1.5 rounded-full bg-amber-400 flex-shrink-0 mt-1" />
+                    <span className="text-[10px] text-amber-400 leading-relaxed">
+                      The extension in {extStatus.outdated.join(', ')} is older than the copy this app ships
+                      {extStatus.bundledVersion ? ` (v${extStatus.bundledVersion})` : ''} — captures still work, but
+                      without the latest fixes. Update it from the Web Store, or for a manually loaded extension
+                      press Reload on <span className="font-mono text-amber-300">chrome://extensions</span>.
+                    </span>
+                  </div>
+                )}
                 {extStatus.connected ? (
                   <div className="flex items-center gap-1.5 pt-0.5">
                     <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 flex-shrink-0" />

@@ -1,5 +1,6 @@
 import { ipcMain, app, nativeImage, screen, shell, type BrowserWindow } from 'electron'
 import { WebSocketServer, WebSocket } from 'ws'
+import { readFileSync } from 'fs'
 import { join } from 'path'
 import { setTimeout as sleep } from 'timers/promises'
 import { randomUUID } from 'crypto'
@@ -141,12 +142,60 @@ interface CaptureSession {
 
 let session: CaptureSession | null = null
 
+// ── Version-skew guard ──────────────────────────────────────────────────────
+// The extension updates on its own schedule (Chrome Web Store rollout, or a
+// load-unpacked copy that only refreshes on browser restart) while the app
+// updates via electron-updater — the two sides are ROUTINELY out of sync.
+// The protocol survives skew by convention: every new wire field is optional
+// with a documented fallback on the receiving side (see meta.overlap /
+// meta.bottomCrop), and both peers ignore unknown message types. On top of
+// that, the app compares each client's `hello` version against the extension
+// copy it ships (Resources/extension) and flags older clients in the status
+// broadcast, so the Dashboard can nudge the user to update instead of
+// silently capturing with yesterday's page-side fixes.
+
+let bundledExtVersion: string | null | undefined // undefined = not read yet
+
+function getBundledExtVersion(): string | null {
+  if (bundledExtVersion !== undefined) return bundledExtVersion
+  try {
+    const dir = app.isPackaged
+      ? join(process.resourcesPath, 'extension')
+      : join(__dirname, '../../extension')
+    const manifest = JSON.parse(readFileSync(join(dir, 'manifest.json'), 'utf8'))
+    bundledExtVersion = typeof manifest.version === 'string' ? manifest.version : null
+  } catch {
+    bundledExtVersion = null
+  }
+  return bundledExtVersion ?? null
+}
+
+/** Dotted-numeric compare: negative when a < b, 0 when equal. */
+function cmpVersions(a: string, b: string): number {
+  const pa = a.split('.').map(n => parseInt(n, 10) || 0)
+  const pb = b.split('.').map(n => parseInt(n, 10) || 0)
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] ?? 0) - (pb[i] ?? 0)
+    if (d !== 0) return d
+  }
+  return 0
+}
+
+function isOutdated(info: ClientInfo): boolean {
+  const bundled = getBundledExtVersion()
+  return !!(bundled && info.version && cmpVersions(info.version, bundled) < 0)
+}
+
 // ── Status ──────────────────────────────────────────────────────────────────
 
 export interface ExtensionStatus {
   connected: boolean
   browsers: string[]
-  clients: Array<{ id: number; browser: string }>
+  clients: Array<{ id: number; browser: string; version: string; outdated: boolean }>
+  /** Version of the extension copy this app ships (null if unreadable). */
+  bundledVersion: string | null
+  /** Browsers whose connected extension is older than the bundled copy. */
+  outdated: string[]
 }
 
 export function getExtensionStatus(): ExtensionStatus {
@@ -154,7 +203,9 @@ export function getExtensionStatus(): ExtensionStatus {
   return {
     connected: open.length > 0,
     browsers: open.map(i => i.browser),
-    clients: open.map(({ id, browser }) => ({ id, browser }))
+    clients: open.map(i => ({ id: i.id, browser: i.browser, version: i.version, outdated: isOutdated(i) })),
+    bundledVersion: getBundledExtVersion(),
+    outdated: open.filter(isOutdated).map(i => i.browser)
   }
 }
 
@@ -673,9 +724,11 @@ function stitchDocumentScroller(
  * chrome entirely. Instead composite a full-width image:
  *   - header (rows above the pane) and footer (rows below it) from frame 0,
  *   - the pane's COLUMN stitched from every frame by exact scroll offset,
- *   - the side margins (sidebar / right rail) from frame 0, with their bottom
- *     edge extended down to fill the grown height (sidebars have no more
- *     content to reveal, so we repeat their last row — usually background).
+ *   - the side margins (sidebar / right rail) from frame 0, extended down to
+ *     fill the grown height with a synthesized background row (per-column
+ *     dominant color over the band's bottom half — see synthMarginRow;
+ *     sidebars have no more content to reveal, and repeating the literal
+ *     last row smeared any icons/text it crossed into vertical streaks).
  */
 function stitchElementScroller(
   images: Electron.NativeImage[],
@@ -712,16 +765,27 @@ function stitchElementScroller(
   if (rawH > bottom) bmp0.copy(out, (top + contentH) * rowBytes, bottom * rowBytes, rawH * rowBytes)
 
   // Side margins (sidebar / right rail) across the whole grown pane. Real
-  // pixels for the first band, then the pane's bottom row repeated downward.
+  // pixels for the first band; below it a SYNTHESIZED background row — the
+  // per-column dominant color over the band's bottom half. Repeating the
+  // band's literal bottom row (the old behavior) smeared whatever content
+  // that row happened to cross (nav icons, text) into vertical streaks;
+  // the per-column mode keeps background and vertical border lines
+  // continuing cleanly while content pixels (a minority per column) vanish.
   const leftBytes = left * 4
   const rightStart = right * 4
   if (left > 0 || right < rawW) {
+    const fillLeft = left > 0 ? synthMarginRow(bmp0, rowBytes, top, bandH, 0, leftBytes) : null
+    const fillRight = right < rawW ? synthMarginRow(bmp0, rowBytes, top, bandH, rightStart, rowBytes) : null
     for (let r = 0; r < contentH; r++) {
-      const srcRow = top + Math.min(r, bandH - 1)
-      const srcOff = srcRow * rowBytes
       const dstOff = (top + r) * rowBytes
-      if (left > 0) bmp0.copy(out, dstOff, srcOff, srcOff + leftBytes)
-      if (right < rawW) bmp0.copy(out, dstOff + rightStart, srcOff + rightStart, srcOff + rowBytes)
+      if (r < bandH) {
+        const srcOff = (top + r) * rowBytes
+        if (left > 0) bmp0.copy(out, dstOff, srcOff, srcOff + leftBytes)
+        if (right < rawW) bmp0.copy(out, dstOff + rightStart, srcOff + rightStart, srcOff + rowBytes)
+      } else {
+        if (fillLeft) fillLeft.copy(out, dstOff)
+        if (fillRight) fillRight.copy(out, dstOff + rightStart)
+      }
     }
   }
 
@@ -752,6 +816,50 @@ function stitchElementScroller(
   }
 
   return finalize(out, rawW, outH, icc)
+}
+
+/**
+ * Synthesize one margin row for extending a side margin below the visible
+ * band: for every column in [byteStart, byteEnd) of the row, the most
+ * frequent color over the bottom half of the band. Background (and vertical
+ * separator lines, which are constant per column) dominate that window, so
+ * the extension continues them seamlessly; nav icons/text crossing any one
+ * row are a per-column minority and can't smear into streaks.
+ */
+function synthMarginRow(
+  bmp: Buffer,
+  rowBytes: number,
+  top: number,
+  bandH: number,
+  byteStart: number,
+  byteEnd: number
+): Buffer {
+  const width = (byteEnd - byteStart) / 4
+  const row = Buffer.alloc(byteEnd - byteStart)
+  const from = top + Math.max(0, Math.floor(bandH / 2))
+  const to = top + bandH // exclusive
+  const counts = new Map<number, number>()
+  for (let c = 0; c < width; c++) {
+    counts.clear()
+    let bestColor = 0
+    let bestN = 0
+    for (let r = from; r < to; r++) {
+      const off = r * rowBytes + byteStart + c * 4
+      const color = bmp[off] | (bmp[off + 1] << 8) | (bmp[off + 2] << 16)
+      const n = (counts.get(color) ?? 0) + 1
+      counts.set(color, n)
+      if (n > bestN) {
+        bestN = n
+        bestColor = color
+      }
+    }
+    const o = c * 4
+    row[o] = bestColor & 0xff
+    row[o + 1] = (bestColor >> 8) & 0xff
+    row[o + 2] = (bestColor >> 16) & 0xff
+    row[o + 3] = 255
+  }
+  return row
 }
 
 /** captureVisibleTab PNGs can carry alpha — force opaque like the classic
