@@ -438,37 +438,88 @@ async function lumiaPrep(maxFrames, mode) {
     const extraStyles = []
 
     // 2. Pick the scroller. The document when it scrolls; otherwise the inner
-    //    element (or same-origin iframe's element) with the MOST scrollable
-    //    content. Choosing by scrollHeight (not on-screen area) matches
-    //    GoFullPage and lands on the main content pane, not a wide-but-short
-    //    wrapper. Apps like Gmail/Drive scroll an inner div; AWS Console and
-    //    other consoles host the scroll region inside an iframe.
+    //    element (or same-origin iframe's element) that best matches "the
+    //    main content pane". Ranking is lexicographic: contains the viewport
+    //    CENTRE first (main panes span the middle of the screen; sidebars and
+    //    detail rails don't), then WIDEST on screen (horizontal space is a
+    //    design signal — sidebars are narrow by design no matter how long
+    //    their content grows), with scrollHeight only as the tie-break for
+    //    equal-width split panes. Ranking by scrollHeight alone (GoFullPage's
+    //    rule, and ours before) systematically favours the WRONG pane: navs,
+    //    ToCs, and detail rails accumulate endless lists while the main
+    //    pane's length varies per page — a short Jira issue would stitch the
+    //    right-hand details panel instead of the content. Apps like
+    //    Gmail/Drive scroll an inner div; AWS Console and other consoles host
+    //    the scroll region inside an iframe.
+    // Ranking key: [containsCentre, clientWidth, scrollHeight] — earlier keys
+    // win. Shared by the per-document search and the cross-frame comparison.
+    const betterThan = (a, b) => {
+      if (a[0] !== b[0]) return a[0] > b[0]
+      if (a[1] !== b[1]) return a[1] > b[1]
+      return a[2] > b[2]
+    }
     const findScrollerIn = (searchDoc) => {
       let all
       try { all = searchDoc.querySelectorAll('*') } catch { return null }
       const n = Math.min(all.length, 30000)
-      const vw = window.innerWidth, vh = window.innerHeight
-      let best = null, bestScroll = 0
-      let bestAny = null, bestAnyScroll = 0
+      const view = searchDoc.defaultView || window
+      const cx = view.innerWidth / 2, cy = view.innerHeight / 2
+      let best = null, bestKey = null
       for (let i = 0; i < n; i++) {
         const el = all[i]
         if (el.scrollHeight - el.clientHeight < 120) continue
         if (el.clientWidth < 60 || el.clientHeight < 60) continue
-        const oy = getComputedStyle(el).overflowY
+        const cs = view.getComputedStyle(el)
+        const oy = cs.overflowY
         if (oy !== 'auto' && oy !== 'scroll' && oy !== 'overlay') continue
-        if (el.scrollHeight > bestAnyScroll) { bestAny = el; bestAnyScroll = el.scrollHeight }
-        if (el.clientWidth >= vw * 0.3 && el.clientHeight >= vh * 0.3 && el.scrollHeight > bestScroll) {
-          best = el; bestScroll = el.scrollHeight
-        }
+        if (cs.pointerEvents === 'none') continue // decorative layer, not a pane
+        const r = el.getBoundingClientRect()
+        const key = [
+          (r.left <= cx && r.right >= cx && r.top <= cy && r.bottom >= cy) ? 1 : 0,
+          el.clientWidth,
+          el.scrollHeight
+        ]
+        if (!bestKey || betterThan(key, bestKey)) { best = el; bestKey = key }
       }
-      return best || bestAny
+      return best
     }
 
     let scroller = de
     let isDoc = true
-    let iframeEl = null   // set when the scroller lives inside a same-origin frame
+    let frameChain = []   // outermost→innermost frames down to the scroller's doc
     let singleFrame = false
     let region = false    // true → crop output to the target box (no page chrome)
+
+    // Frame chain from the top document down to `childDoc` (empty when the
+    // scroller lives in the top document). Same-origin only — walking stops
+    // at a cross-origin boundary, which can't happen for docs we can script.
+    const chainFor = (childDoc) => {
+      const chain = []
+      try {
+        let w = childDoc.defaultView
+        while (w && w !== window && w.frameElement) {
+          chain.unshift(w.frameElement)
+          w = w.parent
+        }
+      } catch { /* boundary reached — return what we have */ }
+      return chain
+    }
+    // Cumulative offset of the scroller's document into TOP-viewport coords:
+    // each frame's rect is relative to ITS parent's viewport, so the offsets
+    // sum down the chain (content box: border + padding included, matching
+    // the region picker's math). Recomputed on use — layout may have shifted.
+    const frameOffset = () => {
+      let ox = 0, oy = 0
+      for (const fe of frameChain) {
+        try {
+          const r = fe.getBoundingClientRect()
+          const cs = (fe.ownerDocument.defaultView || window).getComputedStyle(fe)
+          ox += r.left + (parseFloat(cs.borderLeftWidth) || 0) + (parseFloat(cs.paddingLeft) || 0)
+          oy += r.top + (parseFloat(cs.borderTopWidth) || 0) + (parseFloat(cs.paddingTop) || 0)
+        } catch { /* frame gone — offsets best-effort */ }
+      }
+      return { ox, oy }
+    }
 
     if (mode === 'viewport') {
       // Just the current visible area — one frame, no scrolling.
@@ -484,17 +535,11 @@ async function lumiaPrep(maxFrames, mode) {
         return { error: 'No area was selected' }
       }
       region = true
-      // The picked element may live in a same-origin iframe (AWS console). Find
-      // that frame so its rect is offset into top-viewport coords and scrollTop
-      // writes hit the right element (the same iframeEl offset the full-page
-      // path uses).
+      // The picked element may live in a same-origin (possibly NESTED) iframe
+      // (AWS console). Record the frame chain so its rect is offset into
+      // top-viewport coords — the same offsets the full-page path uses.
       if (picked.ownerDocument !== doc) {
-        const frames = doc.querySelectorAll('iframe, frame')
-        for (let i = 0; i < frames.length; i++) {
-          let fdoc = null
-          try { fdoc = frames[i].contentDocument } catch { fdoc = null }
-          if (fdoc && fdoc === picked.ownerDocument) { iframeEl = frames[i]; break }
-        }
+        frameChain = chainFor(picked.ownerDocument)
       }
       const view = (picked.ownerDocument && picked.ownerDocument.defaultView) || window
       const oy = view.getComputedStyle(picked).overflowY
@@ -503,29 +548,68 @@ async function lumiaPrep(maxFrames, mode) {
       if (scrolls) { scroller = picked; isDoc = false }
       else { singleFrame = true; scroller = picked; isDoc = false }
     } else if (de.scrollHeight <= de.clientHeight + 8) {
-      // Full page: document doesn't scroll → find the inner scroller.
-      let chosen = findScrollerIn(doc)
-      // Fall back to same-origin iframes. Cross-origin frames throw on
-      // contentDocument access and are skipped.
-      if (!chosen) {
-        const frames = doc.querySelectorAll('iframe, frame')
-        let bestFrameScroll = 0
-        for (let i = 0; i < Math.min(frames.length, 40); i++) {
+      // Full page: document doesn't scroll → pick the best scroller across
+      // the top document AND same-origin (i)frames TOGETHER, ranked by the
+      // same centre/width/scrollHeight key in TOP-viewport coordinates.
+      // Consoles (AWS) host the real content scroller inside an iframe —
+      // often as the frame's own scrolling document, which findScrollerIn
+      // can't see (html/body compute overflowY:visible) — while the top
+      // document still has minor scrollable rails; the old "frames only when
+      // the top doc has nothing" rule handed the capture to those rails.
+      const cxT = window.innerWidth / 2, cyT = window.innerHeight / 2
+      const candidates = [] // { el, key } — key in top-viewport coords
+      const addCandidate = (el, ox, oy, rectOverride) => {
+        const r = rectOverride || el.getBoundingClientRect()
+        const left = r.left + ox, topY = r.top + oy
+        const right = left + r.width, bottom = topY + r.height
+        if (right <= 0 || bottom <= 0 || left >= window.innerWidth || topY >= window.innerHeight) return
+        candidates.push({
+          el,
+          key: [
+            (left <= cxT && right >= cxT && topY <= cyT && bottom >= cyT) ? 1 : 0,
+            el.clientWidth,
+            el.scrollHeight
+          ]
+        })
+      }
+      let frameBudget = 40
+      const walkDoc = (searchDoc, ox, oy, depth) => {
+        const inner = findScrollerIn(searchDoc)
+        if (inner) addCandidate(inner, ox, oy)
+        let frames
+        try { frames = searchDoc.querySelectorAll('iframe, frame') } catch { return }
+        for (let i = 0; i < frames.length; i++) {
+          if (frameBudget-- <= 0) return
           const fr = frames[i]
           let fdoc = null
-          try { fdoc = fr.contentDocument } catch { fdoc = null }
+          try { fdoc = fr.contentDocument } catch { fdoc = null } // cross-origin → skip
           if (!fdoc) continue
-          const fr_r = fr.getBoundingClientRect()
-          if (fr_r.width < 100 || fr_r.height < 100) continue
-          const cand = findScrollerIn(fdoc)
-          if (cand && cand.scrollHeight > bestFrameScroll) {
-            chosen = cand; iframeEl = fr; bestFrameScroll = cand.scrollHeight
+          const frr = fr.getBoundingClientRect()
+          if (frr.width < 100 || frr.height < 100) continue
+          const fcs = (fr.ownerDocument.defaultView || window).getComputedStyle(fr)
+          const fox = ox + frr.left + (parseFloat(fcs.borderLeftWidth) || 0) + (parseFloat(fcs.paddingLeft) || 0)
+          const foy = oy + frr.top + (parseFloat(fcs.borderTopWidth) || 0) + (parseFloat(fcs.paddingTop) || 0)
+          // The frame's own document may be the scroller (a plain page
+          // embedded in the frame): its viewport box starts at the frame's
+          // content-box origin.
+          const fde = fdoc.scrollingElement || fdoc.documentElement
+          if (fde && fde.scrollHeight - fde.clientHeight >= 120) {
+            addCandidate(fde, fox, foy, { left: 0, top: 0, width: fde.clientWidth, height: fde.clientHeight })
           }
+          if (depth < 3) walkDoc(fdoc, fox, foy, depth + 1)
         }
+      }
+      walkDoc(doc, 0, 0, 0)
+      let chosen = null, chosenKey = null
+      for (const c of candidates) {
+        if (!chosenKey || betterThan(c.key, chosenKey)) { chosen = c.el; chosenKey = c.key }
       }
       if (chosen) {
         scroller = chosen
         isDoc = false
+        if (chosen.ownerDocument !== doc) {
+          frameChain = chainFor(chosen.ownerDocument)
+        }
       } else {
         // Nothing we can drive by scrollTop (transform-virtualized lists,
         // cross-origin frames, or a genuinely static page). Don't fail —
@@ -615,10 +699,10 @@ async function lumiaPrep(maxFrames, mode) {
           // Some scroll panes live inside a fixed/sticky container (the AWS EC2
           // details drawer is fixed + bottom-anchored); hiding or flattening that
           // container would blank out the very region we're capturing. `.contains`
-          // stops at frame boundaries, so the top-doc iframe host is guarded
-          // separately.
+          // stops at frame boundaries, so every host frame down the chain is
+          // guarded separately.
           if (!isDoc && (el === scroller || el.contains(scroller) ||
-              (iframeEl && (el === iframeEl || el.contains(iframeEl))))) continue
+              frameChain.some((fr) => el === fr || el.contains(fr)))) continue
           const cs = view.getComputedStyle(el)
           if (cs.position === 'fixed') {
             if (cs.display === 'none' || cs.visibility === 'hidden') continue
@@ -893,10 +977,14 @@ async function lumiaPrep(maxFrames, mode) {
             boxes.set(doc, { x: 0, y: 0, w: window.innerWidth, h: window.innerHeight })
           } else {
             const sr = scroller.getBoundingClientRect()
-            boxes.set(scroller.ownerDocument, { x: sr.left, y: sr.top, w: sr.width, h: sr.height })
-            if (scroller.ownerDocument !== doc && iframeEl) {
-              const frr = iframeEl.getBoundingClientRect()
-              boxes.set(doc, { x: sr.left + frr.left, y: sr.top + frr.top, w: sr.width, h: sr.height })
+            // Clamp to the client box — a frame's scrolling documentElement
+            // reports its full CONTENT height as the bounding rect.
+            const bw = Math.min(sr.width, scroller.clientWidth || sr.width)
+            const bh = Math.min(sr.height, scroller.clientHeight || sr.height)
+            boxes.set(scroller.ownerDocument, { x: sr.left, y: sr.top, w: bw, h: bh })
+            if (scroller.ownerDocument !== doc) {
+              const { ox, oy } = frameOffset()
+              boxes.set(doc, { x: sr.left + ox, y: sr.top + oy, w: bw, h: bh })
             }
           }
           const probeEls = []
@@ -909,7 +997,7 @@ async function lumiaPrep(maxFrames, mode) {
               if (el.shadowRoot) collectFrom(el.shadowRoot)
               if (seenOverlays.has(el) || el === styleEl) continue
               if (!isDoc && (el === scroller || el.contains(scroller) ||
-                  (iframeEl && (el === iframeEl || el.contains(iframeEl))))) continue
+                  frameChain.some((fr) => el === fr || el.contains(fr)))) continue
               const sdoc = el.ownerDocument
               if (el === sdoc.documentElement || el === sdoc.body || el === sdoc.scrollingElement) continue
               const box = boxes.get(sdoc)
@@ -995,12 +1083,18 @@ async function lumiaPrep(maxFrames, mode) {
     } else {
       // Element/iframe scroller — rect in TOP-LEVEL viewport coordinates
       // (an iframe scroller's own rect is relative to the frame, so add the
-      // frame's on-screen offset).
+      // cumulative frame-chain offset; empty chain → 0,0). A frame's
+      // scrolling documentElement reports its full CONTENT size as the
+      // bounding rect, so clamp root scrollers to their client (viewport)
+      // box — otherwise the pane would claim rows below the frame's bottom.
       const sr = scroller.getBoundingClientRect()
-      let offX = 0, offY = 0
-      if (iframeEl) { const frr = iframeEl.getBoundingClientRect(); offX = frr.left; offY = frr.top }
+      const isRootScroller = scroller ===
+        (scroller.ownerDocument.scrollingElement || scroller.ownerDocument.documentElement)
+      const visW = isRootScroller ? Math.min(sr.width, scroller.clientWidth || sr.width) : sr.width
+      const visH = isRootScroller ? Math.min(sr.height, scroller.clientHeight || sr.height) : sr.height
+      const { ox: offX, oy: offY } = frameOffset()
       const absLeft = sr.left + offX, absTop = sr.top + offY
-      const absRight = sr.right + offX, absBottom = sr.bottom + offY
+      const absRight = sr.left + visW + offX, absBottom = sr.top + visH + offY
       const x = Math.max(0, absLeft)
       const y = Math.max(0, absTop)
       rect = {
@@ -1193,9 +1287,16 @@ function lumiaScrollTo(y, index, isLast, total) {
   void sc.scrollTop // force layout so the read below is post-scroll
   // Synthetic scroll event (GoFullPage does the same): virtualized lists and
   // lazy-loaders that render off scroll handlers get an immediate kick
-  // instead of waiting for the async native event.
+  // instead of waiting for the async native event. When the scroller is a
+  // frame's own document (scroll events fire on that frame's window, and
+  // 'scroll' doesn't bubble from the html element), kick the frame's window.
   try {
-    (st.isDoc ? window : sc).dispatchEvent(new Event('scroll'))
+    const rootOf = sc.ownerDocument &&
+      (sc.ownerDocument.scrollingElement || sc.ownerDocument.documentElement)
+    const target = st.isDoc
+      ? window
+      : (sc === rootOf ? (sc.ownerDocument.defaultView || sc) : sc)
+    target.dispatchEvent(new Event('scroll'))
   } catch { /* ignore */ }
   return sc.scrollTop
 }
