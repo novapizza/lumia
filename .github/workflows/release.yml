@@ -226,8 +226,10 @@ jobs:
 
   # ── GitHub Release (notes only, no artifacts) ────────────────────────────────
   # Binaries live on R2 (release.lumia.asia). The GitHub release here is just a
-  # public changelog page — body is taken from the tag commit's message and a
-  # footer points users at lumia.asia for the actual installer.
+  # public changelog page — body is taken from the tag commit's message body
+  # (write the changelog there), falling back to the commit subjects since the
+  # previous release tag when that body is empty; a footer points users at
+  # lumia.asia for the actual installer.
   release-github:
     name: Publish GitHub release notes
     needs: [release-mac, release-win]
@@ -237,17 +239,30 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Full history — the notes fallback needs the previous v* tag and
+          # the commit list since it.
+          fetch-depth: 0
 
       - name: Build release notes
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
+          # Preferred source: whatever changelog body the maintainer wrote in
+          # the release commit ("Release version X.Y.Z" subject + blank line
+          # dropped, Co-Authored-By trailer stripped).
+          BODY="$(git log -1 --format=%B HEAD | tail -n +3 | sed '/^Co-Authored-By:/d')"
+          # Fallback: a bare release commit used to publish an EMPTY changelog
+          # page (v2.4.0 / v2.4.1 / v2.4.3 shipped like that, backfilled by
+          # hand) — list the commit subjects since the previous release tag
+          # instead so the page is never blank.
+          if [ -z "$(printf '%s' "$BODY" | tr -d '[:space:]')" ]; then
+            PREV="$(git describe --tags --abbrev=0 --match 'v*.*.*' HEAD^ 2>/dev/null || true)"
+            if [ -n "$PREV" ]; then
+              BODY="$(git log --no-merges --format='- %s' "$PREV..HEAD" | grep -v '^- Release version ' || true)"
+            fi
+          fi
           {
-            # Drop the "Release version X.Y.Z" subject line + blank separator
-            # and strip the Co-Authored-By trailer. What's left is whatever
-            # changelog body the maintainer wrote in the release commit.
-            git log -1 --format=%B HEAD \
-              | tail -n +3 \
-              | sed '/^Co-Authored-By:/d'
+            printf '%s\n' "$BODY"
             echo ""
             echo "Download the installer at [lumia.asia](https://lumia.asia)."
           } > release-notes.md
