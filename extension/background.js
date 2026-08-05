@@ -11,6 +11,16 @@
 // pings (WebSocket message traffic resets Chrome's 30 s idle kill since 116);
 // a chrome.alarms fallback reconnects if the socket ever drops.
 
+// Version skew: this extension and the Lumia app update on INDEPENDENT
+// schedules (Web Store rollout vs electron-updater), so either side may be
+// newer at any time. Compatibility rules — keep both directions working:
+//   - every new field in a message the app consumes must be OPTIONAL, with a
+//     documented fallback in extension-bridge.ts (see meta.overlap /
+//     meta.bottomCrop for the pattern);
+//   - unknown message types are silently ignored by both peers;
+//   - `hello` carries this manifest's version — the app compares it against
+//     the extension copy it ships and shows an "update available" nudge on
+//     the Dashboard when this side is older.
 // Must match BRIDGE_PORTS in electron/extension-bridge.ts.
 const PORTS = [51763, 51764, 51765]
 
@@ -572,6 +582,9 @@ async function lumiaPrep(maxFrames, mode) {
     //    sticky/fixed bars inside the frame are neutralized too.
     const fixed = []
     const sticky = []
+    // Fixed→absolute conversions (GoFullPage technique, see below): every
+    // touched element's full inline-style snapshot, restored by lumiaRestore.
+    const converted = []
     const scanDocs = [doc]
     if (!isDoc && scroller.ownerDocument && scroller.ownerDocument !== doc) scanDocs.push(scroller.ownerDocument)
 
@@ -615,6 +628,7 @@ async function lumiaPrep(maxFrames, mode) {
             const entry = {
               el,
               prevVisibility: el.style.getPropertyValue('visibility'),
+              prevOpacity: el.style.getPropertyValue('opacity'),
               bottomAnchored: r.top > (view.innerHeight || window.innerHeight) * 0.5
             }
             fixed.push(entry)
@@ -639,12 +653,330 @@ async function lumiaPrep(maxFrames, mode) {
         } catch { /* ignore */ }
       }
     }
+    // Hide/show for overlay entries. opacity:0 rides along with
+    // visibility:hidden because visibility is inheritable AND overridable: a
+    // descendant carrying its own `visibility: visible` rule (expand/collapse
+    // submenus animate exactly that way — e.g. Bitsight's open sidenav
+    // section) pokes back through a hidden ancestor and repeats down the
+    // stitch. Nothing pokes through an ancestor's opacity:0.
+    const hideEntry = (f) => {
+      try {
+        f.el.style.setProperty('visibility', 'hidden', 'important')
+        f.el.style.setProperty('opacity', '0', 'important')
+      } catch { /* ignore */ }
+    }
+    const showEntry = (f) => {
+      try {
+        f.el.style.removeProperty('visibility')
+        if (f.prevVisibility) f.el.style.setProperty('visibility', f.prevVisibility)
+        f.el.style.removeProperty('opacity')
+        if (f.prevOpacity) f.el.style.setProperty('opacity', f.prevOpacity)
+      } catch { /* ignore */ }
+    }
     scanOverlays()
     // Flatten sticky → relative + auto offsets only for multi-frame scroll
     // captures (so sticky bars don't repeat down the stitch). A single-frame
     // capture (viewport / non-scrolling selection / unscrollable fallback)
     // must show exactly what's on screen, so leave positions untouched.
     if (!singleFrame) flattenSticky(sticky)
+
+    // 3a. Fixed → absolute conversion (GoFullPage's core technique, document
+    //     scroll only). Instead of hiding ALL fixed chrome after frame 0,
+    //     re-anchor it to the DOCUMENT so it appears once, at its natural
+    //     place, in every frame consistently:
+    //       - "header" bars (top < 20px, not reaching the viewport bottom)
+    //         keep the existing treatment — visible in frame 0, hidden after;
+    //       - offscreen elements (slide-in drawers) stay on the hide pipeline;
+    //       - full-screen fixed overlays (taller than the viewport AND ≥ ⅔ of
+    //         its width) are left alone — they tile seamlessly at every frame;
+    //       - everything else (side rails, floating buttons, cookie bars)
+    //         becomes position:absolute anchored against a position:relative
+    //         <body>: an element with author top+bottom (Bitsight's sidenav)
+    //         STRETCHES the full page height; one that scrolls internally gets
+    //         height=scrollHeight so its whole menu is laid out; bottom-pinned
+    //         bars land at the true page bottom.
+    //     Runs at scrollTop 0 (same arrangement GoFullPage computes for its
+    //     top frame) and stays applied for every frame, so the stitched
+    //     slices always agree. All style snapshots go on `converted`.
+    if (!singleFrame && isDoc) {
+      try {
+        const applyImportant = (el, props) => {
+          let css = el.style.cssText + '; '
+          for (const k in props) css += `${k}: ${props[k]} !important; `
+          el.style.cssText = css
+        }
+        let bodyPrepped = false
+        // Making <body> position:relative re-anchors absolute descendants
+        // that previously anchored to the page itself (no positioned
+        // ancestor) — pin those to their current document coordinates first
+        // (GoFullPage's "hanging absolutes" fix), then promote the body.
+        const prepBodyForAbsolute = () => {
+          if (bodyPrepped) return
+          bodyPrepped = true
+          const body = doc.body
+          if (!body) return
+          const bcs = getComputedStyle(body)
+          if (bcs.position !== 'static') return // already a containing block
+          const hanging = []
+          const queue = Array.prototype.slice.call(body.children)
+          let steps = 0
+          while (queue.length && steps++ < 15000) {
+            const el = queue.shift()
+            if (!el || el.nodeType !== 1) continue
+            let cs2
+            try { cs2 = getComputedStyle(el) } catch { continue }
+            if (cs2.position === 'absolute') {
+              const tag = el.nodeName.toLowerCase()
+              if ((tag === 'iframe' || tag === 'img') &&
+                  parseInt(cs2.width, 10) <= 5 && parseInt(cs2.height, 10) <= 5) continue
+              hanging.push({ el, cs: cs2 })
+            } else if (cs2.position === 'static') {
+              for (const c of el.children) queue.push(c)
+            }
+            // positioned (relative/fixed/sticky) → its absolute descendants
+            // anchor to it, unaffected by the body change — don't descend.
+          }
+          const br = body.getBoundingClientRect()
+          const bx = br.left + window.scrollX
+          const by = br.top + window.scrollY
+          for (const h of hanging) {
+            const prev = h.el.style.cssText
+            applyImportant(h.el, {
+              width: h.cs.width,
+              height: h.cs.height,
+              left: `${parseFloat(h.cs.left) - bx}px`,
+              top: `${parseFloat(h.cs.top) + (parseFloat(bcs.marginTop) || 0) - by}px`,
+              right: 'auto',
+              bottom: 'auto'
+            })
+            converted.push({ el: h.el, prev })
+          }
+          const prevBody = body.style.cssText
+          const bodyProps = { position: 'relative' }
+          if (bcs.display === 'inline') bodyProps.display = 'block'
+          applyImportant(body, bodyProps)
+          converted.push({ el: body, prev: prevBody })
+        }
+        // Port of GoFullPage's fixed→absolute re-anchoring: read the fixed
+        // element's used inset/size values and which of them the author
+        // actually specified (computedStyleMap distinguishes 'auto'), flip to
+        // absolute, then rebuild equivalent offsets against the offsetParent.
+        const convertFixedToAbsolute = (el) => {
+          const cs = getComputedStyle(el)
+          const oldL = parseFloat(cs.left), oldR = parseFloat(cs.right)
+          const oldT = parseFloat(cs.top), oldB = parseFloat(cs.bottom)
+          const oldW = parseFloat(cs.width), oldH = parseFloat(cs.height)
+          const sh = el.scrollHeight
+          const oy = cs.overflowY
+          let map = null
+          try { map = el.computedStyleMap ? el.computedStyleMap() : null } catch { map = null }
+          const spec = {}
+          for (const p of ['left', 'right', 'top', 'bottom', 'width', 'height']) {
+            let s = false
+            try { s = !!map && String(map.get(p).value) !== 'auto' } catch { s = false }
+            spec[p] = s
+          }
+          const prev = el.style.cssText
+          applyImportant(el, { position: 'absolute', transition: 'none' })
+          converted.push({ el, prev })
+          const op = el.offsetParent
+          if (!op) return // anchors to the page as-is — good enough
+          const b = op.getBoundingClientRect()
+          const docH = de.scrollHeight, docW = de.scrollWidth
+          const w = oldL - b.left
+          const x = oldR - (docW - (b.left + b.width))
+          const v = oldT - b.top
+          const S = oldB - (docH - (b.top + b.height))
+          const out = {}
+          let anchored = false
+          if (!isNaN(w) && w <= 0) {
+            anchored = true
+            if (spec.left || spec.right) {
+              if (spec.left) out.left = `${w}px`
+              if (spec.right) out.right = `${x}px`
+            } else out.left = `${w}px`
+          } else if (spec.right && !isNaN(x)) {
+            anchored = true
+            out.right = `${x}px`
+          }
+          if (!isNaN(v) && v <= 0) {
+            anchored = true
+            let hh = oldH
+            // The element scrolls internally (a full-height sidebar menu) →
+            // lay out ALL of its content instead of one viewport's worth.
+            if (oy === 'scroll' || oy === 'auto') hh = Math.max(hh, sh)
+            out.height = `${hh}px`
+            if (spec.top || spec.bottom) {
+              if (spec.top && spec.bottom) delete out.height // stretch instead
+              if (spec.top) out.top = `${v}px`
+              if (spec.bottom) out.bottom = `${S}px`
+            } else if (oldB === 0 && b.height !== 0) {
+              out.bottom = '0px'
+            } else {
+              out.top = `${v}px`
+              out.bottom = 'auto'
+            }
+          } else if (spec.bottom && !isNaN(S)) {
+            anchored = true
+            out.bottom = (oldB === 0 && b.height !== 0) ? '0px' : `${S}px`
+          }
+          if ((out.left && !out.right) || (!out.left && out.right)) {
+            if (spec.width) out.width = `${oldW}px`
+          }
+          if (anchored) {
+            if (out.width) out['max-width'] = out.width
+            if (out.height) out['max-height'] = out.height
+            applyImportant(el, out)
+          }
+        }
+        const vhNow = window.innerHeight, vwNow = window.innerWidth
+        const hasOverflowHiddenParent = (el) => {
+          const p = el.parentNode
+          if (p && p !== doc.documentElement && p !== doc.body && p.nodeType === 1) {
+            try { return getComputedStyle(p).overflow === 'hidden' } catch { return false }
+          }
+          return false
+        }
+        const keepFixed = []
+        for (const f of fixed) {
+          let r
+          try { r = f.el.getBoundingClientRect() } catch { keepFixed.push(f); continue }
+          const isHeader = r.top < 20 && r.height < vhNow - r.top - 20
+          const offscreen = (r.top + r.height <= 0) || (r.left + r.width <= 0) ||
+            (r.top > vhNow) || (r.left > vwNow)
+          const tooBig = r.height > vhNow && r.width >= (vwNow * 2) / 3
+          if (tooBig) continue // left alone entirely — tiles seamlessly
+          // A parent with overflow:hidden doesn't clip a FIXED child but WOULD
+          // clip it once absolute — keep those on the hide pipeline instead.
+          if (isHeader || offscreen || hasOverflowHiddenParent(f.el)) {
+            keepFixed.push(f)
+            continue
+          }
+          try {
+            prepBodyForAbsolute()
+            convertFixedToAbsolute(f.el)
+          } catch {
+            keepFixed.push(f) // conversion failed → fall back to hiding
+          }
+        }
+        fixed.length = 0
+        for (const f of keepFixed) fixed.push(f)
+      } catch { /* conversion is best-effort — hide pipeline + crops still apply */ }
+    }
+
+    // 3b. Pinned-chrome probe (multi-frame captures only). The computed-style
+    //     scan above only sees position:fixed/sticky, but chrome can be pinned
+    //     to the viewport by other means — a scroll handler re-anchoring a
+    //     position:absolute sidebar, transform-pinned wrappers, sticky inside
+    //     shadow roots. Those repeat in every frame, and when they span the
+    //     MIDDLE of the viewport (a full-height pinned sidebar) the
+    //     stitch-time edge crops can't remove them. Detect them empirically:
+    //     measure each on-screen element's viewport rect at three scroll
+    //     offsets (top, bottom, middle) — anything holding its exact viewport
+    //     position across all three while the content scrolls under it is
+    //     pinned. Three probes, not two, so a virtualized-list row that lands
+    //     back on the same spot once can't be flagged. Flagged roots join
+    //     `fixed` and get identical treatment (visible in frame 0 / at the
+    //     bottom when bottom-anchored, hidden everywhere else).
+    if (!singleFrame) {
+      try {
+        const clientH = scroller.clientHeight || window.innerHeight
+        const maxScroll = Math.max(0, scroller.scrollHeight - clientH)
+        if (maxScroll >= 300) {
+          const wait = (ms) => new Promise((r) => setTimeout(r, ms))
+          // Per-document probe box: only elements able to pollute the stitch
+          // matter — the viewport when the document scrolls; the pane's box
+          // (in each document's own coordinates) when an inner pane scrolls,
+          // since chrome outside the pane is composited from frame 0 anyway.
+          const boxes = new Map()
+          if (isDoc) {
+            boxes.set(doc, { x: 0, y: 0, w: window.innerWidth, h: window.innerHeight })
+          } else {
+            const sr = scroller.getBoundingClientRect()
+            boxes.set(scroller.ownerDocument, { x: sr.left, y: sr.top, w: sr.width, h: sr.height })
+            if (scroller.ownerDocument !== doc && iframeEl) {
+              const frr = iframeEl.getBoundingClientRect()
+              boxes.set(doc, { x: sr.left + frr.left, y: sr.top + frr.top, w: sr.width, h: sr.height })
+            }
+          }
+          const probeEls = []
+          const baseRects = []
+          const collectFrom = (root) => {
+            let all
+            try { all = root.querySelectorAll('*') } catch { return }
+            for (let i = 0; i < all.length && probeEls.length < 20000; i++) {
+              const el = all[i]
+              if (el.shadowRoot) collectFrom(el.shadowRoot)
+              if (seenOverlays.has(el) || el === styleEl) continue
+              if (!isDoc && (el === scroller || el.contains(scroller) ||
+                  (iframeEl && (el === iframeEl || el.contains(iframeEl))))) continue
+              const sdoc = el.ownerDocument
+              if (el === sdoc.documentElement || el === sdoc.body || el === sdoc.scrollingElement) continue
+              const box = boxes.get(sdoc)
+              if (!box) continue
+              const r = el.getBoundingClientRect()
+              if (r.width < 8 || r.height < 8) continue
+              if (r.right < box.x || r.left > box.x + box.w || r.bottom < box.y || r.top > box.y + box.h) continue
+              probeEls.push(el)
+              baseRects.push({ top: r.top, left: r.left })
+            }
+          }
+          for (const sdoc of scanDocs) collectFrom(sdoc)
+
+          if (probeEls.length) {
+            const stableAt = (i) => {
+              const el = probeEls[i]
+              if (!el.isConnected) return false
+              const r = el.getBoundingClientRect()
+              const b = baseRects[i]
+              return Math.abs(r.top - b.top) <= 1.5 && Math.abs(r.left - b.left) <= 1.5
+            }
+            scroller.scrollTop = maxScroll
+            void scroller.scrollTop
+            await wait(220)
+            const y1 = scroller.scrollTop
+            const pass1 = []
+            for (let i = 0; i < probeEls.length; i++) if (stableAt(i)) pass1.push(i)
+            scroller.scrollTop = Math.floor(maxScroll / 2)
+            void scroller.scrollTop
+            await wait(180)
+            const y2 = scroller.scrollTop
+            // Both jumps must have really scrolled — otherwise every element
+            // looks "stable" and the whole page would be flagged.
+            if (y1 >= 200 && Math.abs(y1 - y2) >= 100 && pass1.length) {
+              const pinned = new Set()
+              for (const i of pass1) if (stableAt(i)) pinned.add(probeEls[i])
+              // Descendants of pinned chrome are stable too — act only on the
+              // outermost roots (elements already handled as fixed count as
+              // covering ancestors). Hiding a root hides its subtree.
+              const covered = new Set(pinned)
+              for (const f of fixed) covered.add(f.el)
+              const shadowHost = (n) => {
+                const rn = n.getRootNode && n.getRootNode()
+                return rn && rn.host ? rn.host : null
+              }
+              for (const el of pinned) {
+                let p = el.parentElement || shadowHost(el)
+                let isRoot = true
+                while (p) {
+                  if (covered.has(p)) { isRoot = false; break }
+                  p = p.parentElement || shadowHost(p)
+                }
+                if (!isRoot) continue
+                seenOverlays.add(el)
+                const r = el.getBoundingClientRect()
+                fixed.push({
+                  el,
+                  prevVisibility: el.style.getPropertyValue('visibility'),
+                  prevOpacity: el.style.getPropertyValue('opacity'),
+                  bottomAnchored: r.top > window.innerHeight * 0.5
+                })
+              }
+            }
+          }
+        }
+      } catch { /* best-effort — the stitch-time edge crops still guard the strips */ }
+    }
 
     // 4. Scroll to top and measure AFTER all mutations settled.
     if (!singleFrame) {
@@ -709,9 +1041,7 @@ async function lumiaPrep(maxFrames, mode) {
 
     if (totalFrames > 1) {
       for (const f of fixed) {
-        if (f.bottomAnchored) {
-          try { f.el.style.setProperty('visibility', 'hidden', 'important') } catch { /* ignore */ }
-        }
+        if (f.bottomAnchored) hideEntry(f)
       }
     }
 
@@ -720,6 +1050,7 @@ async function lumiaPrep(maxFrames, mode) {
       isDoc,
       fixed,
       sticky,
+      converted,
       extraStyles,
       prevScrollTop,
       prevScrollLeft,
@@ -738,11 +1069,14 @@ async function lumiaPrep(maxFrames, mode) {
           const keep = frameIndex === 0
             ? (!f.bottomAnchored || isLast)
             : (isLast && f.bottomAnchored)
-          if (!keep) {
-            try { f.el.style.setProperty('visibility', 'hidden', 'important') } catch { /* ignore */ }
-          }
+          if (!keep) hideEntry(f)
         }
-      }
+      },
+      // Shared by lumiaScrollTo / lumiaRestore (closures survive across
+      // executeScript calls) so every hide/show site applies the same
+      // opacity+visibility pair and prev-style restore.
+      hideEntry,
+      showEntry
     }
 
     return {
@@ -845,19 +1179,12 @@ function lumiaScrollTo(y, index, isLast, total) {
   }
   if (index === 1) {
     for (const f of st.fixed) {
-      if (!f.bottomAnchored) {
-        try { f.el.style.setProperty('visibility', 'hidden', 'important') } catch { /* ignore */ }
-      }
+      if (!f.bottomAnchored) st.hideEntry(f)
     }
   }
   if (isLast) {
     for (const f of st.fixed) {
-      if (f.bottomAnchored) {
-        try {
-          f.el.style.removeProperty('visibility')
-          if (f.prevVisibility) f.el.style.setProperty('visibility', f.prevVisibility)
-        } catch { /* ignore */ }
-      }
+      if (f.bottomAnchored) st.showEntry(f)
     }
   }
   const sc = st.isDoc ? (document.scrollingElement || document.documentElement) : st.scroller
@@ -883,15 +1210,25 @@ function lumiaRestore() {
     if (dim) dim.remove()
     if (st.overlayKeyHandler) window.removeEventListener('keydown', st.overlayKeyHandler, true)
     for (const f of st.fixed) {
-      try {
-        f.el.style.removeProperty('visibility')
-        if (f.prevVisibility) f.el.style.setProperty('visibility', f.prevVisibility)
-      } catch { /* ignore */ }
+      if (st.showEntry) st.showEntry(f)
+      else {
+        try {
+          f.el.style.removeProperty('visibility')
+          if (f.prevVisibility) f.el.style.setProperty('visibility', f.prevVisibility)
+        } catch { /* ignore */ }
+      }
     }
     for (const s of st.sticky) {
       // Flattening touched position + top/left/right/bottom — restore the
       // element's whole inline style snapshot instead of unpicking each.
       try { s.el.style.cssText = s.prevCssText || '' } catch { /* ignore */ }
+    }
+    // Fixed→absolute conversions (incl. the body promotion and hanging-
+    // absolute pins) — full inline-style snapshots, restored verbatim.
+    if (st.converted) {
+      for (const c of st.converted) {
+        try { c.el.style.cssText = c.prev || '' } catch { /* ignore */ }
+      }
     }
     const styleEl = document.getElementById('__lumia-cap-style')
     if (styleEl) styleEl.remove()
