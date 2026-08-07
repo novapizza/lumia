@@ -40,6 +40,14 @@ export interface AppSettings {
    *  no stitch guessing); 'screen' is the classic synthetic-wheel +
    *  screen-grab + stitch pipeline that works on any app. */
   scrollCaptureMethod: ScrollCaptureMethod
+  /** When true, captures include Lumia's own windows: the main window is NOT
+   *  hidden before the screen freeze (screenshots) or the recording session
+   *  (video), and the window picker offers Lumia's windows too (Win32 — on
+   *  macOS the pick helpers exclude our PID at spawn, but region/screen/
+   *  all-screen still include Lumia because the freeze routes around the
+   *  PID-filtered native snapshot). Scroll capture keeps hiding — it always
+   *  captures another app. */
+  captureSelfWindow: boolean
   /** When true, the physical PrintScreen key is bound to "New Capture" via a
    *  globalShortcut, and on Windows the "PrintScreen opens Snipping Tool"
    *  registry hijack is turned off so the keystroke reaches us. The binding
@@ -99,6 +107,7 @@ const store = new Store<AppSettings>({
     lastImageMode: 'region',
     lastVideoMode: 'region',
     scrollCaptureMethod: 'screen',
+    captureSelfWindow: false,
     printScreenAsCapture: PRINT_SCREEN_DEFAULT,
     printScreenPromptShown: PRINT_SCREEN_DEFAULT,
     wallpaperCategories: [],
@@ -137,6 +146,7 @@ export function getSettings(): AppSettings {
     lastImageMode: store.get('lastImageMode'),
     lastVideoMode: store.get('lastVideoMode'),
     scrollCaptureMethod: store.get('scrollCaptureMethod'),
+    captureSelfWindow: store.get('captureSelfWindow'),
     printScreenAsCapture: store.get('printScreenAsCapture'),
     printScreenPromptShown: store.get('printScreenPromptShown'),
     wallpaperCategories: store.get('wallpaperCategories'),

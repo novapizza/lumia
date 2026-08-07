@@ -308,7 +308,7 @@ function getWindowFrameRectPhysical(hwnd: any): { x: number; y: number; width: n
 // Manager"), wallpaper hosts, and the taskbars.
 const SHELL_CLASS_DENYLIST = new Set(['Progman', 'WorkerW', 'Shell_TrayWnd', 'Shell_SecondaryTrayWnd'])
 
-function isPickableAppWindow(hwnd: any, clsBuf: Uint16Array): boolean {
+function isPickableAppWindow(hwnd: any, clsBuf: Uint16Array, includeSelf = false): boolean {
   if (_overlayHwnds.has(hwnd)) return false
   if (!isWindowReallyVisible(hwnd)) return false
   const WS_EX_TOOLWINDOW = 0x80
@@ -327,10 +327,14 @@ function isPickableAppWindow(hwnd: any, clsBuf: Uint16Array): boolean {
     }
   }
   // Own process (main window, editor, recorder chrome) never counts — the
-  // picker exists to grab OTHER apps' windows.
-  const pidOut = [0]
-  _GetWindowThreadProcessId(hwnd, pidOut)
-  if (pidOut[0] === process.pid) return false
+  // picker exists to grab OTHER apps' windows. Exception: "Capture Lumia
+  // window too" (settings.captureSelfWindow) points the picker at ourselves;
+  // overlay windows stay excluded via _overlayHwnds above either way.
+  if (!includeSelf) {
+    const pidOut = [0]
+    _GetWindowThreadProcessId(hwnd, pidOut)
+    if (pidOut[0] === process.pid) return false
+  }
   // Untitled top-levels are shell plumbing / hidden hosts, not user windows.
   if (_GetWindowTextLengthW(hwnd) <= 0) return false
   const n = _GetClassNameW(hwnd, clsBuf, clsBuf.length)
@@ -358,7 +362,7 @@ export function getForegroundWindowHwnd(): any {
  *  not a tool window, not one of ours) plus a titled-app-window requirement so
  *  shell plumbing doesn't count. Rects are DWM visible frames in virtual-screen
  *  physical pixels — same space as getWindowAtPointPhysical. */
-export function listTopLevelWindowsPhysical(): Array<{ hwnd: any; x: number; y: number; width: number; height: number }> {
+export function listTopLevelWindowsPhysical(includeSelf = false): Array<{ hwnd: any; x: number; y: number; width: number; height: number }> {
   if (!ensureLoaded()) return []
   const prevCtx = _SetThreadDpiAwarenessContext
     ? (() => { try { return _SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_V2) } catch { return null } })()
@@ -371,7 +375,7 @@ export function listTopLevelWindowsPhysical(): Array<{ hwnd: any; x: number; y: 
     let attempts = 0
     while (hwnd && attempts < 2000) {
       attempts++
-      if (isPickableAppWindow(hwnd, clsBuf)) {
+      if (isPickableAppWindow(hwnd, clsBuf, includeSelf)) {
         const rect = getWindowFrameRectPhysical(hwnd)
         // Skip degenerate slivers (offscreen helpers / 1px windows) — same
         // threshold as the macOS helper.

@@ -183,12 +183,23 @@ export function captureDisplayGdi(display: Electron.Display): NativeCapture | nu
  * Fast display capture. Windows uses synchronous GDI; macOS goes through the
  * warm ScreenCaptureKit helper; anything else (or any failure) returns null
  * so the caller falls back to desktopCapturer.
+ *
+ * `includeSelf` — the capture must contain Lumia's own windows ("Capture
+ * Lumia window too"). GDI BitBlts the real screen, so Windows already
+ * complies; the macOS helper excludes our PID at the compositor level and
+ * can't be asked not to (the filter is baked at spawn), so we return null
+ * there and let the caller's desktopCapturer fallback — which captures the
+ * true screen contents — pick it up. Slower on macOS, but correct.
  */
 export async function captureDisplayNative(
-  display: Electron.Display
+  display: Electron.Display,
+  opts?: { includeSelf?: boolean }
 ): Promise<NativeCapture | null> {
   if (process.platform === 'win32') return captureDisplayGdi(display)
-  if (process.platform === 'darwin') return captureDisplayMacSnap(display)
+  if (process.platform === 'darwin') {
+    if (opts?.includeSelf) return null
+    return captureDisplayMacSnap(display)
+  }
   return null
 }
 

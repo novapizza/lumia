@@ -69,9 +69,20 @@ const HIDE_DELAY_MS = process.platform === 'darwin' ? 250 : 200
 // real screen and CAN bake a still-fading main window into the frame.
 let hideWaitSkipped = false
 
+/** "Capture Lumia window too" — when on, captures leave the app visible so
+ *  Lumia's own windows land in the frozen snapshot (or the live recording —
+ *  video.ts consults the same setting), and the window picker offers them
+ *  as targets. */
+function includeSelfInCapture(): boolean {
+  return getSettings().captureSelfWindow
+}
+
 function hideMainWindow(): Promise<void> {
   return new Promise(resolve => {
     hideWaitSkipped = false
+    // Self-capture: the whole point is for Lumia to be IN the shot — skip the
+    // hide (and with it the compositor-settle wait) entirely.
+    if (includeSelfInCapture()) { resolve(); return }
     const win = getMainWindow()
     if (!win || win.isDestroyed()) { resolve(); return }
     // Already hidden → no compositor work needed, skip the delay so we get
@@ -128,16 +139,20 @@ function clearFrozenCache() {
 
 /** Snapshot every display at full physical resolution into the frozen cache.
  *  Caller must have already hidden the main window (otherwise main bakes
- *  into the cached frame). Runs all displays in parallel. */
+ *  into the cached frame — unless captureSelfWindow is on, where baking it
+ *  in is exactly the point). Runs all displays in parallel. */
 async function freezeAllDisplays(): Promise<void> {
   clearFrozenCache()
   const allDisplays = screen.getAllDisplays()
+  const includeSelf = includeSelfInCapture()
 
   // Fast path: native capture — Windows GDI BitBlt (~5–20 ms/display), macOS
   // 14+ warm ScreenCaptureKit helper (~50–200 ms/display). See native-screen.ts.
+  // includeSelf routes macOS to the desktopCapturer fallback below (the
+  // helper's PID filter would erase Lumia from the frame).
   const fallbackDisplays: Electron.Display[] = []
   await Promise.all(allDisplays.map(async d => {
-    const nat: NativeCapture | null = await captureDisplayNative(d)
+    const nat: NativeCapture | null = await captureDisplayNative(d, { includeSelf })
     if (nat) frozenImages.set(d.id, nat)
     else fallbackDisplays.push(d)
   }))
@@ -395,7 +410,9 @@ export function setupCapture() {
     if (confirmActiveInFlight) return null
     confirmActiveInFlight = true
     try {
-      const target = await getActivePickTarget()
+      // captureSelfWindow applies to both screenshot window-pick and
+      // video-window sessions (video.ts also skips its hide when it's on).
+      const target = await getActivePickTarget(includeSelfInCapture())
       if (!target) return null
 
       if (mode === 'video-window') {
@@ -590,7 +607,7 @@ async function captureWindow(): Promise<void> {
     // Exactly one app window showing → nothing to choose between; capture it
     // outright instead of surfacing the picker. The freeze already banked the
     // pixels, so this is the same crop a click would produce.
-    const [, single] = await Promise.all([freezeAllDisplays(), getSinglePickTarget()])
+    const [, single] = await Promise.all([freezeAllDisplays(), getSinglePickTarget(includeSelfInCapture())])
     if (single) {
       resetOverlayMode()
       await captureWindowTarget(single)
@@ -716,7 +733,7 @@ async function captureDisplay(display: Electron.Display, allDisplays: Electron.D
 
   // No frozen frame (fullscreen / single-display monitor capture — no overlay
   // session) — same native fast path the freeze uses, then desktopCapturer.
-  const nat = await captureDisplayNative(display)
+  const nat = await captureDisplayNative(display, { includeSelf: includeSelfInCapture() })
   if (nat) return nat.image.toDataURL()
 
   const sf = display.scaleFactor || 1

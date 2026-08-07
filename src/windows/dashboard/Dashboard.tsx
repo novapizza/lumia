@@ -86,6 +86,7 @@ export default function Dashboard() {
   const [filter, setFilter] = useState<FilterType>('all')
   const [hotkeys, setHotkeys] = useState<Record<string, string>>({})
   const [mediaKind, setMediaKind] = useState<MediaKind>('image')
+  const [captureSelf, setCaptureSelf] = useState(false)
   const [scrollMethod, setScrollMethod] = useState<ScrollMethod>('screen')
   const [extStatus, setExtStatus] = useState<{ connected: boolean; browsers: string[]; outdated?: string[]; bundledVersion?: string | null }>({ connected: false, browsers: [] })
   const [showExtSetup, setShowExtSetup] = useState(false)
@@ -125,6 +126,7 @@ export default function Dashboard() {
       if (s?.scrollCaptureMethod === 'extension' || s?.scrollCaptureMethod === 'screen') {
         setScrollMethod(s.scrollCaptureMethod)
       }
+      setCaptureSelf(!!s?.captureSelfWindow)
       setGdriveReady(!!(s?.googleDriveConnected && s?.googleDriveFolderId))
     })
     // Extension-bridge status for the Scroll tab: initial pull + live push
@@ -186,6 +188,11 @@ export default function Dashboard() {
     // instead of creating a duplicate). Don't navigate again here — that
     // overwrites the state and drops the historyId.
     await window.electronAPI?.captureScreenshot(mode)
+  }
+
+  const handleCaptureSelfChange = (v: boolean) => {
+    setCaptureSelf(v)
+    window.electronAPI?.setSetting('captureSelfWindow', v)
   }
 
   const handleVideo = (mode: VideoMode) => {
@@ -382,65 +389,72 @@ export default function Dashboard() {
       {/* ── Capture Actions ── */}
       <section>
         {mediaKind === 'image' ? (
-          <div className="flex flex-wrap gap-2">
-            {CAPTURE_MODES.map(({ mode, icon, label }) => {
-              const accel = hotkeys[MODE_ACTION[mode]]
-              const keys = accel ? parseShortcut(accel) : []
-              return (
-                <button
-                  key={mode}
-                  onClick={() => handleCapture(mode)}
-                  className="group w-44 flex items-center gap-3 px-3 py-3 rounded-xl
-                             bg-white/[0.03] border border-white/[0.05]
-                             hover:bg-primary/[0.08] hover:border-primary/20
-                             active:scale-[0.98] transition-all duration-200 cursor-pointer"
-                >
-                  <div className="w-9 h-9 rounded-lg bg-primary/10 flex items-center justify-center flex-shrink-0
-                                  group-hover:bg-primary/20 transition-colors duration-200">
-                    <span className="material-symbols-outlined text-primary text-lg">{icon}</span>
-                  </div>
-                  <div className="text-left min-w-0">
-                    <span
-                      className="block text-xs font-semibold text-slate-200 group-hover:text-white transition-colors truncate"
-                      style={{ fontFamily: 'Manrope, sans-serif' }}
-                    >
-                      {label}
-                    </span>
-                    {keys.length > 0 && <KeyCombo keys={keys} />}
-                  </div>
-                </button>
-              )
-            })}
+          <div className="space-y-3">
+            <div className="flex flex-wrap gap-2">
+              {CAPTURE_MODES.map(({ mode, icon, label }) => {
+                const accel = hotkeys[MODE_ACTION[mode]]
+                const keys = accel ? parseShortcut(accel) : []
+                return (
+                  <button
+                    key={mode}
+                    onClick={() => handleCapture(mode)}
+                    className="group w-44 flex items-center gap-3 px-3 py-3 rounded-xl
+                               bg-white/[0.03] border border-white/[0.05]
+                               hover:bg-primary/[0.08] hover:border-primary/20
+                               active:scale-[0.98] transition-all duration-200 cursor-pointer"
+                  >
+                    <div className="w-9 h-9 rounded-lg bg-primary/10 flex items-center justify-center flex-shrink-0
+                                    group-hover:bg-primary/20 transition-colors duration-200">
+                      <span className="material-symbols-outlined text-primary text-lg">{icon}</span>
+                    </div>
+                    <div className="text-left min-w-0">
+                      <span
+                        className="block text-xs font-semibold text-slate-200 group-hover:text-white transition-colors truncate"
+                        style={{ fontFamily: 'Manrope, sans-serif' }}
+                      >
+                        {label}
+                      </span>
+                      {keys.length > 0 && <KeyCombo keys={keys} />}
+                    </div>
+                  </button>
+                )
+              })}
+            </div>
+
+            <CaptureSelfToggle checked={captureSelf} onChange={handleCaptureSelfChange} />
           </div>
         ) : mediaKind === 'video' ? (
-          <div className="flex flex-wrap gap-2">
-            {VIDEO_MODES.map(({ mode, icon, label }) => {
-              const hotkey = hotkeys[VIDEO_MODE_ACTION[mode]]
-              return (
-                <button
-                  key={mode}
-                  onClick={() => handleVideo(mode)}
-                  className="group w-44 flex items-center gap-3 px-3 py-3 rounded-xl
-                             bg-white/[0.03] border border-white/[0.05]
-                             hover:bg-tertiary/[0.08] hover:border-tertiary/20
-                             active:scale-[0.98] transition-all duration-200 cursor-pointer"
-                >
-                  <div className="w-9 h-9 rounded-lg bg-tertiary/10 flex items-center justify-center flex-shrink-0
-                                  group-hover:bg-tertiary/20 transition-colors duration-200">
-                    <span className="material-symbols-outlined text-tertiary text-lg">{icon}</span>
-                  </div>
-                  <div className="text-left min-w-0">
-                    <span
-                      className="block text-xs font-semibold text-slate-200 group-hover:text-white transition-colors truncate"
-                      style={{ fontFamily: 'Manrope, sans-serif' }}
-                    >
-                      {label}
-                    </span>
-                    {hotkey && <KeyCombo keys={parseShortcut(hotkey)} />}
-                  </div>
-                </button>
-              )
-            })}
+          <div className="space-y-3">
+            <div className="flex flex-wrap gap-2">
+              {VIDEO_MODES.map(({ mode, icon, label }) => {
+                const hotkey = hotkeys[VIDEO_MODE_ACTION[mode]]
+                return (
+                  <button
+                    key={mode}
+                    onClick={() => handleVideo(mode)}
+                    className="group w-44 flex items-center gap-3 px-3 py-3 rounded-xl
+                               bg-white/[0.03] border border-white/[0.05]
+                               hover:bg-tertiary/[0.08] hover:border-tertiary/20
+                               active:scale-[0.98] transition-all duration-200 cursor-pointer"
+                  >
+                    <div className="w-9 h-9 rounded-lg bg-tertiary/10 flex items-center justify-center flex-shrink-0
+                                    group-hover:bg-tertiary/20 transition-colors duration-200">
+                      <span className="material-symbols-outlined text-tertiary text-lg">{icon}</span>
+                    </div>
+                    <div className="text-left min-w-0">
+                      <span
+                        className="block text-xs font-semibold text-slate-200 group-hover:text-white transition-colors truncate"
+                        style={{ fontFamily: 'Manrope, sans-serif' }}
+                      >
+                        {label}
+                      </span>
+                      {hotkey && <KeyCombo keys={parseShortcut(hotkey)} />}
+                    </div>
+                  </button>
+                )
+              })}
+            </div>
+            <CaptureSelfToggle checked={captureSelf} onChange={handleCaptureSelfChange} />
           </div>
         ) : (
           <div className="space-y-3">
@@ -870,6 +884,35 @@ function MediaKindToggle({ value, onChange }: { value: MediaKind; onChange: (v: 
         )
       })}
     </div>
+  )
+}
+
+/* ── Capture-self toggle ── */
+
+/** "Include Lumia's own window" — normally the app hides itself before a
+ *  capture/recording starts; this keeps it visible so Lumia's own window can
+ *  be part of the shot (and picked in Window mode). Shown under the mode
+ *  buttons on both the Image and Video tabs; backed by the persisted
+ *  `captureSelfWindow` setting so hotkey captures honor it too. */
+function CaptureSelfToggle({ checked, onChange }: { checked: boolean; onChange: (v: boolean) => void }) {
+  return (
+    <label
+      className="group inline-flex items-center gap-2 cursor-pointer select-none"
+      title="Keep Lumia visible while capturing or recording, so the app's own window appears in the result and can be picked in Window mode"
+    >
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={e => onChange(e.target.checked)}
+        className="w-3.5 h-3.5 accent-primary cursor-pointer flex-shrink-0"
+      />
+      <span
+        className="text-[11px] font-medium text-slate-500 group-hover:text-slate-300 transition-colors"
+        style={{ fontFamily: 'Manrope, sans-serif' }}
+      >
+        Include Lumia's own window in captures
+      </span>
+    </label>
   )
 }
 

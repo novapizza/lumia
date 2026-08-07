@@ -134,10 +134,15 @@ function win32ToPickTarget(w: { hwnd: unknown } & PickRect): PickTarget | null {
 }
 
 /** All pickable app windows, front-to-back. Empty when enumeration is
- *  unsupported (koffi failed to load, pre-"list" macOS helper, linux). */
-export async function listPickTargets(): Promise<PickTarget[]> {
+ *  unsupported (koffi failed to load, pre-"list" macOS helper, linux).
+ *
+ *  `includeSelf` ("Capture Lumia window too"): Win32 lets our own windows
+ *  count as targets. macOS can't — the window-at-point helper excludes our
+ *  PID at spawn — so Lumia stays unpickable there (region/screen captures
+ *  still include it via the freeze's desktopCapturer fallback). */
+export async function listPickTargets(includeSelf = false): Promise<PickTarget[]> {
   if (process.platform === 'win32') {
-    return listTopLevelWindowsPhysical()
+    return listTopLevelWindowsPhysical(includeSelf)
       .map(win32ToPickTarget)
       .filter((t): t is PickTarget => t !== null)
   }
@@ -158,16 +163,16 @@ export async function listPickTargets(): Promise<PickTarget[]> {
 }
 
 /** The lone pickable window, or null when there are zero or several. */
-export async function getSinglePickTarget(): Promise<PickTarget | null> {
-  const targets = await listPickTargets()
+export async function getSinglePickTarget(includeSelf = false): Promise<PickTarget | null> {
+  const targets = await listPickTargets(includeSelf)
   return targets.length === 1 ? targets[0] : null
 }
 
 /** The active window for Enter-to-confirm: the foreground window snapshotted
  *  at session start when it's still pickable, else the frontmost pickable
  *  window, else null (Enter is then a no-op). */
-export async function getActivePickTarget(): Promise<PickTarget | null> {
-  const targets = await listPickTargets()
+export async function getActivePickTarget(includeSelf = false): Promise<PickTarget | null> {
+  const targets = await listPickTargets(includeSelf)
   if (targets.length === 0) return null
   if (process.platform === 'win32' && foregroundHwndAtSessionStart) {
     const hit = targets.find(t => t.hwnd === foregroundHwndAtSessionStart)

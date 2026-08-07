@@ -18,6 +18,9 @@ interface AppSettings {
   lastImageMode: 'region' | 'window' | 'all-screen' | 'screen' | 'scrolling'
   lastVideoMode: 'region' | 'window' | 'screen'
   scrollCaptureMethod: 'extension' | 'screen'
+  // Captures include Lumia's own windows (app stays visible during capture
+  // and recording; the window picker can target Lumia). Image + video.
+  captureSelfWindow: boolean
   printScreenAsCapture: boolean
   printScreenPromptShown: boolean
   wallpaperCategories: string[]

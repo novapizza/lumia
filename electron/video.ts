@@ -18,7 +18,7 @@ import { uploadFileToR2 } from './uploaders/r2'
 import { uploadFilePathToDrive } from './google-drive-service'
 import { resetOverlayMode, setOverlayMode } from './scroll-capture'
 import { showNotification } from './notify'
-import { resolveSaveStartDir, rememberSaveDir } from './settings'
+import { getSettings, resolveSaveStartDir, rememberSaveDir } from './settings'
 import { localTimestamp } from './utils'
 import { makeThumbnail } from './thumbnail'
 import { openAnnotation, closeAnnotation, destroyAnnotation, isAnnotationOpen, setupAnnotation } from './annotation'
@@ -81,6 +81,9 @@ export function isRecordingActive(): boolean {
 
 function hideMain(): Promise<void> {
   return new Promise(resolve => {
+    // "Capture Lumia window too" — keep the app visible so it can be part of
+    // the recording (and a window-record target).
+    if (getSettings().captureSelfWindow) return resolve()
     const win = getMainWindow()
     if (!win || win.isDestroyed()) return resolve()
     win.hide()
@@ -892,7 +895,7 @@ export async function startVideoCapture(mode: 'region' | 'window' | 'screen') {
   // Exactly one app window showing → nothing to choose between; skip the
   // picker and start recording it directly.
   if (mode === 'window') {
-    const single = await getSinglePickTarget()
+    const single = await getSinglePickTarget(getSettings().captureSelfWindow)
     if (single) {
       await beginWindowRecording(single.rect, single.displayId)
       return
