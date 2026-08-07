@@ -434,7 +434,7 @@ function GalleryHeader({
                 key={id}
                 className={`inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs transition ${
                   active
-                    ? 'bg-white text-slate-900 shadow-sm'
+                    ? 'bg-white text-black shadow-sm'
                     : 'bg-white/[0.06] text-slate-200'
                 }`}
                 style={{ fontFamily: 'Manrope, sans-serif' }}
@@ -585,7 +585,7 @@ function PickerView({
               type="button"
               onMouseDown={e => e.preventDefault()}
               onClick={submitNew}
-              className="flex h-7 w-7 items-center justify-center rounded-full bg-white text-slate-900 shadow"
+              className="flex h-7 w-7 items-center justify-center rounded-full bg-white text-black shadow"
               aria-label="Add"
             >
               <span className="material-symbols-outlined text-[16px]">check</span>

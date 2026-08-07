@@ -998,7 +998,7 @@ function HistoryCard({
         {item.type === 'recording' && !isSelecting && (
           <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">
             <div className="w-12 h-12 rounded-full bg-white/10 backdrop-blur-md flex items-center justify-center border border-white/20">
-              <span className="material-symbols-outlined text-white text-2xl ml-0.5">play_arrow</span>
+              <span className="material-symbols-outlined text-white/90 text-2xl ml-0.5">play_arrow</span>
             </div>
           </div>
         )}

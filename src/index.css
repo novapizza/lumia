@@ -118,6 +118,15 @@ body {
   box-shadow: 40px 0 80px rgba(182, 160, 255, 0.06);
 }
 
+/* ── Editor canvas workspace (the area surrounding the capture) ── */
+.editor-workspace {
+  background: radial-gradient(circle at 30% 40%, rgba(15, 23, 42, 0.9) 0%, #020617 100%);
+}
+.editor-workspace-dots {
+  background-image: radial-gradient(circle, rgba(255, 255, 255, 0.6) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+
 /* ── Scrollbar ── */
 ::-webkit-scrollbar { width: 4px; height: 4px; }
 
@@ -239,6 +248,13 @@ html.light .refractive-glow-lg {
   box-shadow: 40px 0 80px rgba(0, 80, 212, 0.04);
 }
 
+html.light .editor-workspace {
+  background: radial-gradient(circle at 30% 40%, #f0f0f6 0%, #dfe0ea 100%);
+}
+html.light .editor-workspace-dots {
+  background-image: radial-gradient(circle, rgba(45, 47, 51, 0.6) 1px, transparent 1px);
+}
+
 html.light .primary-gradient {
   background: linear-gradient(135deg, #0050d4 0%, #7b9cff 100%);
 }
@@ -270,8 +286,10 @@ html.light .text-slate-900 { color: #ffffff !important; }
 html.light .bg-black { background-color: #f0f0f6 !important; }
 html.light .bg-slate-950 { background-color: #f6f6fb !important; }
 html.light .bg-slate-900 { background-color: #f0f0f6 !important; }
+html.light .bg-slate-900\/90 { background-color: rgba(240, 240, 246, 0.9) !important; }
 html.light .bg-white\/5 { background-color: rgba(0, 80, 212, 0.04) !important; }
 html.light .bg-white\/10 { background-color: rgba(0, 80, 212, 0.07) !important; }
+html.light .bg-white\/15 { background-color: rgba(0, 80, 212, 0.09) !important; }
 html.light .bg-white\/20 { background-color: rgba(0, 80, 212, 0.1) !important; }
 html.light .bg-black\/60,
 html.light .bg-black\/70,
@@ -281,6 +299,12 @@ html.light .bg-black\/80 { background-color: rgba(45, 47, 51, 0.55) !important; 
 html.light .border-white\/5 { border-color: rgba(45, 47, 51, 0.1) !important; }
 html.light .border-white\/10 { border-color: rgba(45, 47, 51, 0.14) !important; }
 html.light .border-white\/20 { border-color: rgba(45, 47, 51, 0.2) !important; }
+html.light .border-white\/30 { border-color: rgba(45, 47, 51, 0.25) !important; }
+/* Solid white borders/rings mark selection on glass surfaces (editor color
+   swatches, BackgroundPanel) — flip dark so the indicator stays visible. */
+html.light .border-white { border-color: rgba(45, 47, 51, 0.85) !important; }
+html.light .ring-white { --tw-ring-color: rgba(45, 47, 51, 0.85); }
+html.light .ring-offset-slate-900 { --tw-ring-offset-color: #f0f0f6; }
 
 /* Arbitrary-value variants used across Dashboard and other screens. Use
    :not(:hover) so that hover:border-* and hover:bg-* utilities on the same
@@ -293,7 +317,9 @@ html.light .border-white\/\[0\.05\]:not(:hover) { border-color: rgba(45, 47, 51,
 html.light .border-white\/\[0\.06\]:not(:hover) { border-color: rgba(45, 47, 51, 0.08); }
 html.light .border-white\/\[0\.08\]:not(:hover) { border-color: rgba(45, 47, 51, 0.1); }
 
+html.light .bg-white\/\[0\.02\]:not(:hover) { background-color: rgba(45, 47, 51, 0.03); }
 html.light .bg-white\/\[0\.03\]:not(:hover) { background-color: rgba(45, 47, 51, 0.04); }
 html.light .bg-white\/\[0\.04\]:not(:hover) { background-color: rgba(45, 47, 51, 0.05); }
+html.light .bg-white\/\[0\.05\]:not(:hover) { background-color: rgba(45, 47, 51, 0.055); }
 html.light .bg-white\/\[0\.06\]:not(:hover) { background-color: rgba(45, 47, 51, 0.06); }
 html.light .bg-white\/\[0\.08\]:not(:hover) { background-color: rgba(45, 47, 51, 0.07); }

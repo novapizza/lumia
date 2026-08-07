@@ -619,17 +619,8 @@ export default function Editor() {
       <div className="flex flex-1 overflow-hidden">
 
         {/* ── Canvas container ── */}
-        <div
-          className="flex-1 relative overflow-hidden"
-          style={{ background: 'radial-gradient(circle at 30% 40%, rgba(15,23,42,0.9) 0%, #020617 100%)' }}
-        >
-          <div
-            className="absolute inset-0 opacity-[0.025] pointer-events-none"
-            style={{
-              backgroundImage: `radial-gradient(circle, rgba(255,255,255,0.6) 1px, transparent 1px)`,
-              backgroundSize: '24px 24px',
-            }}
-          />
+        <div className="flex-1 relative overflow-hidden editor-workspace">
+          <div className="absolute inset-0 opacity-[0.025] pointer-events-none editor-workspace-dots" />
           {isVideo ? (
             /* Plain HTML5 video player — annotation isn't supported on video in
              *  this build; showing a live video through Konva is overkill when

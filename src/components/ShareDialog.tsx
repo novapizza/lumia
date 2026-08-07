@@ -85,18 +85,11 @@ export default function ShareDialog({ imageDataUrl, templateId, onClose }: Props
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center"
-      style={{ background: 'rgba(2,6,23,0.75)', backdropFilter: 'blur(8px)' }}
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-md"
       onClick={onClose}
     >
       <div
-        className="relative w-[400px] rounded-3xl overflow-hidden shadow-2xl"
-        style={{
-          background: 'rgba(10, 15, 30, 0.92)',
-          border: '1px solid rgba(255,255,255,0.07)',
-          backdropFilter: 'blur(40px)',
-          boxShadow: '0 32px 80px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.06)',
-        }}
+        className="relative w-[400px] rounded-3xl overflow-hidden shadow-2xl liquid-glass"
         onClick={e => e.stopPropagation()}
       >
         {/* ── Image preview ── */}
@@ -110,7 +103,7 @@ export default function ShareDialog({ imageDataUrl, templateId, onClose }: Props
           {/* gradient fade bottom */}
           <div
             className="absolute inset-x-0 bottom-0 h-12 pointer-events-none"
-            style={{ background: 'linear-gradient(to top, rgba(10,15,30,0.95), transparent)' }}
+            style={{ background: 'linear-gradient(to top, var(--color-surface), transparent)' }}
           />
           {/* close button */}
           <button
@@ -130,18 +123,15 @@ export default function ShareDialog({ imageDataUrl, templateId, onClose }: Props
               {templateId && template && (
                 <button
                   onClick={handleRunWorkflow}
-                  className="w-full flex items-center gap-3 px-4 py-3.5 rounded-2xl transition-all hover:brightness-110 active:scale-[0.98]"
-                  style={{
-                    background: 'linear-gradient(135deg, #b6a0ff 0%, #00e3fd 100%)',
-                    fontFamily: 'Manrope, sans-serif',
-                  }}
+                  className="w-full flex items-center gap-3 px-4 py-3.5 rounded-2xl transition-all hover:brightness-110 active:scale-[0.98] primary-gradient"
+                  style={{ fontFamily: 'Manrope, sans-serif' }}
                 >
                   <div className="w-8 h-8 rounded-xl bg-black/20 flex items-center justify-center flex-shrink-0">
-                    <span className="material-symbols-outlined text-[18px] text-white">{template.icon}</span>
+                    <span className="material-symbols-outlined text-[18px] text-white/90">{template.icon}</span>
                   </div>
                   <div className="flex-1 text-left">
                     <p className="text-xs font-black text-slate-900 leading-tight">{template.name}</p>
-                    <p className="text-[10px] text-slate-800/70 leading-tight mt-0.5">
+                    <p className="text-[10px] text-slate-900 opacity-70 leading-tight mt-0.5">
                       {[
                         template.afterCapture.length > 0 && `${template.afterCapture.length} pre-step`,
                         template.destinations.length > 0 && `${template.destinations.length} upload`,
@@ -149,7 +139,7 @@ export default function ShareDialog({ imageDataUrl, templateId, onClose }: Props
                       ].filter(Boolean).join(' · ')}
                     </p>
                   </div>
-                  <span className="material-symbols-outlined text-[20px] text-slate-900/70">chevron_right</span>
+                  <span className="material-symbols-outlined text-[20px] text-slate-900 opacity-70">chevron_right</span>
                 </button>
               )}
 
@@ -166,24 +156,16 @@ export default function ShareDialog({ imageDataUrl, templateId, onClose }: Props
               <div className="grid grid-cols-2 gap-2">
                 <button
                   onClick={handleCopy}
-                  className="flex items-center justify-center gap-2 py-3 rounded-xl text-xs font-semibold text-slate-300 hover:text-white transition-all"
-                  style={{
-                    background: 'rgba(255,255,255,0.04)',
-                    border: '1px solid rgba(255,255,255,0.07)',
-                    fontFamily: 'Manrope, sans-serif',
-                  }}
+                  className="flex items-center justify-center gap-2 py-3 rounded-xl text-xs font-semibold text-slate-300 hover:text-white transition-all bg-white/[0.04] border border-white/10"
+                  style={{ fontFamily: 'Manrope, sans-serif' }}
                 >
                   <span className="material-symbols-outlined text-[16px] text-slate-400">content_copy</span>
                   Copy
                 </button>
                 <button
                   onClick={handleSave}
-                  className="flex items-center justify-center gap-2 py-3 rounded-xl text-xs font-semibold text-slate-300 hover:text-white transition-all"
-                  style={{
-                    background: 'rgba(255,255,255,0.04)',
-                    border: '1px solid rgba(255,255,255,0.07)',
-                    fontFamily: 'Manrope, sans-serif',
-                  }}
+                  className="flex items-center justify-center gap-2 py-3 rounded-xl text-xs font-semibold text-slate-300 hover:text-white transition-all bg-white/[0.04] border border-white/10"
+                  style={{ fontFamily: 'Manrope, sans-serif' }}
                 >
                   <span className="material-symbols-outlined text-[16px] text-slate-400">save</span>
                   Save
@@ -228,12 +210,8 @@ export default function ShareDialog({ imageDataUrl, templateId, onClose }: Props
 
               <button
                 onClick={onClose}
-                className="w-full mt-2 py-2.5 rounded-xl text-xs font-bold text-slate-400 hover:text-white transition-colors"
-                style={{
-                  background: 'rgba(255,255,255,0.04)',
-                  border: '1px solid rgba(255,255,255,0.07)',
-                  fontFamily: 'Manrope, sans-serif',
-                }}
+                className="w-full mt-2 py-2.5 rounded-xl text-xs font-bold text-slate-400 hover:text-white transition-colors bg-white/[0.04] border border-white/10"
+                style={{ fontFamily: 'Manrope, sans-serif' }}
               >
                 Close
               </button>
@@ -248,12 +226,8 @@ export default function ShareDialog({ imageDataUrl, templateId, onClose }: Props
               </div>
               <button
                 onClick={() => setStatus('idle')}
-                className="w-full py-2.5 rounded-xl text-xs font-bold text-slate-400 hover:text-white transition-colors"
-                style={{
-                  background: 'rgba(255,255,255,0.04)',
-                  border: '1px solid rgba(255,255,255,0.07)',
-                  fontFamily: 'Manrope, sans-serif',
-                }}
+                className="w-full py-2.5 rounded-xl text-xs font-bold text-slate-400 hover:text-white transition-colors bg-white/[0.04] border border-white/10"
+                style={{ fontFamily: 'Manrope, sans-serif' }}
               >
                 Try again
               </button>
