@@ -34,7 +34,7 @@ jobs:
   chrome:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Resolve version
         id: v
@@ -67,7 +67,7 @@ jobs:
           zip -r ../lumia-extension.zip . -x '*.md' '*.DS_Store' 'screenshot-*.png'
 
       - name: Upload & publish to Chrome Web Store
-        uses: mnao305/chrome-extension-upload@v5.0.0
+        uses: mnao305/chrome-extension-upload@v6.0.0
         with:
           file-path: lumia-extension.zip
           extension-id: ${{ secrets.CWS_EXTENSION_ID }}
