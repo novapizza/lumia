@@ -3,6 +3,7 @@ import {
   useCallback,
   useEffect,
   useImperativeHandle,
+  useMemo,
   useRef,
   useState,
 } from 'react'
@@ -283,7 +284,11 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
 
     // ── Zoom ──────────────────────────────────────────────────────────────────
     const [userZoom, setUserZoom] = useState(1)
-    const clampZoom = (z: number) => Math.max(0.1, Math.min(z, 5))
+    // The ceiling is dynamic (see `maxZoom` below, kept in a ref so the
+    // long-lived wheel handler and the []-dep zoom callbacks read the latest
+    // value without re-binding).
+    const maxZoomRef = useRef(Number.POSITIVE_INFINITY)
+    const clampZoom = (z: number) => Math.max(0.1, Math.min(z, maxZoomRef.current))
     const zoomIn  = useCallback(() => setUserZoom(z => clampZoom(z + 0.1)), [])
     const zoomOut = useCallback(() => setUserZoom(z => clampZoom(z - 0.1)), [])
     const zoomReset = useCallback(() => { setUserZoom(1); setPanOffset({ x: 0, y: 0 }) }, [])
@@ -291,7 +296,8 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
     const userZoomRef = useRef(1)
     useEffect(() => { userZoomRef.current = userZoom }, [userZoom])
 
-    // ── Pan (right-click drag, Space+left-click drag, two-finger touchpad swipe) ──
+    // ── Pan (right-click drag, Space+left-click drag, cursor-tool left-drag on
+    // empty canvas, two-finger touchpad swipe) ──
     const [panOffset, setPanOffset] = useState({ x: 0, y: 0 })
     const panOffsetRef = useRef(panOffset)
     useEffect(() => { panOffsetRef.current = panOffset }, [panOffset])
@@ -304,6 +310,10 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
     const [spaceHeld, setSpaceHeld] = useState(false)
     const spaceHeldRef = useRef(false)
     useEffect(() => { spaceHeldRef.current = spaceHeld }, [spaceHeld])
+    // Latest tool for the long-lived pan mousedown handler (cursor-tool
+    // left-drag pan) without re-binding listeners on every tool switch.
+    const toolRef = useRef(tool)
+    useEffect(() => { toolRef.current = tool }, [tool])
 
     // ── History ───────────────────────────────────────────────────────────────
     const {
@@ -439,6 +449,27 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
 
     const scale = baseScale * userZoom
 
+    // Max zoom: bounded by Chromium's hard canvas caps rather than a fixed
+    // percentage. The Stage's canvas spans the whole zoomed image (not just
+    // the visible viewport), and Chromium silently blanks a canvas past
+    // 65,535 px on a side or ~268M px² of backing-buffer area (CSS px ×
+    // devicePixelRatio, since Konva renders buffers at dpr× the CSS size).
+    // Stay under both with headroom; floor at 1 so 100% is always reachable.
+    const maxZoom = useMemo(() => {
+      const dpr = window.devicePixelRatio || 1
+      const maxSide = 60_000 / dpr
+      const maxArea = 240_000_000 / (dpr * dpr)
+      const w = naturalW * baseScale
+      const h = naturalH * baseScale
+      return Math.max(1, Math.min(maxSide / w, maxSide / h, Math.sqrt(maxArea / (w * h))))
+    }, [naturalW, naturalH, baseScale])
+    useEffect(() => {
+      maxZoomRef.current = maxZoom
+      // Pull the zoom back down if the ceiling dropped below it (e.g. the
+      // window grew → baseScale grew → the stage hits the canvas cap sooner).
+      setUserZoom(z => Math.min(z, maxZoom))
+    }, [maxZoom])
+
     useEffect(() => { onZoomChange?.(userZoom) }, [userZoom, onZoomChange])
 
     // Wheel handling:
@@ -545,6 +576,8 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
     // Mouse-drag to pan. Triggers:
     //   • Right-click drag (legacy fallback)
     //   • Space-bar held + left-click drag (Figma convention)
+    //   • Cursor tool + left-click drag on empty canvas (clicks on shapes
+    //     still select/drag them)
     // Uses capture phase so Konva doesn't also start drawing on the same gesture.
     useEffect(() => {
       const el = containerRef.current
@@ -552,9 +585,27 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
       const onMouseDown = (e: MouseEvent) => {
         const rightClick    = e.button === 2
         const spaceLeftDrag = e.button === 0 && spaceHeldRef.current
-        if (!rightClick && !spaceLeftDrag) return
+        // Cursor tool: left-drag pans when no shape is under the pointer.
+        // Konva's hit canvas decides, so this agrees exactly with what a
+        // click would select (bg image is listening=false → counts as empty;
+        // transformer anchors and the delete handle count as shapes).
+        let cursorLeftDrag = false
+        if (!rightClick && !spaceLeftDrag && e.button === 0 && toolRef.current === 'none') {
+          const stage = stageRef.current
+          if (stage) {
+            stage.setPointersPositions(e)
+            const pos = stage.getPointerPosition()
+            cursorLeftDrag = !pos || !stage.getIntersection(pos)
+          } else {
+            cursorLeftDrag = true
+          }
+        }
+        if (!rightClick && !spaceLeftDrag && !cursorLeftDrag) return
         e.preventDefault()
-        e.stopPropagation()
+        // Cursor-tool pan lets the event reach Konva so the stage's own
+        // mousedown still deselects on empty-canvas clicks; the other
+        // triggers must not (space+left would start a draw).
+        if (!cursorLeftDrag) e.stopPropagation()
         isPanning.current = true
         setIsPanningState(true)
         // Read the latest pan from the ref so this effect doesn't need
