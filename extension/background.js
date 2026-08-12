@@ -378,7 +378,12 @@ async function runCapture(id, target, mode) {
       if (activeCapture.cancelled) { bail(); return }
       const isLast = index === meta.totalFrames - 1
       const targetY = Math.max(0, Math.min(index * stepY, meta.scrollHeight - meta.vpH))
-      const scrollY = await exec(lumiaScrollTo, targetY, index, isLast, meta.totalFrames)
+      // Single-frame captures (viewport mode / non-scrolling selection) shoot
+      // in place — lumiaScrollTo(0) would yank the page to the top and
+      // photograph the wrong spot. The stitcher places a lone frame at 0.
+      const scrollY = meta.totalFrames === 1
+        ? 0
+        : await exec(lumiaScrollTo, targetY, index, isLast, meta.totalFrames)
       await sleep(FRAME_DELAY_MS)
       if (activeCapture.cancelled) { bail(); return }
 
