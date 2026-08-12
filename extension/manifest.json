@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Lumia Scroll Capture",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Companion extension for the Lumia desktop app — captures full-page scrolling screenshots with exact pixel offsets.",
   "minimum_chrome_version": "116",
   "permissions": ["activeTab", "scripting", "alarms"],
