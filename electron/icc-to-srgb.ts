@@ -8,8 +8,12 @@
  * e.g. AWS-console link blue #0972d3 came back as violet (107,48,229) on one
  * wide-gamut laptop. Tagging the saved PNG (png-icc.ts) fixes color-managed
  * viewers, but the clipboard image, the editor dataUrl, and thumbnails are
- * raw pixels — so the extension capture path converts the stitched bitmap to
- * sRGB once, and every consumer agrees.
+ * raw pixels — so captures are converted to sRGB once at the source, and
+ * every consumer agrees. Both capture pipelines do this: the extension
+ * bridge converts its stitched bitmap, and the native screen paths
+ * (capture.ts freeze/confirm, scroll-capture.ts frames) convert theirs —
+ * GDI/desktopCapturer read the same display-space compositor output that
+ * captureVisibleTab returns.
  *
  * Scope: matrix-shaper profiles only (rXYZ/gXYZ/bXYZ + rTRC/gTRC/bTRC — what
  * effectively every display profile ships). LUT-based (A2B) profiles return
@@ -210,6 +214,44 @@ export function convertBgraToSrgbInPlace(buf: Buffer, icc: Buffer): boolean {
     buf[i + 2] = enc[(r * N + 0.5) | 0]
     buf[i + 1] = enc[(g * N + 0.5) | 0]
     buf[i] = enc[(b * N + 0.5) | 0]
+  }
+  return true
+}
+
+/**
+ * True when converting through this profile would be a no-op within 8-bit
+ * precision — i.e. the profile IS sRGB or a rebadged copy of it (what Windows
+ * assigns to most displays by default). Callers skip the full-frame convert
+ * then: it would only add ±1 LSB rounding noise and a wasted pixel pass.
+ */
+export function profileIsNearSrgb(icc: Buffer): boolean {
+  const prof = parseMatrixShaper(icc)
+  if (!prof) return false
+
+  // Fold device→XYZ with XYZ→linear-sRGB; sRGB-like primaries fold to ≈ I.
+  // 2e-3 tolerance absorbs s15Fixed16 quantization across profile vendors
+  // while staying under half an 8-bit step on full-scale channels.
+  const A = XYZD50_TO_LSRGB
+  const B = prof.m
+  for (let row = 0; row < 3; row++) {
+    for (let col = 0; col < 3; col++) {
+      const v =
+        A[row * 3 + 0] * B[0 * 3 + col] +
+        A[row * 3 + 1] * B[1 * 3 + col] +
+        A[row * 3 + 2] * B[2 * 3 + col]
+      if (Math.abs(v - (row === col ? 1 : 0)) > 2e-3) return false
+    }
+  }
+
+  // With the matrix ≈ identity the transform reduces to per-channel
+  // decode→re-encode; require that round trip to move no value more than 1.
+  const enc = buildSrgbEncodeLut()
+  const N = enc.length - 1
+  for (const lut of prof.decode) {
+    for (let i = 0; i < 256; i++) {
+      const v = lut[i] < 0 ? 0 : lut[i] > 1 ? 1 : lut[i]
+      if (Math.abs(enc[(v * N + 0.5) | 0] - i) > 1) return false
+    }
   }
   return true
 }

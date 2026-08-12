@@ -7,6 +7,8 @@ import * as native from './native-input'
 import { getSettings } from './settings'
 import type { ScrollCaptureMethod } from './settings'
 import { isExtensionConnected, startExtensionCapture, cancelExtensionCapture } from './extension-bridge'
+import { getDisplayConversionIcc } from './display-icc'
+import { convertBgraToSrgbInPlace } from './icc-to-srgb'
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const FFT = require('fft.js')
 
@@ -1026,6 +1028,14 @@ async function captureScrollingInRect(
     await sleep(500) // wait for scroll animation to finish
   }
 
+  // Display profile → sRGB conversion, resolved once per session. Frames are
+  // converted as they're captured so the overlap detector and every output
+  // path (dialog preview, save, editor) see sRGB — same treatment the other
+  // capture modes get in capture.ts (toSrgbFrame). Null when the display has
+  // no profile / the stock sRGB one (skip) or a LUT profile (not convertible
+  // — frames stay raw, same as before conversion existed).
+  const conversionIcc = await getDisplayConversionIcc(targetDisplay.id).catch(() => null)
+
   const frames: Electron.NativeImage[] = []
   const scrollSteps: number[] = [] // per-pair scroll offsets (in physical pixels)
 
@@ -1080,12 +1090,20 @@ async function captureScrollingInRect(
     if (!source) { console.log(`[scroll-capture] no source found — breaking`); break }
 
     // Crop to selected rect (apply scaleFactor)
-    const cropped = source.thumbnail.crop({
+    let cropped = source.thumbnail.crop({
       x: Math.round(rect.x * scaleFactor),
       y: Math.round(rect.y * scaleFactor),
       width: Math.round(rect.width * scaleFactor),
       height: framePhysH
     })
+
+    if (conversionIcc) {
+      const size = cropped.getSize()
+      const bmp = cropped.toBitmap()
+      if (convertBgraToSrgbInPlace(bmp, conversionIcc)) {
+        cropped = nativeImage.createFromBitmap(bmp, size)
+      }
+    }
 
     frames.push(cropped)
     progressCb({ frame: i + 1, maxFrames: opts.maxFrames, phase: 'capturing' })

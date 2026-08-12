@@ -5,6 +5,7 @@ import { existsSync } from 'fs'
 import { tmpdir } from 'os'
 import { join, resolve } from 'path'
 import { randomUUID } from 'crypto'
+import { profileIsNearSrgb } from './icc-to-srgb'
 
 /**
  * Fetch the ICC profile bytes attached to a display by ID. Used to tag PNG
@@ -44,6 +45,17 @@ export async function getDisplayIcc(displayId: number): Promise<Buffer | null> {
   }
   cache.set(displayId, result)
   return result
+}
+
+/** Like getDisplayIcc, but null also when the profile is effectively sRGB —
+ *  i.e. non-null only when pixels captured from this display actually need
+ *  converting (or iCCP-tagging) to read correctly as sRGB. Capture paths use
+ *  this to skip the per-pixel conversion pass on the overwhelmingly common
+ *  case of displays carrying the stock sRGB profile (or none at all). */
+export async function getDisplayConversionIcc(displayId: number): Promise<Buffer | null> {
+  const icc = await getDisplayIcc(displayId)
+  if (!icc) return null
+  return profileIsNearSrgb(icc) ? null : icc
 }
 
 // ── macOS ───────────────────────────────────────────────────────────────────

@@ -12,7 +12,8 @@ import { showNotification } from './notify'
 import { applyWatermark } from './watermark'
 import { getSettings } from './settings'
 import { startVideoCapture, beginWindowRecording } from './video'
-import { getDisplayIcc } from './display-icc'
+import { getDisplayIcc, getDisplayConversionIcc } from './display-icc'
+import { convertBgraToSrgbInPlace } from './icc-to-srgb'
 import { tagPngWithIcc } from './png-icc'
 import { captureDisplayNative, type NativeCapture } from './native-screen'
 import { macSnapAvailable } from './mac-screen-snap'
@@ -26,11 +27,13 @@ export const ORIGINALS_DIR = join(homedir(), 'Pictures', 'Lumia')
 /** Write the just-captured image to disk at {ORIGINALS_DIR}/capture-{ts}.{ext}.
  *  Best-effort — returns null if anything goes wrong so capture still completes.
  *
- *  When `displayId` is provided and the OS exposes an ICC profile for that
- *  display, the PNG gets an `iCCP` chunk before write — so color-managed
- *  viewers render wide-gamut content (P3 MacBooks, calibrated monitors)
- *  faithfully instead of falling back to sRGB. JPEG path skips tagging
- *  (different container, not currently produced by our capture pipeline). */
+ *  `displayId` is the LUT-profile fallback: capture pixels are normally
+ *  converted to sRGB at the source (see toSrgbFrame) and arrive here with no
+ *  displayId. When the display's profile can't be expressed as matrix-shaper
+ *  math the pixels stay in display space instead, and the PNG gets an `iCCP`
+ *  chunk so color-managed viewers still render them faithfully. JPEG path
+ *  skips tagging (different container, not currently produced by our capture
+ *  pipeline). */
 async function saveOriginalImage(dataUrl: string, displayId?: number): Promise<{ filePath: string; filename: string } | null> {
   try {
     const { writeFile, mkdir } = await import('fs/promises')
@@ -118,8 +121,53 @@ function hideMainWindow(): Promise<void> {
 interface FrozenFrame {
   image: Electron.NativeImage
   raw?: { buffer: Buffer; width: number; height: number }
+  /** Pixels are sRGB — converted from the display's color space at freeze
+   *  time, or the display had no profile / the stock sRGB one. false only
+   *  for LUT-profile displays (not convertible): those pixels stay in
+   *  display space and the saved PNG gets iCCP-tagged instead. */
+  srgb: boolean
 }
 const frozenImages = new Map<number, FrozenFrame>()
+
+/** Convert a freshly captured frame's pixels from the display's color space
+ *  to sRGB, so every consumer — overlay preview, editor, clipboard, saved
+ *  PNG, thumbnails, uploads — reads them the same way (the extension capture
+ *  path already does this; see icc-to-srgb.ts). Chromium composites
+ *  color-managed apps' output INTO the display profile's space, so on panels
+ *  with a strong profile (e.g. Lenovo's AICCP laptop profiles) raw captures
+ *  look tinted everywhere pixels are read as sRGB.
+ *
+ *  Mutates `raw.buffer` in place when provided (the NativeImage is rebuilt
+ *  from it). Cost is one pass over the pixels (~15-30 ms for a FHD frame) and
+ *  is skipped entirely for profile-less / sRGB-profiled displays — only
+ *  displays whose profile meaningfully differs from sRGB pay, which is also
+ *  exactly when the overlay preview would otherwise render visibly off. */
+async function toSrgbFrame(
+  image: Electron.NativeImage,
+  raw: { buffer: Buffer; width: number; height: number } | undefined,
+  displayId: number
+): Promise<FrozenFrame> {
+  try {
+    const icc = await getDisplayConversionIcc(displayId)
+    if (!icc) return { image, raw, srgb: true }
+    const bmp = raw ?? (() => {
+      const size = image.getSize()
+      return { buffer: image.toBitmap(), width: size.width, height: size.height }
+    })()
+    if (!convertBgraToSrgbInPlace(bmp.buffer, icc)) {
+      // LUT profile — leave pixels in display space; save path tags instead.
+      return { image, raw, srgb: false }
+    }
+    return {
+      image: nativeImage.createFromBitmap(bmp.buffer, { width: bmp.width, height: bmp.height }),
+      raw: bmp,
+      srgb: true,
+    }
+  } catch (err) {
+    console.error('[capture] sRGB conversion failed', err)
+    return { image, raw, srgb: false }
+  }
+}
 
 /** Raw BGRA bitmap of the frozen snapshot for the given display, intended for
  *  the overlay window to render as background via canvas putImageData. No
@@ -153,7 +201,7 @@ async function freezeAllDisplays(): Promise<void> {
   const fallbackDisplays: Electron.Display[] = []
   await Promise.all(allDisplays.map(async d => {
     const nat: NativeCapture | null = await captureDisplayNative(d, { includeSelf })
-    if (nat) frozenImages.set(d.id, nat)
+    if (nat) frozenImages.set(d.id, await toSrgbFrame(nat.image, nat.raw, d.id))
     else fallbackDisplays.push(d)
   }))
   if (fallbackDisplays.length === 0) return
@@ -189,7 +237,7 @@ async function freezeAllDisplays(): Promise<void> {
     })
     for (const d of group) {
       const src = findSourceForDisplay(sources, allDisplays, d.id)
-      if (src) frozenImages.set(d.id, { image: src.thumbnail })
+      if (src) frozenImages.set(d.id, await toSrgbFrame(src.thumbnail, undefined, d.id))
     }
   }))
 }
@@ -295,10 +343,10 @@ export function setupCapture() {
     closeAllOverlays()
     // No overlay-gone wait — the crop comes from the frozen snapshot, not a
     // fresh screen grab, so the overlay's residual presence doesn't matter.
-    const dataUrl = await captureRect(payload.rect, displayId)
+    const res = await captureRect(payload.rect, displayId)
     clearFrozenCache()
-    await sendCaptureToEditor(dataUrl, 'region', displayId ?? undefined)
-    return dataUrl
+    await sendCaptureToEditor(res.dataUrl, 'region', res.tagDisplayId)
+    return res.dataUrl
   })
 
   ipcMain.handle('overlay:get-source', (e) => {
@@ -379,12 +427,12 @@ export function setupCapture() {
     const displayId = cached?.displayId ?? overlayId
     const display = screen.getAllDisplays().find(d => d.id === displayId) ?? screen.getPrimaryDisplay()
     const cornerRadius = pickCornerRadiusPhys(rect, display)
-    const dataUrl = cached
+    const res = cached
       ? await capturePhysicalRect(cached, cornerRadius)
       : await captureRect(rect, overlayId, cornerRadius)
     clearFrozenCache()
-    await sendCaptureToEditor(dataUrl, 'window', cached?.displayId ?? overlayId ?? undefined)
-    return dataUrl
+    await sendCaptureToEditor(res.dataUrl, 'window', res.tagDisplayId)
+    return res.dataUrl
   })
 
   ipcMain.handle('window-pick:cancel', () => {
@@ -454,10 +502,10 @@ export function setupCapture() {
     const target = allDisplays.find(d => d.id === displayId) ?? screen.getPrimaryDisplay()
     resetOverlayMode()
     closeAllOverlays()
-    const dataUrl = await captureDisplay(target, allDisplays)
+    const res = await captureDisplay(target, allDisplays)
     clearFrozenCache()
-    await sendCaptureToEditor(dataUrl, 'screen', target.id)
-    return dataUrl
+    await sendCaptureToEditor(res.dataUrl, 'screen', res.tagDisplayId)
+    return res.dataUrl
   })
 
   ipcMain.handle('monitor-pick:cancel', () => {
@@ -502,9 +550,9 @@ async function captureAllScreen(): Promise<string> {
   // then desktopCapturer.
   if (allDisplays.length <= 1) {
     const d = allDisplays[0] ?? screen.getPrimaryDisplay()
-    const dataUrl = await captureDisplay(d, allDisplays)
-    await sendCaptureToEditor(dataUrl, 'all-screen', d.id)
-    return dataUrl
+    const res = await captureDisplay(d, allDisplays)
+    await sendCaptureToEditor(res.dataUrl, 'all-screen', res.tagDisplayId)
+    return res.dataUrl
   }
 
   // Multi-display: grab every display through the same native-first freeze the
@@ -571,11 +619,16 @@ async function captureAllScreen(): Promise<string> {
     }
 
     const dataUrl = compositeBGRA(items, totalW, totalH)
-    // Multi-display composite has mixed color spaces by construction (each
-    // display's pixels are in its own native space). Tag with the primary
-    // display's profile — accepts inaccuracy across non-primary regions in
-    // exchange for at least labeling the dominant color space.
-    await sendCaptureToEditor(dataUrl, 'all-screen', screen.getPrimaryDisplay().id)
+    // Every frame was sRGB-normalized at freeze time, so the composite is
+    // uniformly sRGB and needs no tag. The exception is a LUT-profile display
+    // (not convertible): its region stays in display space. A single tag
+    // can't be right for a mixed composite anyway — fall back to tagging
+    // with the primary display's profile only when the primary itself
+    // couldn't convert (labels the dominant region, same compromise as
+    // before sRGB normalization existed).
+    const primary = screen.getPrimaryDisplay()
+    const primarySrgb = frozenImages.get(primary.id)?.srgb ?? true
+    await sendCaptureToEditor(dataUrl, 'all-screen', primarySrgb ? undefined : primary.id)
     return dataUrl
   } finally {
     clearFrozenCache()
@@ -587,12 +640,12 @@ async function captureAllScreen(): Promise<string> {
 async function captureWindowTarget(target: PickTarget): Promise<string> {
   const display = screen.getAllDisplays().find(d => d.id === target.displayId) ?? screen.getPrimaryDisplay()
   const cornerRadius = pickCornerRadiusPhys(target.rect, display)
-  const dataUrl = target.physRect
+  const res = target.physRect
     ? await capturePhysicalRect(target.physRect, cornerRadius)
     : await captureRect(target.rect, target.displayId, cornerRadius)
   clearFrozenCache()
-  await sendCaptureToEditor(dataUrl, 'window', target.displayId)
-  return dataUrl
+  await sendCaptureToEditor(res.dataUrl, 'window', res.tagDisplayId)
+  return res.dataUrl
 }
 
 async function captureWindow(): Promise<void> {
@@ -640,23 +693,43 @@ async function captureRegion(): Promise<void> {
   }
 }
 
-/** PNG-encode a cropped capture. When `cornerRadiusPhys` > 0 (window captures
- *  only — region/monitor crops stay square), the corners outside the window's
- *  rounded outline are erased to transparency first. */
-function encodeCrop(cropped: Electron.NativeImage, cornerRadiusPhys?: number): string {
-  if (cornerRadiusPhys && cornerRadiusPhys > 0) {
-    const size = cropped.getSize()
-    const bmp = cropped.toBitmap()
-    maskCornersInPlace(bmp, size.width, size.height, cornerRadiusPhys)
-    return nativeImage.createFromBitmap(bmp, size).toDataURL()
-  }
-  return cropped.toDataURL()
+/** An encoded capture plus how to color-label it downstream: `tagDisplayId`
+ *  is set only when the pixels could NOT be normalized to sRGB (LUT display
+ *  profile) — saveOriginalImage then iCCP-tags the PNG with that display's
+ *  profile. Undefined means the pixels are sRGB (or the display had no
+ *  meaningful profile) and the file needs no tag. */
+interface EncodedCapture {
+  dataUrl: string
+  tagDisplayId?: number
+}
+
+/** PNG-encode a cropped capture. When the crop came from a live grab (frozen
+ *  cache miss — `alreadySrgb` false) the pixels are converted from the
+ *  display's color space to sRGB first, mirroring what toSrgbFrame did for
+ *  frozen frames. When `cornerRadiusPhys` > 0 (window captures only —
+ *  region/monitor crops stay square), the corners outside the window's
+ *  rounded outline are erased to transparency. */
+async function encodeCrop(
+  cropped: Electron.NativeImage,
+  opts: { displayId?: number | null; alreadySrgb: boolean; cornerRadiusPhys?: number }
+): Promise<EncodedCapture> {
+  const { displayId, alreadySrgb, cornerRadiusPhys } = opts
+  const icc = alreadySrgb || displayId == null ? null : await getDisplayConversionIcc(displayId).catch(() => null)
+  const needsMask = !!cornerRadiusPhys && cornerRadiusPhys > 0
+  if (!icc && !needsMask) return { dataUrl: cropped.toDataURL() }
+
+  const size = cropped.getSize()
+  const bmp = cropped.toBitmap()
+  let tagDisplayId: number | undefined
+  if (icc && !convertBgraToSrgbInPlace(bmp, icc)) tagDisplayId = displayId ?? undefined
+  if (needsMask) maskCornersInPlace(bmp, size.width, size.height, cornerRadiusPhys!)
+  return { dataUrl: nativeImage.createFromBitmap(bmp, size).toDataURL(), tagDisplayId }
 }
 
 // Crop directly in physical pixels against the target display's native
 // thumbnail. Takes a rect in virtual-screen physical coords (the same space
 // getWindowAtPointPhysical returns).
-async function capturePhysicalRect(rect: { x: number; y: number; width: number; height: number; displayId: number }, cornerRadiusPhys?: number): Promise<string> {
+async function capturePhysicalRect(rect: { x: number; y: number; width: number; height: number; displayId: number }, cornerRadiusPhys?: number): Promise<EncodedCapture> {
   const allDisplays = screen.getAllDisplays()
   const target = allDisplays.find(d => d.id === rect.displayId) ?? screen.getPrimaryDisplay()
   const sf = target.scaleFactor || 1
@@ -664,7 +737,8 @@ async function capturePhysicalRect(rect: { x: number; y: number; width: number; 
   const physH = Math.max(1, Math.round(target.size.height * sf))
   // Frozen cache hit → use the snapshot taken at hotkey time (preserves
   // tooltips/popovers that the overlay would otherwise have dismissed).
-  let fullImg = frozenImages.get(target.id)?.image ?? null
+  const frozen = frozenImages.get(target.id) ?? null
+  let fullImg = frozen?.image ?? null
   if (!fullImg) {
     const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: physW, height: physH } })
     fullImg = findSourceForDisplay(sources, allDisplays, target.id)?.thumbnail ?? null
@@ -686,10 +760,14 @@ async function capturePhysicalRect(rect: { x: number; y: number; width: number; 
   const cropW = Math.max(1, Math.min(fullSize.width  - cropX, Math.round(rect.width  * sx)))
   const cropH = Math.max(1, Math.min(fullSize.height - cropY, Math.round(rect.height * sy)))
 
-  return encodeCrop(fullImg.crop({ x: cropX, y: cropY, width: cropW, height: cropH }), cornerRadiusPhys)
+  return encodeCrop(fullImg.crop({ x: cropX, y: cropY, width: cropW, height: cropH }), {
+    displayId: target.id,
+    alreadySrgb: frozen?.srgb ?? false,
+    cornerRadiusPhys,
+  })
 }
 
-async function captureRect(rect: { x: number; y: number; width: number; height: number }, displayId?: number | null, cornerRadiusPhys?: number): Promise<string> {
+async function captureRect(rect: { x: number; y: number; width: number; height: number }, displayId?: number | null, cornerRadiusPhys?: number): Promise<EncodedCapture> {
   const allDisplays = screen.getAllDisplays()
   const overlayId = displayId ?? getOverlayDisplayId()
   const targetDisplay = allDisplays.find(d => d.id === overlayId) ?? screen.getPrimaryDisplay()
@@ -702,7 +780,8 @@ async function captureRect(rect: { x: number; y: number; width: number; height: 
   const physH = Math.max(1, Math.round(targetDisplay.size.height * scaleFactor))
   // Prefer the frozen snapshot captured at hotkey time. Falls through to a
   // live capture if cache is empty (legacy paths, scrolling capture).
-  let fullImg = frozenImages.get(targetDisplay.id)?.image ?? null
+  const frozen = frozenImages.get(targetDisplay.id) ?? null
+  let fullImg = frozen?.image ?? null
   if (!fullImg) {
     const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: physW, height: physH } })
     fullImg = findSourceForDisplay(sources, allDisplays, targetDisplay.id)?.thumbnail ?? null
@@ -720,21 +799,29 @@ async function captureRect(rect: { x: number; y: number; width: number; height: 
   const cropH = Math.max(1, Math.min(fullSize.height - cropY, Math.round(rect.height * sy)))
 
   const cropped = fullImg.crop({ x: cropX, y: cropY, width: cropW, height: cropH })
-  return encodeCrop(cropped, cornerRadiusPhys)
+  return encodeCrop(cropped, {
+    displayId: targetDisplay.id,
+    alreadySrgb: frozen?.srgb ?? false,
+    cornerRadiusPhys,
+  })
 }
 
-async function captureDisplay(display: Electron.Display, allDisplays: Electron.Display[]): Promise<string> {
+async function captureDisplay(display: Electron.Display, allDisplays: Electron.Display[]): Promise<EncodedCapture> {
   // Frozen cache hit (monitor-pick path) — encode the cached NativeImage to
   // PNG now. We deliberately don't pre-encode during freezeAllDisplays(): the
   // encode is ~500-1000ms on 4K and would block overlay creation. At confirm
   // time it's off the critical path (overlay already gone) so the cost is OK.
+  // Frozen frames were already sRGB-normalized at freeze time.
   const cached = frozenImages.get(display.id)
-  if (cached) return cached.image.toDataURL()
+  if (cached) return { dataUrl: cached.image.toDataURL(), tagDisplayId: cached.srgb ? undefined : display.id }
 
   // No frozen frame (fullscreen / single-display monitor capture — no overlay
   // session) — same native fast path the freeze uses, then desktopCapturer.
   const nat = await captureDisplayNative(display, { includeSelf: includeSelfInCapture() })
-  if (nat) return nat.image.toDataURL()
+  if (nat) {
+    const frame = await toSrgbFrame(nat.image, nat.raw, display.id)
+    return { dataUrl: frame.image.toDataURL(), tagDisplayId: frame.srgb ? undefined : display.id }
+  }
 
   const sf = display.scaleFactor || 1
   const sources = await desktopCapturer.getSources({
@@ -746,7 +833,8 @@ async function captureDisplay(display: Electron.Display, allDisplays: Electron.D
   })
   const src = findSourceForDisplay(sources, allDisplays, display.id)
   if (!src) throw new Error('no screen source available for capture')
-  return src.thumbnail.toDataURL()
+  const frame = await toSrgbFrame(src.thumbnail, undefined, display.id)
+  return { dataUrl: frame.image.toDataURL(), tagDisplayId: frame.srgb ? undefined : display.id }
 }
 
 async function captureActiveMonitor(): Promise<string | void> {
@@ -756,9 +844,9 @@ async function captureActiveMonitor(): Promise<string | void> {
   if (allDisplays.length <= 1) {
     const activeDisplay = allDisplays[0] ?? screen.getPrimaryDisplay()
     await hideMainWindow()
-    const dataUrl = await captureDisplay(activeDisplay, allDisplays)
-    await sendCaptureToEditor(dataUrl, 'screen', activeDisplay.id)
-    return dataUrl
+    const res = await captureDisplay(activeDisplay, allDisplays)
+    await sendCaptureToEditor(res.dataUrl, 'screen', res.tagDisplayId)
+    return res.dataUrl
   }
 
   // Multiple displays → show overlays, let the user click one.
@@ -776,7 +864,12 @@ async function captureActiveMonitor(): Promise<string | void> {
   }
 }
 
-export async function sendCaptureToEditor(dataUrlIn: string, source: string, displayId?: number) {
+/** `tagDisplayId` — set only when the capture's pixels are still in that
+ *  display's color space (LUT profile, not convertible to sRGB); the saved
+ *  PNG then gets iCCP-tagged with the display's profile. Callers that
+ *  normalized to sRGB pass undefined. The extension bridge follows the same
+ *  convention (`srgb ? undefined : displayId`). */
+export async function sendCaptureToEditor(dataUrlIn: string, source: string, tagDisplayId?: number) {
   const mainWin = getMainWindow()
   if (!mainWin || mainWin.isDestroyed()) return
 
@@ -793,8 +886,7 @@ export async function sendCaptureToEditor(dataUrlIn: string, source: string, dis
 
   // Always save the original capture to ~/Pictures/Lumia/ (fixed location).
   // Editor's Save button is a separate flow that writes to a user-chosen path.
-  // Pass displayId so the PNG carries the originating display's ICC profile.
-  const saved = await saveOriginalImage(dataUrl, displayId)
+  const saved = await saveOriginalImage(dataUrl, tagDisplayId)
 
   // Capture the new entry's id so the Editor knows it's already in history.
   // Without this, a follow-up runWorkflow(...) sees historyId=undefined and the
