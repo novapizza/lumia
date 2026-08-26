@@ -62,7 +62,7 @@ export function HistoryListRow({
       {/* Thumbnail */}
       <div className="w-10 h-10 rounded-lg bg-slate-900 overflow-hidden flex-shrink-0 border border-white/5">
         {(item.thumbnailUrl ?? item.dataUrl) ? (
-          <img src={item.thumbnailUrl ?? item.dataUrl} className="w-full h-full object-cover" />
+          <img src={item.thumbnailUrl ?? item.dataUrl} loading="lazy" decoding="async" className="w-full h-full object-cover" />
         ) : (
           <div className="w-full h-full flex items-center justify-center">
             <span className="material-symbols-outlined text-slate-700 text-sm">

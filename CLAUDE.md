@@ -31,6 +31,10 @@ Headline features:
 There is **no test framework, linter, or formatter** configured. Type-check via `pnpm build` (note: electron-vite uses esbuild and does **not** type-check — run `tsc --noEmit -p tsconfig.node.json` / `-p tsconfig.web.json` for a real type-check).
 
 > If `pnpm dev` crashes at startup with `require('electron')` returning a path / `app` undefined, or a V8 `snapshot_data() != nullptr` assertion, check that `ELECTRON_RUN_AS_NODE` is **not** set in your environment — when present (even empty) it makes the Electron binary run as plain Node.
+>
+> A dev instance and the installed build share `%APPDATA%\Lumia` (package `name` and `productName` collide on case-insensitive filesystems) and therefore the single-instance lock — the dev instance quits silently while the tray instance is alive. To run both, give dev its own profile: `pnpm exec electron-vite dev -- --user-data-dir=<dir>`.
+>
+> **Memory**: every launch logs a per-process breakdown (`[mem] startup +10s` / `+60s` from `electron/mem-metrics.ts`) — the browser process, GPU process, the main renderer and one renderer per pooled overlay are listed separately. Set `LUMIA_MEM_LOG_INTERVAL_MS=30000` to keep sampling while profiling.
 
 ### Releases
 
@@ -90,6 +94,7 @@ Releases are produced by **GitHub Actions** (`.github/workflows/release.yml`), n
 | `wallpapers.ts` | Unsplash wallpaper browser — fetch random wallpapers, download to `userData/wallpapers/`, set as desktop wallpaper. IPC: `wallpapers:random`, `wallpapers:trackDownload`, `wallpapers:isConfigured`, `wallpapers:setAsWallpaper`. Needs `MAIN_VITE_UNSPLASH_ACCESS_KEY` |
 | `types.ts` | Shared interfaces: `WorkflowTemplate`, `HistoryItem`, `AnnotationObject` |
 | `utils.ts` | `localTimestamp()` formatter for filenames |
+| `mem-metrics.ts` | Per-process memory snapshots via `app.getAppMetrics()` (renderers labelled `main` / `overlay:<displayId>`), logged at +10 s / +60 s after launch and periodically with `LUMIA_MEM_LOG_INTERVAL_MS` |
 | `uploaders/r2.ts` | Cloudflare R2 (S3-compatible) — credentials baked at build time via `MAIN_VITE_R2_*`. `uploadToR2()` single-PUTs buffered image data URLs; `uploadFileToR2()` streams on-disk files (recordings) — hashes for HEAD dedup, single-PUT below the 16 MB `MULTIPART_THRESHOLD`, else parallel multipart (8 MB parts × 6 workers → ~48 MB peak regardless of file size) |
 | `uploaders/googledrive.ts` | Pure Google Drive HTTP layer — folder lookup/create, multipart image upload, resumable file upload streamed in 1 MB chunks with backpressure, OAuth token exchange/refresh/revoke |
 | `google-drive-service.ts` | Drive orchestration over `uploaders/googledrive.ts` — token lifecycle (auto-refresh with 60 s margin, dedup concurrent refreshes, retry on 401), folder resolution, errors surfaced as `UploadResult`. Entry points: `uploadImageDataUrlToDrive()`, `uploadFilePathToDrive()` |
@@ -100,7 +105,7 @@ Releases are produced by **GitHub Actions** (`.github/workflows/release.yml`), n
 
 ### Renderer (`src/`)
 
-- **Entry**: `src/main.tsx` → `HashRouter`
+- **Entry**: `src/main.tsx` → `HashRouter`. The pooled capture overlay has its **own lean entry** — `src/overlay.html` → `src/overlay-main.tsx` renders `windows/overlay/Overlay.tsx` directly (no router, no dashboard/editor chunks, no Manrope). One of those renderers lives per display for the whole session, so keep that entry's imports minimal.
 - **Layout**: `App.tsx` wraps standard routes with `TitleBar` + `Sidebar`. The `/editor` route runs full-width (its own toolbars replace the sidebar).
 - **Routes** (each in `src/windows/<route>/<Pascal>.tsx`):
   - `/dashboard` — capture launcher (Image / Video / Scroll kind toggle; the Scroll tab offers Browser Extension vs Screen Scroll method cards with live extension-connection status) + history grid (legacy `/history` redirects here)
@@ -108,7 +113,7 @@ Releases are produced by **GitHub Actions** (`.github/workflows/release.yml`), n
   - `/workflow` — template manager
   - `/settings` — preferences + Google Drive auth
   - **Standalone windows** (no sidebar/titlebar, transparent where applicable):
-    - `/overlay` — region/window/monitor picker for both capture and recording
+    - `overlay.html` (own entry, not a hash route) — region/window/monitor picker for both capture and recording
     - `/recording-toolbar` — floating Pause/Stop/Mic toolbar during a recording
     - `/recording-border` — border outline drawn around the recorded region
     - `/recorder-host` — hidden window that owns `MediaRecorder` and writes blobs
@@ -121,7 +126,7 @@ Releases are produced by **GitHub Actions** (`.github/workflows/release.yml`), n
 ### Window Management
 
 - **Main window**: 1250×700 (min 900×600), frameless, `#07070b` background. macOS uses `hiddenInset` titlebar with traffic lights at `{x:18, y:20}`; Windows uses native overlay controls (`titleBarOverlay`).
-- **Overlay windows**: One transparent fullscreen `BrowserWindow` per display, `alwaysOnTop: 'pop-up-menu'`, `setVisibleOnAllWorkspaces(true)`. A 100 ms cursor-poll switches the "active" overlay as the cursor moves between displays; inactive overlays use `setIgnoreMouseEvents(true, { forward: true })` to pass clicks through to the active one. The `overlay:drawing` IPC locks the active display while the user is drawing a region so the cursor poll can't yank focus mid-drag.
+- **Overlay windows**: One transparent fullscreen `BrowserWindow` per display, `alwaysOnTop: 'pop-up-menu'`, `setVisibleOnAllWorkspaces(true)`. A 100 ms cursor-poll switches the "active" overlay as the cursor moves between displays; inactive overlays use `setIgnoreMouseEvents(true, { forward: true })` to pass clicks through to the active one. The `overlay:drawing` IPC locks the active display while the user is drawing a region so the cursor poll can't yank focus mid-drag. The pool is pre-created at startup and **parked** at opacity 0 between captures (instant reveal); parking also sends `overlay:frozen-bgra-changed` `null` so the renderer drops the previous snapshot and its full-screen `<canvas>` backing store. Each parked window still costs ~28 MB in the GPU process (its full-screen compositor surface) plus a ~35 MB renderer; `win.hide()` was measured **not** to release the GPU part — only destroying the window would, at the price of the ~300–500 ms cold start on the next capture.
 - **Recording windows**: `RecorderHost` (hidden, owns the stream), `RecordingToolbar` (floating controls), `RecordingBorder` (visual outline), and a fullscreen annotation overlay (`annotation.ts`, toggled interactive via `annotation-overlay:set-interactive`) — all created and torn down by `video.ts`.
 - **Close behavior**: clicking close on the main window hides to tray; on `/editor` it instead navigates back to `/dashboard` (X is "discard capture" there). Real quit only via tray menu / `ExitLumia` hotkey / explicit `markQuitting()`.
 - **Single-instance lock**: `app.requestSingleInstanceLock()` prevents Chromium cache lock errors when relaunching while the tray instance is still alive.
@@ -152,7 +157,7 @@ Scroll capture has **no global hotkey** — it starts from the Dashboard Scroll 
 
 ### Design System — Liquid Glass
 
-Custom CSS design tokens in `src/index.css`. Key utility classes: `.glass-refractive`, `.liquid-glass`, `.card-organic`, `.glass-card`. Manrope (headlines) + Inter (body) + Material Icons. Light/dark theme toggled via `html.light` class and synced to the Windows `titleBarOverlay` via `titlebar:setTheme` IPC.
+Custom CSS design tokens in `src/index.css`. Key utility classes: `.glass-refractive`, `.liquid-glass`, `.card-organic`, `.glass-card`. Manrope (headlines) + Inter (body) + Material Symbols Outlined. The icon font is **subset** to the icons referenced in source: `src/assets/fonts/material-symbols*.{css,woff2,icons.txt}` are generated by `pnpm icons:subset` (`scripts/subset-material-symbols.py`, needs Python with `fonttools brotli uharfbuzz`) — 3.9 MB → tens of KB per renderer. An icon missing from the subset renders as its literal name, so re-run the script after adding one. Light/dark theme toggled via `html.light` class and synced to the Windows `titleBarOverlay` via `titlebar:setTheme` IPC.
 
 ### Build Tooling
 

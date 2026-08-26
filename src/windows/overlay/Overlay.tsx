@@ -239,8 +239,15 @@ export default function Overlay() {
   // Two rAFs after putImageData guarantees the GPU has shown the bitmap, then
   // we ack main so it can ramp opacity to 1.
   useEffect(() => {
-    if (!frozenBgr) { setFrozenBgReady(false); return }
     const canvas = frozenCanvasRef.current
+    if (!frozenBgr) {
+      setFrozenBgReady(false)
+      // Parked between captures (main sends null from closeAllOverlays):
+      // release the canvas backing store so the previous snapshot's bitmap
+      // — and its GPU texture — is freed instead of idling until next time.
+      if (canvas) { canvas.width = 0; canvas.height = 0 }
+      return
+    }
     if (!canvas) return
 
     canvas.width = frozenBgr.width

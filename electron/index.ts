@@ -4,6 +4,7 @@ import fs from 'fs/promises'
 import { setupCapture, ORIGINALS_DIR, getFrozenBgrForDisplay, prewarmDesktopCapturer } from './capture'
 import { prewarmNativeCapture } from './native-screen'
 import { prewarmMacWindowPick } from './mac-window-pick'
+import { setupMemoryLogging, labelWebContents } from './mem-metrics'
 import { getIccFromPng, tagPngWithIcc } from './png-icc'
 import { setupVideo, isRecordingActive } from './video'
 import { uploadFileToR2 } from './uploaders/r2'
@@ -384,6 +385,12 @@ export function closeAllOverlays() {
     // the EX_TRANSPARENT flag above.
     if (!win.webContents.isDestroyed()) {
       win.webContents.send('overlay:set-active', false)
+      // Drop the frozen snapshot while parked. Otherwise every pooled overlay
+      // keeps its last capture alive until the next one — the BGRA buffer in
+      // the renderer plus the full-screen <canvas> backing store in the GPU
+      // process, i.e. displays × (8–16 MB × 2) sitting idle for hours. The
+      // next capture pushes a fresh buffer before the overlay is revealed.
+      win.webContents.send('overlay:frozen-bgra-changed', null)
     }
   }
   overlayWindows.clear()
@@ -561,10 +568,14 @@ function addOverlayToPool(display: Electron.Display): BrowserWindow {
   win.setAlwaysOnTop(true, 'pop-up-menu')
   win.setVisibleOnAllWorkspaces(true)
 
+  // Dedicated lean entry (src/overlay.html → overlay-main.tsx): no router,
+  // no dashboard/editor bundle, only the fonts the overlay uses. These
+  // renderers live for the whole session, one per display, so every byte
+  // the entry pulls in is paid N times.
   if (isDev) {
-    win.loadURL('http://localhost:5173/#/overlay')
+    win.loadURL('http://localhost:5173/overlay.html')
   } else {
-    win.loadFile(join(__dirname, '../renderer/index.html'), { hash: '/overlay' })
+    win.loadFile(join(__dirname, '../renderer/overlay.html'))
   }
 
   // One-time per-window setup: register the HWND for the native click-through
@@ -601,6 +612,7 @@ function addOverlayToPool(display: Electron.Display): BrowserWindow {
     overlayWindows.delete(display.id)
   })
 
+  labelWebContents(win.webContents, `overlay:${display.id} ${width}x${height}@${display.scaleFactor}x`)
   overlayPool.set(display.id, win)
   return win
 }
@@ -886,6 +898,7 @@ app.whenReady().then(async () => {
 
   const startHidden = wasLaunchedAtStartup()
   mainWindow = createMainWindow(startHidden)
+  labelWebContents(mainWindow.webContents, 'main')
 
   // macOS: normal launches leave the dock visible (default). Login-item
   // startups boot straight to the tray, so drop the dock icon explicitly —
@@ -937,6 +950,9 @@ app.whenReady().then(async () => {
   // the renderer already loaded. The first capture after boot drops from
   // ~300–500ms (window construct + React boot) to ~30ms (show + IPC reset).
   setupOverlayPool()
+
+  // Per-process memory breakdown into the log at +10 s / +60 s (mem-metrics.ts).
+  setupMemoryLogging()
 
   // Surface OS permission prompts (Screen Recording / Microphone / Accessibility
   // on macOS, Microphone on Windows) at startup rather than mid-capture. Skip

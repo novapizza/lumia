@@ -26,8 +26,16 @@ export default defineConfig({
   renderer: {
     root: resolve(__dirname, 'src'),
     build: {
+      // electron-vite leaves every target unminified by default. The renderer
+      // bundles are parsed by the main window *and* by one pooled overlay per
+      // display, so ship them minified (react-dom alone is ~540 KB → ~180 KB).
+      minify: 'esbuild',
       rollupOptions: {
-        input: resolve(__dirname, 'src/index.html')
+        input: {
+          index: resolve(__dirname, 'src/index.html'),
+          // Lean entry for the pooled capture overlays (see src/overlay-main.tsx).
+          overlay: resolve(__dirname, 'src/overlay.html'),
+        }
       }
     },
     resolve: {
