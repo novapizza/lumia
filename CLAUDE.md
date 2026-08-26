@@ -83,8 +83,8 @@ Releases are produced by **GitHub Actions** (`.github/workflows/release.yml`), n
 | `history.ts` | `HistoryStore` — capture history persistence (max 1000 items, ~4 KB each), file-cleanup on delete |
 | `settings.ts` | `AppSettings` interface + electron-store wrapper, `resolveSaveStartDir` helper |
 | `startup.ts` | Launch-at-startup OS integration; `wasLaunchedAtStartup()` for `--hidden` boot |
-| `thumbnail.ts` | Downscaled PNG thumbnail used by history rows + toast hero |
-| `watermark.ts` | Stamps the Lumia logo onto every screenshot (applied in `capture.ts`) |
+| `thumbnail.ts` | History previews as ≤300 px JPEG **files** under `userData/thumbnails/` (`writeThumbnail` / `writeThumbnailFromDataUrl`; file names embed the row id + a write stamp so a re-thumbnail gets a fresh URL). `resolveThumbnailUrl` derives the renderer-facing `lumia-media://` URL from `HistoryItem.thumbnailFile` at read time; `thumbnailNotifyOpts` feeds the toast hero. Legacy rows with inline data-URL thumbnails are migrated to files by `HistoryStore`'s constructor |
+| `watermark.ts` | Stamps the Lumia logo onto every screenshot — `applyWatermarkToImage` is bitmap in / bitmap out. `capture.ts`'s `sendCaptureToEditor` accepts the cropped `NativeImage`, stamps it, PNG-encodes **once**, and reuses those bytes for the clipboard, the saved original, the thumbnail and the editor payload (the old data-URL-only path re-encoded/decoded the same pixels several times per capture) |
 | `native-input.ts` | Win32 input via koffi FFI — `SetCursorPos`, `mouse_event`, `keybd_event`, `SendMessageW`. Replaces PowerShell-based scroll/key sim (~0 ms vs ~200–500 ms cold start). Windows-only |
 | `printscreen-key.ts` | Windows-only — toggles the `PrintScreenKeyForSnippingEnabled` registry value so PrintScreen reaches Lumia's global hotkey instead of the Snipping Tool (`setSnippingHijack()`) |
 | `mac-window-pick.ts` | macOS window picker — long-running Swift `window-at-point` helper queries CoreGraphics for the topmost non-Lumia window under the cursor to drive overlay hover highlighting; also serves the helper's `list` query (all visible windows, front-to-back) |
@@ -136,7 +136,7 @@ Releases are produced by **GitHub Actions** (`.github/workflows/release.yml`), n
 Four isolated stores under the OS userData dir:
 - `settings.json` — `AppSettings` (theme, default save path, active workflow, Google Drive tokens, last capture mode/kind — `lastCaptureKind` is `image | video | scroll` — scroll method (`scrollCaptureMethod`: `extension | screen`), history retention, last annotation style — `annotationStyle: { color, strokeWidth }`, written on toolbar picks and restored when the editor opens)
 - `templates.json` — user workflow templates (built-ins are code-defined, never persisted)
-- `history.json` — capture history (capped at 1000 entries; thumbnails inline as data URLs)
+- `history.json` — capture history (capped at 1000 entries). Thumbnails are **not** inline any more: each row's `thumbnailFile` names a JPEG under `userData/thumbnails/`, `history:get` derives the `lumia-media://` URL the renderer puts in `<img src>` (so `loading="lazy"` actually defers offscreen previews — data: URLs never did), and rows from older builds that still carry a data-URL `thumbnailUrl` are moved to files on first start
 - `hotkeys.json` — `HotkeyConfig` with `schemaVersion` for forward migrations of capture-mode bindings
 
 ### Workflow pipeline

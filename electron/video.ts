@@ -20,7 +20,7 @@ import { resetOverlayMode, setOverlayMode } from './scroll-capture'
 import { showNotification } from './notify'
 import { getSettings, resolveSaveStartDir, rememberSaveDir } from './settings'
 import { localTimestamp } from './utils'
-import { makeThumbnail } from './thumbnail'
+import { writeThumbnailFromDataUrl } from './thumbnail'
 import { openAnnotation, closeAnnotation, destroyAnnotation, isAnnotationOpen, setupAnnotation } from './annotation'
 import { forceWindowsExcludeFromCapture } from './native-input'
 import { getSinglePickTarget } from './window-list'
@@ -427,7 +427,7 @@ async function recordHistoryAndNotify(
       timestamp: Date.now(),
       name: filename,
       filePath,
-      thumbnailUrl: makeThumbnail(thumbnailDataUrl),
+      thumbnailFile: writeThumbnailFromDataUrl(id, thumbnailDataUrl),
       type: 'recording',
       uploads: [],
     })

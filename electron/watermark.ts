@@ -56,21 +56,23 @@ export function getWatermarkLogoDataUrl(): string | null {
   return logo.toDataURL()
 }
 
-export function applyWatermark(dataUrl: string): string {
+/** Composite the logo onto a NativeImage and return the stamped image —
+ *  bitmap in, bitmap out, no PNG encode/decode round trip. Returns the input
+ *  itself when there's nothing to do (tiny image, missing logo asset, or an
+ *  unexpected failure). */
+export function applyWatermarkToImage(base: Electron.NativeImage): Electron.NativeImage {
   try {
-    if (!dataUrl || !dataUrl.startsWith('data:image/')) return dataUrl
-    const base = nativeImage.createFromDataURL(dataUrl)
-    if (base.isEmpty()) return dataUrl
+    if (base.isEmpty()) return base
     const { width: iw, height: ih } = base.getSize()
-    if (iw < 32 || ih < 32) return dataUrl // too small to bother
+    if (iw < 32 || ih < 32) return base // too small to bother
 
     const logo = loadLogo()
-    if (!logo) return dataUrl
+    if (!logo) return base
 
     const targetW = Math.max(12, Math.round(Math.min(iw, ih) * LOGO_SIZE_PCT))
     const logoResized = logo.resize({ width: targetW, quality: 'good' })
     const { width: lw, height: lh } = logoResized.getSize()
-    if (lw === 0 || lh === 0) return dataUrl
+    if (lw === 0 || lh === 0) return base
 
     const margin = Math.max(2, Math.round(targetW * LOGO_MARGIN_PCT))
     const dx = margin
@@ -106,10 +108,9 @@ export function applyWatermark(dataUrl: string): string {
       }
     }
 
-    const out = nativeImage.createFromBuffer(baseBuf, { width: iw, height: ih })
-    return out.toDataURL()
+    return nativeImage.createFromBuffer(baseBuf, { width: iw, height: ih })
   } catch (err) {
     console.error('[watermark] failed, returning original', err)
-    return dataUrl
+    return base
   }
 }
