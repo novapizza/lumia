@@ -103,7 +103,10 @@ export default function AnnotationToolBar({
         </div>
 
         {/* ── Middle: color + stroke ──────────────────────────────────── */}
-        <div className="flex-1 flex items-center gap-2 min-w-0 overflow-hidden">
+        {/* data-style-controls: the Canvas text box keeps editing (and takes
+            focus back) when focus lands here — picking a color / stroke is an
+            edit of the text being typed, not the end of typing. */}
+        <div className="flex-1 flex items-center gap-2 min-w-0 overflow-hidden" data-style-controls="">
           <div className="flex items-center gap-1 px-1 flex-shrink min-w-0">
             {COLORS.map((c) => (
               <button
@@ -194,6 +197,7 @@ export default function AnnotationToolBar({
       {popover && (
         <div
           ref={colorPopoverRef}
+          data-style-controls=""
           className="fixed z-[100] glass-refractive rounded-xl p-2 flex items-center gap-1.5"
           style={{ left: popover.left, top: popover.top, transform: 'translate(-50%, -100%)', fontFamily: 'Manrope, sans-serif' }}
         >

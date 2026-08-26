@@ -77,6 +77,11 @@ export interface AppSettings {
     pickId: string
     fetchedAt: number
   } | null
+  /** Last annotation style picked in the editor toolbar (color + stroke
+   *  width — the latter also sizes text). Restored when the editor opens so
+   *  the next edit starts where the last one left off. Written on user picks
+   *  only, not when the toolbar merely mirrors a selected shape's style. */
+  annotationStyle: { color: string; strokeWidth: number }
 }
 
 // On macOS, binding PrintScreen has no downside: built-in Apple keyboards
@@ -112,7 +117,8 @@ const store = new Store<AppSettings>({
     printScreenPromptShown: PRINT_SCREEN_DEFAULT,
     wallpaperCategories: [],
     wallpaperCustomCategories: [],
-    wallpaperGrid: null
+    wallpaperGrid: null,
+    annotationStyle: { color: '#f87171', strokeWidth: 3 }
   }
 })
 
@@ -151,7 +157,8 @@ export function getSettings(): AppSettings {
     printScreenPromptShown: store.get('printScreenPromptShown'),
     wallpaperCategories: store.get('wallpaperCategories'),
     wallpaperCustomCategories: store.get('wallpaperCustomCategories'),
-    wallpaperGrid: store.get('wallpaperGrid')
+    wallpaperGrid: store.get('wallpaperGrid'),
+    annotationStyle: store.get('annotationStyle')
   }
 }
 

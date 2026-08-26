@@ -50,6 +50,16 @@ export interface DrawObject {
   src?: string
 }
 
+/** Style of the currently selected shape, reported through
+ *  `onSelectionChange` so the toolbar can mirror it; toolbar edits then flow
+ *  back onto the selection through the `color` / `strokeWidth` props. */
+export interface SelectionInfo {
+  id: string
+  type: Tool
+  color: string
+  strokeWidth: number
+}
+
 // ── Sticker image resolution ────────────────────────────────────────────────
 // Sticker bytes are fetched + disk-cached in the main process and returned as
 // data URLs (loading remote URLs straight into Konva would taint the canvas and
@@ -157,6 +167,10 @@ interface Props {
    *  edits from rehydration without comparing object counts. */
   onHistoryChange?: (canUndo: boolean, canRedo: boolean, userEdited?: boolean) => void
   onZoomChange?: (zoom: number) => void
+  /** Fires when the selection changes (null = nothing selected) with the
+   *  selected shape's style. While a shape is selected, changes to the
+   *  `color` / `strokeWidth` props restyle it (one undo step per gesture). */
+  onSelectionChange?: (selection: SelectionInfo | null) => void
   /** Disable pointer-driven drawing (used by video mode while the video is
    *  actively playing — lets users watch without accidental strokes). */
   readOnly?: boolean
@@ -206,7 +220,7 @@ function clampPan(
 
 const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
   function AnnotationCanvas(
-    { background, tool, color, strokeWidth, onExport, exportTrigger = 0, onHistoryChange, onZoomChange, readOnly = false, initialObjects },
+    { background, tool, color, strokeWidth, onExport, exportTrigger = 0, onHistoryChange, onZoomChange, onSelectionChange, readOnly = false, initialObjects },
     ref,
   ) {
     // ── Background ────────────────────────────────────────────────────────────
@@ -274,11 +288,25 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
     // Konva node ref for the delete handle so drag/transform can reposition it
     // imperatively without a React re-render of the whole canvas per mousemove.
     const deleteHandleRef = useRef<Konva.Group>(null)
-    const [textInput, setTextInput] = useState<{
-      x: number; y: number; screenX: number; screenY: number
-    } | null>(null)
-    const textInputRef = useRef<HTMLInputElement>(null)
+    // Open text-entry box. `editingId` set → re-editing an existing text
+    // object in place (its Konva node is hidden meanwhile) instead of adding a
+    // new one on commit.
+    type TextEntry = { x: number; y: number; screenX: number; screenY: number; editingId?: string }
+    const [textInput, setTextInput] = useState<TextEntry | null>(null)
+    const textInputRef = useRef<HTMLTextAreaElement>(null)
     const [textValue, setTextValue] = useState('')
+    // Mirrors for handlers that must read the open entry synchronously
+    // (flushing it before a new one opens) without re-binding per keypress.
+    const textEntryRef = useRef<TextEntry | null>(null)
+    useEffect(() => { textEntryRef.current = textInput }, [textInput])
+    const textValueRef = useRef('')
+    useEffect(() => { textValueRef.current = textValue }, [textValue])
+    // Set while a click that opens a new entry is being handled, so the blur
+    // of the previous textarea doesn't double-commit / close the new entry.
+    const skipBlurCommitRef = useRef(false)
+    // Set when a Konva double-click begins a text edit so the container's DOM
+    // dblclick (zoom reset) fired by the same gesture is ignored.
+    const suppressDblClickZoomResetRef = useRef(false)
     const trRef = useRef<Konva.Transformer>(null)
     const [containerSize, setContainerSize] = useState({ w: 0, h: 0 })
 
@@ -426,7 +454,13 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
     // Focus text input — delayed to prevent Konva mouseUp stealing focus
     useEffect(() => {
       if (textInput && textInputRef.current) {
-        const t = setTimeout(() => textInputRef.current?.focus(), 50)
+        const t = setTimeout(() => {
+          const el = textInputRef.current
+          if (!el) return
+          el.focus()
+          const n = el.value.length
+          el.setSelectionRange(n, n)
+        }, 50)
         return () => clearTimeout(t)
       }
     }, [textInput])
@@ -565,7 +599,16 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
     useEffect(() => {
       const el = containerRef.current
       if (!el) return
-      const onDblClick = () => {
+      const onDblClick = (e: MouseEvent) => {
+        // Double-clicking inside the text box (word-select) must not yank the
+        // view — the box lives inside this container so the event bubbles here.
+        if ((e.target as HTMLElement | null)?.closest?.('textarea, input')) return
+        // Double-clicking a text shape opens in-place editing (Konva fires its
+        // own dblclick first, from the same mouseup) — don't also reset zoom.
+        if (suppressDblClickZoomResetRef.current) {
+          suppressDblClickZoomResetRef.current = false
+          return
+        }
         setUserZoom(1)
         setPanOffset({ x: 0, y: 0 })
       }
@@ -854,20 +897,76 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
     }, [exportTrigger, onExport, toDataURL])
 
     // ── Transformer attachment ────────────────────────────────────────────────
+    // A text being edited in place stays selected (so toolbar color / size
+    // changes apply to it and the toolbar mirrors it) but its Konva node is
+    // hidden behind the textarea — no frame around an invisible node.
     useEffect(() => {
       const tr = trRef.current
       if (!tr) return
-      if (!selectedId) { tr.nodes([]); tr.getLayer()?.batchDraw(); return }
+      if (!selectedId || textInput?.editingId === selectedId) { tr.nodes([]); tr.getLayer()?.batchDraw(); return }
       const stage = stageRef.current
       if (!stage) return
       const node = stage.findOne('#' + selectedId)
       if (node) { tr.nodes([node]); tr.getLayer()?.batchDraw() }
       else tr.nodes([])
-    }, [selectedId, objects, stickerLoadTick])
+    }, [selectedId, objects, stickerLoadTick, textInput])
 
-    // Deselect when switching to a drawing tool. The cursor tool ('none')
-    // is the only mode where selection is valid.
-    useEffect(() => { if (tool !== 'none') setSelectedId(null) }, [tool])
+    // Switching tools drops the selection — except when the new tool is the
+    // selected shape's own kind. Selecting a shape makes the Editor switch to
+    // that tool (`onSelectionChange` → `setTool`), and that switch must not
+    // undo the selection it was caused by; a user picking the matching tool by
+    // hand keeps it too. `selectedId` is read from this render's closure on
+    // purpose: the effect should fire on tool changes only, not on selection
+    // changes.
+    useEffect(() => {
+      if (tool === 'none') return
+      const sel = selectedId ? objectsRef.current.find(o => o.id === selectedId) : undefined
+      if (sel && sel.type === tool) return
+      setSelectedId(null)
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [tool])
+
+    // ── Selection ↔ toolbar style ─────────────────────────────────────────────
+    // Report the selected shape's style. Keyed on the id only — a style change
+    // coming *from* the toolbar re-renders with the same selection and must
+    // not echo back into the toolbar.
+    const onSelectionChangeRef = useRef(onSelectionChange)
+    useEffect(() => { onSelectionChangeRef.current = onSelectionChange }, [onSelectionChange])
+    useEffect(() => {
+      const cb = onSelectionChangeRef.current
+      if (!cb) return
+      const obj = selectedId ? objectsRef.current.find(o => o.id === selectedId) : undefined
+      cb(obj ? { id: obj.id, type: obj.type, color: obj.color, strokeWidth: obj.strokeWidth } : null)
+    }, [selectedId])
+
+    // Toolbar color / stroke-width changes while a shape is selected restyle
+    // that shape (the toolbar was just synced to it, so the user is editing
+    // what they see). Text follows too: its size derives from strokeWidth.
+    // Consecutive tweaks to the same shape with no other commit in between
+    // coalesce into one undo step — dragging the stroke slider is one
+    // gesture, not twenty. Coalescing is detected by array identity: any
+    // other commit (draw, drag, undo) replaces the objects array.
+    const prevStyleRef = useRef({ color, strokeWidth })
+    const styleCoalesceRef = useRef<{ id: string; result: DrawObject[] } | null>(null)
+    useEffect(() => {
+      const prev = prevStyleRef.current
+      prevStyleRef.current = { color, strokeWidth }
+      if (prev.color === color && prev.strokeWidth === strokeWidth) return
+      if (!selectedId) return
+      const cur = objectsRef.current.find(o => o.id === selectedId)
+      // Stickers carry no style; nothing to restyle.
+      if (!cur || cur.type === 'sticker') return
+      const patch: Partial<DrawObject> = {}
+      if (cur.color !== color) patch.color = color
+      if (cur.strokeWidth !== strokeWidth) patch.strokeWidth = strokeWidth
+      if (Object.keys(patch).length === 0) return
+      userEditedRef.current = true
+      const coalesce = styleCoalesceRef.current?.id === selectedId
+        && styleCoalesceRef.current.result === objectsRef.current
+      const result = objectsRef.current.map(o => (o.id === selectedId ? { ...o, ...patch } : o))
+      styleCoalesceRef.current = { id: selectedId, result }
+      commitObjects(result, { replace: coalesce })
+    }, [color, strokeWidth, selectedId, commitObjects])
 
     // Track the top-right corner of the selected shape so the delete handle
     // (small red X next to the Transformer) follows the shape during drag /
@@ -876,7 +975,7 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
     // updates during drag/transform move the Konva node directly via its ref,
     // avoiding a full canvas re-render on every mousemove.
     useEffect(() => {
-      if (!selectedId) { setDeleteHandle(null); return }
+      if (!selectedId || textInput?.editingId === selectedId) { setDeleteHandle(null); return }
       const stage = stageRef.current
       if (!stage) { setDeleteHandle(null); return }
       const node = stage.findOne('#' + selectedId)
@@ -904,7 +1003,7 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
       return () => {
         node.off('dragmove.deletehandle transform.deletehandle')
       }
-    }, [selectedId, objects, baseScale, scale])
+    }, [selectedId, objects, baseScale, scale, textInput])
 
     // ── Keyboard: Delete / Backspace removes the selected shape ──────────────
     useEffect(() => {
@@ -922,43 +1021,154 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
       return () => window.removeEventListener('keydown', onKey)
     }, [selectedId, commitObjects])
 
+    // ── Select / move while drawing ───────────────────────────────────────────
+    // In a drawing/text tool, pressing on an existing shape never draws:
+    // release without dragging = select it (Text tool on a text = edit it);
+    // dragging = Konva moves it (every committed shape is draggable) and it
+    // becomes the selection on release. New shapes start on empty canvas only
+    // — the ShareX / Snagit convention.
+    //
+    // Konva decides what is a drag (its own 3 px threshold): onDragStart
+    // clears the press, so a press still pending at mouseup was a click. While
+    // Konva drags, the Stage receives no mousemove at all and nothing here
+    // touches React state — the drag stays a bare Konva drag (no re-render,
+    // no Transformer) until the mouse is released.
+    const pendingPressRef = useRef<{ objId: string } | null>(null)
+    // Shape under the cursor — drives the pointer/move cursor that hints
+    // "click to select" while a drawing tool is active.
+    const [hoverId, setHoverId] = useState<string | null>(null)
+
+    // Walk up from an event target to the node carrying an object id (blur's
+    // inner Image is nested in its Group). Transformer anchors, the delete
+    // handle and the background never resolve to an object.
+    const objectIdFromTarget = useCallback((node: Konva.Node | null): string | null => {
+      let n: Konva.Node | null = node
+      while (n && n.getClassName() !== 'Layer' && n.getClassName() !== 'Stage') {
+        const id = n.id()
+        if (id && objectsRef.current.some(o => o.id === id)) return id
+        n = n.getParent()
+      }
+      return null
+    }, [])
+
+    // Begin a new shape of the active tool at `pos` (image coordinates).
+    const startDrawing = useCallback((pos: { x: number; y: number }) => {
+      setIsDrawing(true)
+      isDrawingRef.current = true
+      drawStart.current = pos
+      const base: DrawObject = { id: uid(), type: tool, color, strokeWidth }
+      if (tool === 'pen') {
+        setCurrentObj({ ...base, points: [pos.x, pos.y] })
+      } else if (tool === 'rect' || tool === 'blur') {
+        setCurrentObj({ ...base, x: pos.x, y: pos.y, width: 0, height: 0 })
+      } else if (tool === 'ellipse') {
+        setCurrentObj({ ...base, x: pos.x, y: pos.y, radiusX: 0, radiusY: 0 })
+      } else if (tool === 'arrow') {
+        setCurrentObj({ ...base, points: [pos.x, pos.y, pos.x, pos.y] })
+      }
+    }, [tool, color, strokeWidth])
+
+    // ── Text entry ────────────────────────────────────────────────────────────
+    const commitText = useCallback(
+      (entry: TextEntry, value: string) => {
+        if (entry.editingId) {
+          const id = entry.editingId
+          const cur = objectsRef.current.find(o => o.id === id)
+          // Object gone (undo) or text unchanged → no undo step.
+          if (!cur || (cur.text ?? '') === value) return
+          userEditedRef.current = true
+          // Emptying an existing text deletes it (Escape cancels instead).
+          commitObjects(prev => value.trim()
+            ? prev.map(o => (o.id === id ? { ...o, text: value } : o))
+            : prev.filter(o => o.id !== id))
+          return
+        }
+        if (!value.trim()) return
+        userEditedRef.current = true
+        commitObjects(prev => [
+          ...prev,
+          { id: uid(), type: 'text' as Tool, x: entry.x, y: entry.y, text: value, color, strokeWidth },
+        ])
+      },
+      [commitObjects, color, strokeWidth],
+    )
+
+    // Open the text box. If one is already open its content is committed first
+    // — the textarea's blur would otherwise fire after the new entry's state
+    // is set and clobber it (the old flow lost the first text that way).
+    const openTextEntry = useCallback(
+      (entry: TextEntry, initialValue: string) => {
+        if (textEntryRef.current) {
+          commitText(textEntryRef.current, textValueRef.current)
+          skipBlurCommitRef.current = true
+          setTimeout(() => { skipBlurCommitRef.current = false }, 0)
+        }
+        setTextInput(entry)
+        setTextValue(initialValue)
+      },
+      [commitText],
+    )
+
+    // Re-edit an existing text object in place: double-click it with the
+    // cursor tool, or click it while the Text tool is active.
+    const beginTextEdit = useCallback(
+      (obj: DrawObject) => {
+        if (readOnly || obj.type !== 'text') return
+        const x = obj.x ?? 0
+        const y = obj.y ?? 0
+        // Editing keeps (or takes) the selection: the toolbar syncs to this
+        // text and its color / size edits land on it live while typing. The
+        // Transformer and delete handle hide themselves for the edited text.
+        setSelectedId(obj.id)
+        openTextEntry({ x, y, screenX: x * scale, screenY: y * scale, editingId: obj.id }, obj.text ?? '')
+      },
+      [openTextEntry, readOnly, scale],
+    )
+
     // ── Drawing handlers ──────────────────────────────────────────────────────
     const handleMouseDown = useCallback(
       (e: Konva.KonvaEventObject<MouseEvent>) => {
+        pendingPressRef.current = null
         if (readOnly || e.evt.button === 2) return
         if (tool === 'none') {
           if (e.target === e.target.getStage()) setSelectedId(null)
           return
         }
+        // Transformer anchors and the delete handle handle their own presses.
+        if (e.target.getParent()?.getClassName() === 'Transformer') return
+        const dh = deleteHandleRef.current
+        if (dh && (e.target === dh || dh.isAncestorOf(e.target))) return
+
         const raw = e.target.getStage()!.getPointerPosition()!
         const pos = { x: raw.x / scale, y: raw.y / scale }
-        setIsDrawing(true)
-        isDrawingRef.current = true
-        drawStart.current = pos
 
-        const base: DrawObject = { id: uid(), type: tool, color, strokeWidth }
-
-        if (tool === 'pen') {
-          setCurrentObj({ ...base, points: [pos.x, pos.y] })
-        } else if (tool === 'rect' || tool === 'blur') {
-          setCurrentObj({ ...base, x: pos.x, y: pos.y, width: 0, height: 0 })
-        } else if (tool === 'ellipse') {
-          setCurrentObj({ ...base, x: pos.x, y: pos.y, radiusX: 0, radiusY: 0 })
-        } else if (tool === 'arrow') {
-          setCurrentObj({ ...base, points: [pos.x, pos.y, pos.x, pos.y] })
-        } else if (tool === 'text') {
-          setTextInput({ x: pos.x, y: pos.y, screenX: raw.x, screenY: raw.y })
-          setTextValue('')
-          setIsDrawing(false)
-          isDrawingRef.current = false
+        const hitId = objectIdFromTarget(e.target)
+        if (hitId) {
+          // Existing shape: a click (decided on release) selects it, a drag
+          // (decided on move) is Konva's — never a new stroke.
+          pendingPressRef.current = { objId: hitId }
           return
         }
+
+        // Empty canvas: drop the selection, then draw / place text.
+        setSelectedId(null)
+        if (tool === 'text') {
+          openTextEntry({ x: pos.x, y: pos.y, screenX: raw.x, screenY: raw.y }, '')
+          return
+        }
+        startDrawing(pos)
       },
-      [tool, color, strokeWidth, scale, readOnly],
+      [tool, scale, readOnly, openTextEntry, startDrawing, objectIdFromTarget],
     )
 
     const handleMouseMove = useCallback(
       (e: Konva.KonvaEventObject<MouseEvent>) => {
+        if (pendingPressRef.current) {
+          // Pressed on a shape, Konva hasn't started dragging it yet: never
+          // draw. A button released off-stage voids the press.
+          if (!(e.evt.buttons & 1)) pendingPressRef.current = null
+          return
+        }
         if (!isDrawing || !currentObj) return
         const raw = e.target.getStage()!.getPointerPosition()!
         const pos = { x: raw.x / scale, y: raw.y / scale }
@@ -1016,6 +1226,16 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
     }
 
     const handleMouseUp = useCallback(() => {
+      const pending = pendingPressRef.current
+      if (pending) {
+        pendingPressRef.current = null
+        const obj = objectsRef.current.find(o => o.id === pending.objId)
+        if (obj) {
+          if (toolRef.current === 'text' && obj.type === 'text') beginTextEdit(obj)
+          else setSelectedId(obj.id)
+        }
+        return
+      }
       // Guard against the double-fire: the Stage's onMouseUp and the
       // window-level mouseup fallback both call this for one gesture with no
       // re-render in between. The ref is flipped synchronously here so the
@@ -1028,7 +1248,7 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
       userEditedRef.current = true
       commitObjects(prev => [...prev, currentObj])
       setCurrentObj(null)
-    }, [isDrawing, currentObj, commitObjects])
+    }, [isDrawing, currentObj, commitObjects, beginTextEdit])
 
     // Global mouseup so a shape still commits if the pointer exits the stage
     useEffect(() => {
@@ -1139,11 +1359,27 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
     const renderObj = (obj: DrawObject, isPreview = false) => {
       if (isPreview && isTrivialShape(obj)) return null
       const key = isPreview ? 'preview' : obj.id
+      // Every committed shape is draggable in every tool: a press on an
+      // existing shape never starts a new stroke (see handleMouseDown), so a
+      // drag can always move it. The preview (shape being drawn) is not, and
+      // while read-only (video playing) only the cursor tool may still drag —
+      // drawing tools stay fully inert there, as before.
+      const manipulable = !isPreview && (!readOnly || selectable)
 
       const commonInteractive = !isPreview && {
         onClick: () => { if (selectable) setSelectedId(obj.id) },
         onTap:   () => { if (selectable) setSelectedId(obj.id) },
-        onDragEnd: (e: Konva.KonvaEventObject<DragEvent>) => bakeNodeIntoObject(obj.id, e.target),
+        onMouseEnter: () => setHoverId(obj.id),
+        onMouseLeave: () => setHoverId(prev => (prev === obj.id ? null : prev)),
+        // A real drag is not a click → the pending press must not select /
+        // edit on release.
+        onDragStart: () => { pendingPressRef.current = null },
+        // Selecting on release (not mid-drag) keeps the drag itself free of
+        // React work; the toolbar / tool then follow the moved shape.
+        onDragEnd: (e: Konva.KonvaEventObject<DragEvent>) => {
+          bakeNodeIntoObject(obj.id, e.target)
+          setSelectedId(obj.id)
+        },
         onTransformEnd: (e: Konva.KonvaEventObject<Event>) => bakeNodeIntoObject(obj.id, e.target),
       }
 
@@ -1166,7 +1402,7 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
             lineCap="round"
             lineJoin="round"
             globalCompositeOperation="source-over"
-            draggable={selectable}
+            draggable={manipulable}
             {...commonInteractive}
           />
         )
@@ -1192,7 +1428,7 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
             strokeWidth={obj.strokeWidth}
             strokeScaleEnabled={false}
             hitStrokeWidth={Math.max(obj.strokeWidth + 8, 14) / scale}
-            draggable={selectable}
+            draggable={manipulable}
             {...commonInteractive}
           />
         )
@@ -1213,7 +1449,7 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
               fill="rgba(128,128,128,0.35)"
               stroke="rgba(255,255,255,0.4)"
               dash={[4, 4]}
-              draggable={selectable}
+              draggable={manipulable}
               {...commonInteractive}
             />
           )
@@ -1223,7 +1459,7 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
             key={key}
             id={obj.id}
             clipX={bx} clipY={by} clipWidth={bw} clipHeight={bh}
-            draggable={selectable}
+            draggable={manipulable}
             {...commonInteractive}
             // The inner pre-blurred image sits at group-local (0,0) and is the
             // size of the whole background. As the group moves, counter-offset
@@ -1265,7 +1501,7 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
             // See the rect above — outline-only hit testing matches the
             // visible outline-only fill.
             fillEnabled={false}
-            draggable={selectable}
+            draggable={manipulable}
             {...commonInteractive}
           />
         )
@@ -1286,7 +1522,7 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
             // keep the head consistent across image sizes.
             pointerLength={Math.max(8, obj.strokeWidth * 3) / scale}
             pointerWidth={Math.max(8, obj.strokeWidth * 3) / scale}
-            draggable={selectable}
+            draggable={manipulable}
             {...commonInteractive}
           />
         )
@@ -1303,8 +1539,24 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
             fontFamily="Manrope, sans-serif"
             fontStyle="bold"
             fill={obj.color}
-            draggable={!isPreview}
+            // Hidden while its content is being re-edited — the textarea
+            // stands in for it at the same spot.
+            visible={textInput?.editingId !== obj.id}
+            draggable={manipulable && textInput?.editingId !== obj.id}
             {...commonInteractive}
+            onDblClick={() => {
+              if (isPreview || readOnly || (tool !== 'none' && tool !== 'text')) return
+              // The DOM dblclick (if the browser agrees it was one — Konva
+              // only checks timing, the browser also checks movement) fires in
+              // this same task; the timeout clears a flag nobody consumed.
+              suppressDblClickZoomResetRef.current = true
+              setTimeout(() => { suppressDblClickZoomResetRef.current = false }, 0)
+              beginTextEdit(obj)
+            }}
+            onDblTap={() => {
+              if (isPreview || readOnly || (tool !== 'none' && tool !== 'text')) return
+              beginTextEdit(obj)
+            }}
           />
         )
       }
@@ -1315,7 +1567,7 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
           <StickerImage
             key={key}
             obj={obj}
-            selectable={selectable}
+            selectable={manipulable}
             interactive={commonInteractive || {}}
             onLoaded={bumpStickerTick}
           />
@@ -1324,22 +1576,25 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
       return null
     }
 
-    const commitText = useCallback(
-      (pos: { x: number; y: number }, value: string) => {
-        if (!value.trim()) return
-        userEditedRef.current = true
-        commitObjects(prev => [
-          ...prev,
-          { id: uid(), type: 'text' as Tool, x: pos.x, y: pos.y, text: value, color, strokeWidth },
-        ])
-      },
-      [commitObjects, color, strokeWidth],
-    )
+    // ── Text box metrics ──────────────────────────────────────────────────────
+    // The textarea mirrors the Konva <Text> it stands for (same font, weight,
+    // size scaled to the stage, same color) so typing/editing happens in
+    // place; the box is shifted up-left by its padding + 1px border so the
+    // glyphs land where the shape renders.
+    const TEXT_BOX_PAD = 4
+    const textEntryObj = textInput?.editingId ? objects.find(o => o.id === textInput.editingId) : undefined
+    const textEntryFontPx = ((textEntryObj?.strokeWidth ?? strokeWidth) * 6 + 12) * scale
+    const textEntryColor = textEntryObj?.color ?? color
 
     // ── Cursor ────────────────────────────────────────────────────────────────
+    // Hovering a shape in a drawing/text tool shows the move cursor (drag
+    // moves it, click selects it) — not while a stroke is in progress. Looked
+    // up in `objects` so a deleted shape can't leave a stale cursor behind.
+    const hoverObj = hoverId && !isDrawing && tool !== 'none' ? objects.find(o => o.id === hoverId) : undefined
     const cursor = isPanningState ? 'grabbing'
       : spaceHeld ? 'grab'
       : readOnly ? 'default'
+      : hoverObj ? 'move'
       : tool === 'pen' ? 'crosshair'
       : tool === 'text' ? 'text'
       : tool === 'none' ? 'default'
@@ -1455,15 +1710,22 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
           {textInput && (
             <div
               className="absolute z-10"
-              style={{ left: textInput.screenX, top: textInput.screenY }}
+              style={{ left: textInput.screenX - TEXT_BOX_PAD - 1, top: textInput.screenY - TEXT_BOX_PAD - 1 }}
               onMouseDown={e => e.stopPropagation()}
             >
-              <input
+              <textarea
                 ref={textInputRef}
                 value={textValue}
+                rows={textValue.split('\n').length}
                 onChange={e => setTextValue(e.target.value)}
                 onKeyDown={e => {
                   if (e.key === 'Enter') {
+                    // Shift+Enter inserts a line break (Konva <Text> renders
+                    // '\n' natively); bare Enter commits. Never commit while an
+                    // IME composition is in flight — Enter there only confirms
+                    // the candidate (Vietnamese Telex/Unikey, CJK input).
+                    if (e.shiftKey || e.nativeEvent.isComposing) return
+                    e.preventDefault()
                     commitText(textInput, textValue)
                     setTextInput(null)
                     setTextValue('')
@@ -1472,21 +1734,50 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
                     setTextValue('')
                   }
                 }}
-                onBlur={() => {
+                onBlur={e => {
+                  // Opening another entry (click elsewhere with the Text tool,
+                  // double-click another text) already committed this one.
+                  if (skipBlurCommitRef.current) return
+                  // Focus moving to the toolbar's color / stroke controls is a
+                  // style edit of this text (it is the selection, so the change
+                  // lands on it live), not the end of typing: keep the entry
+                  // open and take focus back once the control has its click.
+                  const to = e.relatedTarget as HTMLElement | null
+                  if (to?.closest?.('[data-style-controls]')) {
+                    requestAnimationFrame(() => textInputRef.current?.focus())
+                    return
+                  }
+                  const entry = textInput
                   setTimeout(() => {
-                    setTextInput(prev => {
-                      if (!prev) return null
-                      const val = textInputRef.current?.value ?? ''
-                      commitText(prev, val)
-                      return null
-                    })
+                    // Still the open entry? Enter/Escape may have closed it, or
+                    // a newer one replaced it, in the meantime.
+                    if (!entry || textEntryRef.current !== entry) return
+                    commitText(entry, textValueRef.current)
+                    setTextInput(null)
                     setTextValue('')
                   }, 150)
                 }}
-                className="bg-slate-900/90 border border-primary/50 text-white text-sm px-3 py-2 rounded-xl outline-none min-w-[160px] backdrop-blur-sm shadow-lg"
-                style={{ fontFamily: 'Manrope, sans-serif' }}
-                placeholder="Type text, Enter to confirm..."
+                // whiteSpace: pre — no soft-wrapping, so the box mirrors the
+                // Konva <Text> (which has no width and never wraps); the only
+                // line breaks are the ones the user typed. fieldSizing: content
+                // grows the box with the text in both axes (Chromium 123+).
+                // lineHeight 1 matches Konva's default line height.
+                className="block bg-slate-900/70 border border-primary/50 rounded-md outline-none min-w-[160px] backdrop-blur-sm shadow-lg resize-none overflow-hidden"
+                style={{
+                  fontFamily: 'Manrope, sans-serif',
+                  fontWeight: 700,
+                  fontSize: textEntryFontPx,
+                  lineHeight: 1,
+                  color: textEntryColor,
+                  padding: TEXT_BOX_PAD,
+                  whiteSpace: 'pre',
+                  fieldSizing: 'content',
+                }}
+                placeholder="Type…"
               />
+              <div className="mt-1 inline-block rounded bg-slate-900/80 px-1.5 py-1 text-[11px] leading-none text-white/80 whitespace-nowrap select-none">
+                Enter confirm · Shift+Enter new line · Esc cancel
+              </div>
             </div>
           )}
         </div>

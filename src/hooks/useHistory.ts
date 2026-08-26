@@ -27,19 +27,27 @@ export function useHistory<T>(initialState: T) {
   /**
    * Commit a new state.  Accepts a value OR a functional updater, just like
    * React's setState.  Any "future" redo states are discarded.
+   *
+   * `replace: true` overwrites the latest commit instead of adding a step —
+   * for rapid successive tweaks (dragging a stroke-width slider over a
+   * selected shape) so Undo reverts the whole gesture at once. Falls back to a
+   * normal push when there is nothing but the initial state to replace.
    */
-  const set = useCallback((next: T | ((prev: T) => T)) => {
+  const set = useCallback((next: T | ((prev: T) => T), opts?: { replace?: boolean }) => {
     const cur   = history.current[cursor.current]
     const value = typeof next === 'function' ? (next as (p: T) => T)(cur) : next
 
     // Discard any redo branch
     history.current = history.current.slice(0, cursor.current + 1)
-    history.current.push(value)
 
-    // Keep memory bounded
-    if (history.current.length > MAX_HISTORY) history.current.shift()
-
-    cursor.current = history.current.length - 1
+    if (opts?.replace && cursor.current > 0) {
+      history.current[cursor.current] = value
+    } else {
+      history.current.push(value)
+      // Keep memory bounded
+      if (history.current.length > MAX_HISTORY) history.current.shift()
+      cursor.current = history.current.length - 1
+    }
     rerender()
   }, [rerender])
 
