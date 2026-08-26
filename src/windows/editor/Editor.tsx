@@ -7,7 +7,7 @@ import AnnotationCanvas, {
 import AnnotationToolBar from '../../components/AnnotationCanvas/ToolBar'
 import { matchToolShortcut } from '../../components/AnnotationCanvas/tools'
 import type { WorkflowTemplate, HistoryItem, AnnotationObject } from '../../types'
-import type { DrawObject } from '../../components/AnnotationCanvas/Canvas'
+import type { DrawObject, SelectionInfo } from '../../components/AnnotationCanvas/Canvas'
 import StickerPicker, { type PickedSticker } from '../../components/StickerPicker'
 import { deriveActions, type ActionBtn } from '../../lib/workflow-actions'
 import { useLocalVideoUrl } from '../../hooks/useLocalVideoUrl'
@@ -212,6 +212,12 @@ export default function Editor() {
     ]).then(([t, s]) => {
       if (t) setTemplates(t)
       if (s?.activeWorkflowId) setActiveWorkflowId(s.activeWorkflowId)
+      // Start from the style the user last picked (see persistStyle below).
+      const st = s?.annotationStyle
+      if (st && typeof st.color === 'string' && typeof st.strokeWidth === 'number') {
+        setColor(st.color)
+        setStrokeWidth(st.strokeWidth)
+      }
       setGdriveConnected(!!s?.googleDriveConnected)
     })
     return () => { window.electronAPI?.removeAllListeners('capture:ready') }
@@ -360,6 +366,45 @@ export default function Editor() {
     if (pending) {
       window.electronAPI?.saveHistoryAnnotations(pending.historyId, pending.objects, pending.flattenedDataUrl).catch(() => {})
     }
+  }, [])
+
+  // Persist toolbar style picks to settings (debounced — the stroke slider
+  // fires per pixel) so the next editor session starts with them. Only the
+  // wrappers handed to the toolbar persist; handleSelectionChange below sets
+  // the raw state on purpose — mirroring an existing shape's style into the
+  // toolbar is not a new pick.
+  const styleRef = useRef({ color, strokeWidth })
+  useEffect(() => { styleRef.current = { color, strokeWidth } }, [color, strokeWidth])
+  const persistStyleTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const persistStyle = useCallback(() => {
+    if (persistStyleTimer.current) clearTimeout(persistStyleTimer.current)
+    persistStyleTimer.current = setTimeout(() => {
+      persistStyleTimer.current = null
+      window.electronAPI?.setSetting('annotationStyle', styleRef.current)
+    }, 300)
+  }, [])
+  // Flush a pending write if the editor closes inside the debounce window.
+  useEffect(() => () => {
+    if (persistStyleTimer.current) {
+      clearTimeout(persistStyleTimer.current)
+      persistStyleTimer.current = null
+      window.electronAPI?.setSetting('annotationStyle', styleRef.current)
+    }
+  }, [])
+  const pickColor = useCallback((c: string) => { setColor(c); persistStyle() }, [persistStyle])
+  const pickStrokeWidth = useCallback((w: number) => { setStrokeWidth(w); persistStyle() }, [persistStyle])
+
+  // Selecting a shape switches to its tool (rect → Rect, text → Text, …) and
+  // mirrors its style in the toolbar; toolbar edits then flow back onto that
+  // shape through Canvas's `color` / `strokeWidth` props. Canvas keeps the
+  // selection across this tool switch (it only drops it for a *different*
+  // tool). Stickers are skipped: the sticker "tool" is the picker modal and
+  // they carry no style. Deselecting keeps tool + values for the next shape.
+  const handleSelectionChange = useCallback((sel: SelectionInfo | null) => {
+    if (!sel || sel.type === 'sticker' || sel.type === 'none') return
+    setTool(sel.type)
+    setColor(sel.color)
+    setStrokeWidth(sel.strokeWidth)
   }, [])
 
   const handleExport = useCallback(async (dataUrl: string) => {
@@ -662,6 +707,7 @@ export default function Editor() {
               exportTrigger={exportTrigger}
               onHistoryChange={handleHistoryChange}
               onZoomChange={setZoomLevel}
+              onSelectionChange={handleSelectionChange}
               initialObjects={initialAnnotations as DrawObject[] | undefined}
             />
           )}
@@ -729,8 +775,8 @@ export default function Editor() {
         )}
         <AnnotationToolBar
           tool={tool} setTool={setTool}
-          color={color} setColor={setColor}
-          strokeWidth={strokeWidth} setStrokeWidth={setStrokeWidth}
+          color={color} setColor={pickColor}
+          strokeWidth={strokeWidth} setStrokeWidth={pickStrokeWidth}
           canUndo={canUndo} canRedo={canRedo}
           onUndo={() => canvasRef.current?.undo()}
           onRedo={() => canvasRef.current?.redo()}

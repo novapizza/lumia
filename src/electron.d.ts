@@ -30,6 +30,8 @@ interface AppSettings {
     pickId: string
     fetchedAt: number
   } | null
+  // Last toolbar color / stroke width the user picked in the editor.
+  annotationStyle: { color: string; strokeWidth: number }
 }
 
 declare global {
