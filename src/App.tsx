@@ -15,13 +15,14 @@ const Editor = lazy(() => import('./windows/editor/Editor'))
 const Workflow = lazy(() => import('./windows/workflow/Workflow'))
 const Wallpapers = lazy(() => import('./windows/wallpapers/Wallpapers'))
 const Settings = lazy(() => import('./windows/settings/Settings'))
-const Overlay = lazy(() => import('./windows/overlay/Overlay'))
 const RecordingToolbar = lazy(() => import('./windows/recording-toolbar/RecordingToolbar'))
 const RecordingBorder = lazy(() => import('./windows/recording-border/RecordingBorder'))
 const RecorderHost = lazy(() => import('./windows/recorder-host/RecorderHost'))
 const AnnotationOverlay = lazy(() => import('./windows/annotation-overlay/AnnotationOverlay'))
 
-const STANDALONE_ROUTES = ['/overlay', '/recording-toolbar', '/recording-border', '/recorder-host', '/annotation-overlay']
+// The capture overlay is not a route any more — it has its own entry
+// (src/overlay.html) so the per-display pooled renderers stay lean.
+const STANDALONE_ROUTES = ['/recording-toolbar', '/recording-border', '/recorder-host', '/annotation-overlay']
 
 function isStandaloneHash(): boolean {
   const hash = window.location.hash.replace(/^#/, '')
@@ -89,7 +90,6 @@ export default function App() {
     return (
       <Suspense fallback={null}>
         <Routes>
-          <Route path="/overlay" element={<Overlay />} />
           <Route path="/recording-toolbar" element={<RecordingToolbar />} />
           <Route path="/recording-border" element={<RecordingBorder />} />
           <Route path="/recorder-host" element={<RecorderHost />} />

@@ -979,7 +979,7 @@ function HistoryCard({
       {/* Thumbnail */}
       <div className="aspect-video bg-slate-950 relative overflow-hidden rounded-t-lg">
         {(item.thumbnailUrl ?? item.dataUrl) ? (
-          <img src={item.thumbnailUrl ?? item.dataUrl} className="w-full h-full object-cover group-hover:scale-[1.03] transition-transform duration-500 opacity-90 group-hover:opacity-100" />
+          <img src={item.thumbnailUrl ?? item.dataUrl} loading="lazy" decoding="async" className="w-full h-full object-cover group-hover:scale-[1.03] transition-transform duration-500 opacity-90 group-hover:opacity-100" />
         ) : (
           <div className="w-full h-full flex items-center justify-center">
             <span className="material-symbols-outlined text-slate-700 text-4xl">{item.type === 'recording' ? 'videocam' : 'image'}</span>

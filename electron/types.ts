@@ -63,6 +63,12 @@ export interface HistoryItem {
   name: string
   filePath?: string
   dataUrl?: string
+  // Preview JPEG (≤300 px wide) stored as a file under userData/thumbnails/
+  // (see thumbnail.ts). Persisted; `thumbnailUrl` is derived from it on read.
+  thumbnailFile?: string
+  // Renderer-facing preview URL (`lumia-media://…` for thumbnailFile). Only
+  // legacy rows still persist an inline data URL here — HistoryStore moves
+  // those to files on startup.
   thumbnailUrl?: string
   size?: number
   type: 'screenshot' | 'recording'

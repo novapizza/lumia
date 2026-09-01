@@ -20,12 +20,15 @@ import '@fontsource/manrope/latin-500.css'
 import '@fontsource/manrope/latin-600.css'
 import '@fontsource/manrope/latin-700.css'
 import '@fontsource/manrope/latin-800.css'
-import 'material-symbols/outlined.css'
+// Material Symbols, subset to the icons Lumia references (~150 of ~4,300):
+// 3.9 MB → a few dozen KB per renderer. Regenerate with `pnpm icons:subset`
+// after adding a new icon (scripts/subset-material-symbols.py).
+import './assets/fonts/material-symbols.css'
 
 import './index.css'
 
 // Standalone transparent windows (annotation overlay, palette, recording
-// toolbar/border, recorder host, region overlay) must have a transparent
+// toolbar/border, recorder host) must have a transparent
 // body from the very first paint — otherwise the dark gradient body that
 // the main app routes use shows up for one frame and looks like a flash
 // when the BrowserWindow appears. Set this synchronously before React
@@ -35,7 +38,6 @@ const TRANSPARENT_HASHES = [
   '#/recording-toolbar',
   '#/recording-border',
   '#/recorder-host',
-  '#/overlay',
 ]
 if (TRANSPARENT_HASHES.some(h => window.location.hash === h || window.location.hash.startsWith(h + '?') || window.location.hash.startsWith(h + '/'))) {
   document.documentElement.style.background = 'transparent'

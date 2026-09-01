@@ -4,6 +4,7 @@ import fs from 'fs/promises'
 import { setupCapture, ORIGINALS_DIR, getFrozenBgrForDisplay, prewarmDesktopCapturer } from './capture'
 import { prewarmNativeCapture } from './native-screen'
 import { prewarmMacWindowPick } from './mac-window-pick'
+import { setupMemoryLogging, labelWebContents, logMilestone } from './mem-metrics'
 import { getIccFromPng, tagPngWithIcc } from './png-icc'
 import { setupVideo, isRecordingActive } from './video'
 import { uploadFileToR2 } from './uploaders/r2'
@@ -24,7 +25,7 @@ import { setupStickers } from './stickers'
 import { WorkflowEngine } from './workflow'
 import { TemplateStore } from './templates'
 import { HistoryStore } from './history'
-import { makeThumbnail } from './thumbnail'
+import { writeThumbnail, writeThumbnailFromDataUrl, resolveThumbnailUrl, thumbnailNotifyOpts } from './thumbnail'
 import { showNotification, consumePendingNotificationClick } from './notify'
 import type { HistoryItem } from './types'
 import { getSettings, setSetting, isRememberedMode, resolveSaveStartDir, rememberSaveDir, type AppSettings } from './settings'
@@ -384,6 +385,12 @@ export function closeAllOverlays() {
     // the EX_TRANSPARENT flag above.
     if (!win.webContents.isDestroyed()) {
       win.webContents.send('overlay:set-active', false)
+      // Drop the frozen snapshot while parked. Otherwise every pooled overlay
+      // keeps its last capture alive until the next one — the BGRA buffer in
+      // the renderer plus the full-screen <canvas> backing store in the GPU
+      // process, i.e. displays × (8–16 MB × 2) sitting idle for hours. The
+      // next capture pushes a fresh buffer before the overlay is revealed.
+      win.webContents.send('overlay:frozen-bgra-changed', null)
     }
   }
   overlayWindows.clear()
@@ -452,9 +459,11 @@ function createMainWindow(startHidden = false): BrowserWindow {
     if (shown || startHidden || win.isDestroyed() || win.isVisible()) return
     shown = true
     win.show()
+    logMilestone('main window shown')
   }
-  ipcMain.once('window:ready', () => showOnce())
+  ipcMain.once('window:ready', () => { logMilestone('window:ready (dashboard settled)'); showOnce() })
   win.once('ready-to-show', () => {
+    logMilestone('main ready-to-show (first paint)')
     setTimeout(showOnce, 1000)
     // Opt main out of DWM's hide animation so capture flows can rely on
     // win.hide() removing it from the compositor instantly. Without this,
@@ -561,10 +570,14 @@ function addOverlayToPool(display: Electron.Display): BrowserWindow {
   win.setAlwaysOnTop(true, 'pop-up-menu')
   win.setVisibleOnAllWorkspaces(true)
 
+  // Dedicated lean entry (src/overlay.html → overlay-main.tsx): no router,
+  // no dashboard/editor bundle, only the fonts the overlay uses. These
+  // renderers live for the whole session, one per display, so every byte
+  // the entry pulls in is paid N times.
   if (isDev) {
-    win.loadURL('http://localhost:5173/#/overlay')
+    win.loadURL('http://localhost:5173/overlay.html')
   } else {
-    win.loadFile(join(__dirname, '../renderer/index.html'), { hash: '/overlay' })
+    win.loadFile(join(__dirname, '../renderer/overlay.html'))
   }
 
   // One-time per-window setup: register the HWND for the native click-through
@@ -601,6 +614,7 @@ function addOverlayToPool(display: Electron.Display): BrowserWindow {
     overlayWindows.delete(display.id)
   })
 
+  labelWebContents(win.webContents, `overlay:${display.id} ${width}x${height}@${display.scaleFactor}x`)
   overlayPool.set(display.id, win)
   return win
 }
@@ -872,6 +886,7 @@ if (process.platform === 'win32') {
 }
 
 app.whenReady().then(async () => {
+  logMilestone('app ready')
   // Plant the Start Menu shortcut that registers our AUMID with the Windows
   // shell. Without it, dev-mode toast clicks have no launcher to activate
   // and silently no-op. Fire-and-forget; failure is non-fatal.
@@ -886,6 +901,7 @@ app.whenReady().then(async () => {
 
   const startHidden = wasLaunchedAtStartup()
   mainWindow = createMainWindow(startHidden)
+  labelWebContents(mainWindow.webContents, 'main')
 
   // macOS: normal launches leave the dock visible (default). Login-item
   // startups boot straight to the tray, so drop the dock icon explicitly —
@@ -937,6 +953,9 @@ app.whenReady().then(async () => {
   // the renderer already loaded. The first capture after boot drops from
   // ~300–500ms (window construct + React boot) to ~30ms (show + IPC reset).
   setupOverlayPool()
+
+  // Per-process memory breakdown into the log at +10 s / +60 s (mem-metrics.ts).
+  setupMemoryLogging()
 
   // Surface OS permission prompts (Screen Recording / Microphone / Accessibility
   // on macOS, Microphone on Windows) at startup rather than mid-capture. Skip
@@ -1140,7 +1159,9 @@ app.whenReady().then(async () => {
     const items = historyStore.getAll()
     const { access } = await import('fs/promises')
     // fs.access is microsecond-fast on SSDs; 200 parallel probes are trivial.
-    return Promise.all(items.map(async (item) => {
+    return Promise.all(items.map(async (raw) => {
+      // Renderer view: thumbnailFile → lumia-media:// URL for <img src>.
+      const item = resolveThumbnailUrl(raw)
       if (!item.filePath) return item
       try {
         await access(item.filePath)
@@ -1199,7 +1220,7 @@ app.whenReady().then(async () => {
     // to undefined, orphan the sidecar on disk, and force Dashboard Share/
     // Copy back to the un-annotated original.
     let annotatedFilePath: string | undefined = item.annotatedFilePath
-    let thumbnailUrl = item.thumbnailUrl
+    let thumbnailFile = item.thumbnailFile
 
     if (hasAnnotations && typeof flattenedDataUrl === 'string' && flattenedDataUrl.startsWith('data:image/')) {
       // Write (or overwrite) the sidecar PNG next to the original. Naming
@@ -1232,7 +1253,7 @@ app.whenReady().then(async () => {
 
       await writeFile(sidecar, sidecarBuf)
       annotatedFilePath = sidecar
-      thumbnailUrl = makeThumbnail(flattenedDataUrl)
+      thumbnailFile = writeThumbnailFromDataUrl(id, flattenedDataUrl, item.thumbnailFile) ?? thumbnailFile
     }
 
     if (!hasAnnotations && item.annotatedFilePath) {
@@ -1249,17 +1270,16 @@ app.whenReady().then(async () => {
       try {
         const { readFile } = await import('fs/promises')
         const buf = await readFile(originalPath)
-        const ext = extname(originalPath).toLowerCase()
-        const mime = ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg' : 'image/png'
-        thumbnailUrl = makeThumbnail(`data:${mime};base64,${buf.toString('base64')}`)
+        thumbnailFile = writeThumbnail(id, nativeImage.createFromBuffer(buf), item.thumbnailFile) ?? thumbnailFile
       } catch { /* leave previous thumbnail rather than blank the card */ }
     }
 
-    return historyStore.update(id, {
+    const updated = historyStore.update(id, {
       annotations: hasAnnotations ? (annotations as HistoryItem['annotations']) : undefined,
       annotatedFilePath,
-      thumbnailUrl,
+      thumbnailFile,
     })
+    return updated && resolveThumbnailUrl(updated)
   })
 
   // Upload a history item's source file to R2 and copy the resulting URL.
@@ -1311,7 +1331,7 @@ app.whenReady().then(async () => {
       historyStore.update(id, { uploads })
       showNotification({
         body: 'Link copied to clipboard',
-        thumbnailDataUrl: item.thumbnailUrl,
+        ...thumbnailNotifyOpts(item),
       })
     }
     return res
@@ -1365,7 +1385,7 @@ app.whenReady().then(async () => {
       historyStore.update(id, { uploads })
       showNotification({
         body: 'Drive link copied to clipboard',
-        thumbnailDataUrl: item.thumbnailUrl,
+        ...thumbnailNotifyOpts(item),
       })
     }
     return res
@@ -1397,7 +1417,7 @@ app.whenReady().then(async () => {
       // source of truth for the full image — dataUrl is never stored.
       if (item && typeof item.dataUrl === 'string' && item.dataUrl.startsWith('data:image/')) {
         const { dataUrl, thumbnailUrl, ...rest } = item
-        item = { ...rest, thumbnailUrl: thumbnailUrl ?? makeThumbnail(dataUrl) }
+        item = { ...rest, thumbnailFile: writeThumbnailFromDataUrl(item.id, thumbnailUrl ?? dataUrl) }
       }
     } catch (err) {
       console.error('[history:addCapture] failed to persist original', err)
@@ -2191,11 +2211,22 @@ app.whenReady().then(async () => {
       const { Readable } = await import('stream')
       const normalized = resolve(normalize(filePath))
       // Same homedir sandbox as file:read — never serve arbitrary disk paths.
-      if (!normalized.startsWith(homedir())) return new Response('Forbidden', { status: 403 })
+      if (!normalized.startsWith(homedir())) {
+        // A refused path is a bug signal (e.g. a profile dir outside the home
+        // directory), not a normal miss - say so instead of failing silently.
+        console.warn('[lumia-media] refused path outside the home directory:', normalized)
+        return new Response('Forbidden', { status: 403 })
+      }
 
       const total = (await stat(normalized)).size
       const ext = extname(normalized).toLowerCase()
-      const contentType = ext === '.mp4' ? 'video/mp4' : ext === '.webm' ? 'video/webm' : 'application/octet-stream'
+      const contentType =
+        ext === '.mp4' ? 'video/mp4' :
+        ext === '.webm' ? 'video/webm' :
+        ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg' :
+        ext === '.png' ? 'image/png' :
+        ext === '.webp' ? 'image/webp' :
+        'application/octet-stream'
 
       const toWeb = (start?: number, end?: number) =>
         Readable.toWeb(createReadStream(normalized, { start, end })) as unknown as ReadableStream<Uint8Array>

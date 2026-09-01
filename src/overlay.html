@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html class="dark" lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Lumia Overlay</title>
+    <!-- Lean entry for the pooled region/window/monitor picker overlays (one
+         BrowserWindow per display, alive for the whole session). It skips the
+         router, the dashboard bundle and the headline font that index.html
+         pulls in — see overlay-main.tsx for what it does load. -->
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="./overlay-main.tsx"></script>
+  </body>
+</html>

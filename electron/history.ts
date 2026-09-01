@@ -3,6 +3,7 @@ import { unlink } from 'fs/promises'
 import { resolve, normalize } from 'path'
 import { homedir } from 'os'
 import type { HistoryItem } from './types'
+import { thumbnailPathFor, writeThumbnailBytesFromDataUrl } from './thumbnail'
 
 export class HistoryStore {
   private store: Store<{ items: HistoryItem[]; cleanupVersion?: number }>
@@ -25,6 +26,32 @@ export class HistoryStore {
       // app at first read.
       clearInvalidConfig: true
     })
+    this.migrateInlineThumbnails()
+  }
+
+  // One-time: rows written before thumbnails moved to files carry the JPEG
+  // inline as a data URL (~16 KB each — 2.5 MB of history.json for 150 rows,
+  // parsed on every read and shipped whole to the Dashboard on every mount).
+  // Write each one out byte for byte (no re-encode) and keep just the file
+  // name. A row whose write fails keeps its data URL, which the renderer
+  // still displays. Synchronous and cheap (~0.2 ms/row), so it runs in the
+  // constructor before anything can read or write the store.
+  private migrateInlineThumbnails(): void {
+    const items = this.readItems()
+    let moved = 0
+    const migrated = items.map(it => {
+      if (it.thumbnailFile || !it.thumbnailUrl?.startsWith('data:')) return it
+      const file = writeThumbnailBytesFromDataUrl(it.id, it.thumbnailUrl)
+      if (!file) return it
+      moved++
+      const next: HistoryItem = { ...it, thumbnailFile: file }
+      delete next.thumbnailUrl
+      return next
+    })
+    if (moved > 0) {
+      this.setItems(migrated)
+      console.log(`[history] moved ${moved} inline thumbnail(s) to files`)
+    }
   }
 
   // Read the items array, preferring the in-memory cache. The cached array is
@@ -149,6 +176,8 @@ export class HistoryStore {
     const paths = [
       opts.originals ? item.filePath : undefined,
       item.annotatedFilePath,
+      // Thumbnails are app-managed artifacts — dropped in every mode.
+      item.thumbnailFile ? thumbnailPathFor(item.thumbnailFile) : undefined,
     ].filter((p): p is string => !!p)
     for (const p of paths) {
       try {
