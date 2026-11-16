@@ -333,8 +333,8 @@ export function setupCapture() {
     try { await dispatchLastCapture() } finally { newCaptureInFlight = false }
   })
 
-  ipcMain.handle('region:confirm', async (_e, payload: { dataUrl: string; rect: { x: number; y: number; width: number; height: number } }) => {
-    const displayId = getOverlayDisplayId()
+  ipcMain.handle('region:confirm', async (e, payload: { dataUrl: string; rect: { x: number; y: number; width: number; height: number } }) => {
+    const displayId = getOverlayDisplayId(e.sender)
     resetOverlayMode()
     closeAllOverlays()
     // No overlay-gone wait — the crop comes from the frozen snapshot, not a
@@ -352,10 +352,10 @@ export function setupCapture() {
   //
   // Windows: HWND lookup via WindowFromPoint, then DIP/physical conversions.
   // macOS:   delegated to the Swift CGWindowList helper (see mac-window-pick.ts).
-  ipcMain.handle('window-pick:get-window-at', async (_e, x: number, y: number) => {
+  ipcMain.handle('window-pick:get-window-at', async (e, x: number, y: number) => {
     if (process.platform === 'darwin') {
       try {
-        const displayId = getOverlayDisplayId()
+        const displayId = getOverlayDisplayId(e.sender, false)
         const allDisplays = screen.getAllDisplays()
         const display = allDisplays.find(d => d.id === displayId) ?? screen.getPrimaryDisplay()
 
@@ -378,7 +378,7 @@ export function setupCapture() {
 
     if (process.platform !== 'win32') return null
     try {
-      const displayId = getOverlayDisplayId()
+      const displayId = getOverlayDisplayId(e.sender, false)
       const allDisplays = screen.getAllDisplays()
       const display = allDisplays.find(d => d.id === displayId) ?? screen.getPrimaryDisplay()
 
@@ -411,8 +411,8 @@ export function setupCapture() {
 
   // Window-pick confirm: crop against the cached physical rect so we don't lose
   // pixels to the DIP→physical round-trip.
-  ipcMain.handle('window-pick:confirm', async (_e, rect: { x: number; y: number; width: number; height: number }) => {
-    const overlayId = getOverlayDisplayId()
+  ipcMain.handle('window-pick:confirm', async (e, rect: { x: number; y: number; width: number; height: number }) => {
+    const overlayId = getOverlayDisplayId(e.sender)
     const cached = lastWindowPickPhysical
     lastWindowPickPhysical = null
     resetOverlayMode()
@@ -490,8 +490,8 @@ export function setupCapture() {
   })
 
   // Monitor-pick: user clicked an overlay → capture that display
-  ipcMain.handle('monitor-pick:confirm', async () => {
-    const displayId = getOverlayDisplayId()
+  ipcMain.handle('monitor-pick:confirm', async (e) => {
+    const displayId = getOverlayDisplayId(e.sender)
     const allDisplays = screen.getAllDisplays()
     const target = allDisplays.find(d => d.id === displayId) ?? screen.getPrimaryDisplay()
     resetOverlayMode()

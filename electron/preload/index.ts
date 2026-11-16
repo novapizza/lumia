@@ -172,6 +172,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Video file actions (operate on saved recording files)
   videoSaveAs:   (filePath: string) => ipcRenderer.invoke('video:save-as', filePath),
   videoCopyFile: (filePath: string) => ipcRenderer.invoke('video:copy-file', filePath),
+  videoTrim: (historyId: string, startMs: number, endMs: number, thumbnailDataUrl?: string) =>
+    ipcRenderer.invoke('video:trim', historyId, startMs, endMs, thumbnailDataUrl),
+  videoClearTrim: (historyId: string, thumbnailDataUrl?: string) =>
+    ipcRenderer.invoke('video:clear-trim', historyId, thumbnailDataUrl),
   videoUploadR2: (filePath: string) => ipcRenderer.invoke('video:upload-r2', filePath),
   videoUploadGoogleDrive: (filePath: string) => ipcRenderer.invoke('video:upload-google-drive', filePath),
 

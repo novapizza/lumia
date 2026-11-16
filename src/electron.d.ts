@@ -122,6 +122,10 @@ declare global {
       // Video file actions (operate on saved recording files)
       videoSaveAs:   (filePath: string) => Promise<{ canceled: boolean; savedPath?: string }>
       videoCopyFile: (filePath: string) => Promise<{ ok: boolean; fallback?: 'text'; error?: string }>
+      /** Lossless trim of a history recording (original kept). Thumbnail is a small JPEG data URL of the new first frame. */
+      videoTrim: (historyId: string, startMs: number, endMs: number, thumbnailDataUrl?: string) => Promise<{ ok: boolean; error?: string; item?: import('./types').HistoryItem | null }>
+      /** Drop the trimmed copy and go back to the original recording. */
+      videoClearTrim: (historyId: string, thumbnailDataUrl?: string) => Promise<{ ok: boolean; error?: string; item?: import('./types').HistoryItem | null }>
       videoUploadR2: (filePath: string) => Promise<import('./types').UploadResult>
       videoUploadGoogleDrive: (filePath: string) => Promise<import('./types').UploadResult>
 

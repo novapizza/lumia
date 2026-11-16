@@ -74,7 +74,20 @@ export interface HistoryItem {
   annotations?: AnnotationObject[]
   // Pixel-flat counterpart of `annotations`, written by the Editor on every
   // committing action (Copy/Share/upload — not Save).
+  // Recordings reuse this field for the trimmed copy, so every "edited copy
+  // if present, else original" consumer picks up the trim automatically.
   annotatedFilePath?: string
+  // Recording only: the applied trim (cut from the original). Absent = untrimmed.
+  trim?: VideoTrim
+}
+
+/** Applied trim on a recording. `startMs`/`endMs` are what the user picked;
+ *  `actualStartMs` is where the lossless cut really begins (the keyframe at
+ *  or before `startMs`). */
+export interface VideoTrim {
+  startMs: number
+  endMs: number
+  actualStartMs: number
 }
 
 /** One sticker within a category. `path` is relative to the stickers base URL

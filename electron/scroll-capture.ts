@@ -1352,7 +1352,7 @@ export function setupScrollCapture(
   mainWindow: BrowserWindow,
   createOverlayWindows: () => void,
   closeAllOverlays: () => void,
-  getOverlayDisplayId: () => number | null,
+  getOverlayDisplayId: (sender?: Electron.WebContents) => number | null,
   restoreFromOverlayCancel: () => void,
 ) {
   scrollDeps = { mainWindow, createOverlayWindows }
@@ -1391,12 +1391,12 @@ export function setupScrollCapture(
   })
 
   // Step 2: Overlay confirms region selection
-  ipcMain.handle('scroll-region:confirm', async (_e, rect: { x: number; y: number; width: number; height: number }) => {
+  ipcMain.handle('scroll-region:confirm', async (e, rect: { x: number; y: number; width: number; height: number }) => {
     // Reset here too: the hotkey path opens the overlay without going through
     // scroll-capture:start, so a previous ESC leaves `cancelled` stuck true and
     // every subsequent capture would abort at frame 0.
     cancelled = false
-    const captureDisplayId = getOverlayDisplayId()
+    const captureDisplayId = getOverlayDisplayId(e.sender)
     resetOverlayMode()
     closeAllOverlays()
 

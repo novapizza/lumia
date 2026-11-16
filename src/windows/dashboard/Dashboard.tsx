@@ -278,7 +278,7 @@ export default function Dashboard() {
   const openItem = async (item: HistoryItem) => {
     if (item.fileMissing) return
     if (item.type === 'recording') {
-      navigate('/editor', { state: { kind: 'video', filePath: item.filePath, name: item.name, historyId: item.id, annotations: item.annotations } })
+      navigate('/editor', { state: { kind: 'video', filePath: item.filePath, trimmedFilePath: item.annotatedFilePath, trim: item.trim, name: item.name, historyId: item.id, annotations: item.annotations } })
       return
     }
     // Load the ORIGINAL file — annotations ride along as vector data and

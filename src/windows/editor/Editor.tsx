@@ -6,11 +6,12 @@ import AnnotationCanvas, {
 } from '../../components/AnnotationCanvas/Canvas'
 import AnnotationToolBar from '../../components/AnnotationCanvas/ToolBar'
 import { matchToolShortcut } from '../../components/AnnotationCanvas/tools'
-import type { WorkflowTemplate, HistoryItem, AnnotationObject } from '../../types'
+import type { WorkflowTemplate, HistoryItem, AnnotationObject, VideoTrim } from '../../types'
 import type { DrawObject, SelectionInfo } from '../../components/AnnotationCanvas/Canvas'
 import StickerPicker, { type PickedSticker } from '../../components/StickerPicker'
 import { deriveActions, type ActionBtn } from '../../lib/workflow-actions'
 import { useLocalVideoUrl } from '../../hooks/useLocalVideoUrl'
+import VideoTrimBar, { MIN_TRIM_SELECTION_MS } from '../../components/VideoTrimBar'
 
 /** Location.state shape accepted by the unified editor. Image mode carries a
  *  dataUrl; video mode carries filePath (+ optional display name). */
@@ -18,6 +19,9 @@ type EditorState = {
   kind?: 'image' | 'video'
   dataUrl?: string
   filePath?: string
+  /** Recording only: applied trimmed copy + its range (from the history row). */
+  trimmedFilePath?: string
+  trim?: VideoTrim
   name?: string
   source?: string
   historyId?: string
@@ -46,6 +50,44 @@ function fixWebmDuration(e: React.SyntheticEvent<HTMLVideoElement>) {
   v.currentTime = 1e101
 }
 
+/** Grab one frame of `src` at `ms` as a small JPEG data URL, for the history
+ *  thumbnail after a trim. Uses a throwaway <video> so the user's playback
+ *  isn't disturbed, draws straight at thumbnail size (never a full-res frame),
+ *  and releases the decoder afterwards. Resolves undefined on any failure —
+ *  the trim still goes ahead with the old thumbnail. */
+function grabVideoFrame(src: string, ms: number, maxWidth = 480): Promise<string | undefined> {
+  return new Promise((resolve) => {
+    const v = document.createElement('video')
+    v.muted = true
+    v.preload = 'auto'
+    let done = false
+    const finish = (out?: string) => {
+      if (done) return
+      done = true
+      clearTimeout(timer)
+      v.removeAttribute('src')
+      v.load() // drop the media pipeline right away
+      resolve(out)
+    }
+    const timer = setTimeout(() => finish(undefined), 5000)
+    v.addEventListener('error', () => finish(undefined), { once: true })
+    v.addEventListener('loadeddata', () => { v.currentTime = Math.max(0, ms / 1000 + 0.05) }, { once: true })
+    v.addEventListener('seeked', () => {
+      try {
+        const k = Math.min(1, maxWidth / (v.videoWidth || maxWidth))
+        const c = document.createElement('canvas')
+        c.width = Math.max(1, Math.round(v.videoWidth * k))
+        c.height = Math.max(1, Math.round(v.videoHeight * k))
+        c.getContext('2d')?.drawImage(v, 0, 0, c.width, c.height)
+        finish(c.toDataURL('image/jpeg', 0.85))
+      } catch {
+        finish(undefined)
+      }
+    }, { once: true })
+    v.src = src
+  })
+}
+
 function relativeTime(ts: number): string {
   const diff = Date.now() - ts
   const mins = Math.floor(diff / 60000)
@@ -70,6 +112,10 @@ export default function Editor() {
   const [imageDataUrl, setImageDataUrl] = useState<string>(initialState.dataUrl ?? '')
   const [videoFilePath, setVideoFilePath] = useState<string>(initialState.filePath ?? '')
   const [videoName, setVideoName]         = useState<string>(initialState.name ?? '')
+  // Trim: the player always shows the ORIGINAL (videoFilePath) so a trim can
+  // be widened again; the trimmed copy is what Save / Copy / Upload send.
+  const [trimmedPath, setTrimmedPath]     = useState<string | undefined>(initialState.trimmedFilePath)
+  const [appliedTrim, setAppliedTrim]     = useState<VideoTrim | undefined>(initialState.trim)
   const [historyId, setHistoryId]         = useState<string | undefined>(initialState.historyId)
   const [initialAnnotations, setInitialAnnotations] = useState<AnnotationObject[] | undefined>(initialState.annotations)
   const isVideo = kind === 'video'
@@ -143,6 +189,52 @@ export default function Editor() {
       height: Math.round(videoNaturalSize.h * k),
     }
   }, [videoNaturalSize, videoContainerSize])
+  // ── Trim state ─────────────────────────────────────────────────────────
+  // durationMs stays 0 until the real (finite) duration is known —
+  // fixWebmDuration may report Infinity first for un-remuxed files.
+  const [durationMs, setDurationMs] = useState(0)
+  const [currentMs, setCurrentMs] = useState(0)
+  const [sel, setSel] = useState<{ start: number; end: number }>({ start: 0, end: 0 })
+  const [trimBusy, setTrimBusy] = useState(false)
+  useEffect(() => { setDurationMs(0); setCurrentMs(0) }, [videoSrc])
+  // (Re)seed the selection from the applied trim once the duration is known.
+  useEffect(() => {
+    if (durationMs <= 0) return
+    setSel(appliedTrim
+      ? { start: Math.min(appliedTrim.startMs, durationMs), end: Math.min(appliedTrim.endMs, durationMs) }
+      : { start: 0, end: durationMs })
+  }, [durationMs, appliedTrim])
+  const onVideoDuration = (e: React.SyntheticEvent<HTMLVideoElement>) => {
+    const d = e.currentTarget.duration
+    if (Number.isFinite(d) && d > 0) setDurationMs(Math.round(d * 1000))
+  }
+  const selIsFull = durationMs > 0 && sel.start <= 0 && sel.end >= durationMs
+  const trimDirty = durationMs > 0 && (appliedTrim
+    ? Math.abs(sel.start - appliedTrim.startMs) > 1 || Math.abs(sel.end - Math.min(appliedTrim.endMs, durationMs)) > 1
+    : !selIsFull)
+  // Keep playback inside the selection (applied or pending).
+  const onVideoTime = (e: React.SyntheticEvent<HTMLVideoElement>) => {
+    const v = e.currentTarget
+    const ms = v.currentTime * 1000
+    setCurrentMs(ms)
+    if (durationMs > 0 && !selIsFull && !v.paused && ms >= sel.end) {
+      v.pause()
+      v.currentTime = sel.end / 1000
+    }
+  }
+  const onVideoPlay = (e: React.SyntheticEvent<HTMLVideoElement>) => {
+    const v = e.currentTarget
+    const ms = v.currentTime * 1000
+    if (durationMs > 0 && !selIsFull && (ms < sel.start - 50 || ms >= sel.end - 50)) {
+      v.currentTime = sel.start / 1000
+    }
+  }
+  const seekVideo = useCallback((ms: number) => {
+    const v = videoRef.current
+    if (v) v.currentTime = ms / 1000
+    setCurrentMs(ms)
+  }, [])
+
   const onVideoMeta = (e: React.SyntheticEvent<HTMLVideoElement>) => {
     fixWebmDuration(e)
     const v = e.currentTarget
@@ -181,6 +273,8 @@ export default function Editor() {
       setKind('video')
       setVideoFilePath(state.filePath ?? '')
       setVideoName(state.name ?? '')
+      setTrimmedPath(state.trimmedFilePath)
+      setAppliedTrim(state.trim)
       setImageDataUrl('')
       canvasRef.current?.clear()
     } else if (state.dataUrl) {
@@ -298,15 +392,17 @@ export default function Editor() {
   // deriveActions) so order and styling stay consistent. Video routes clicks
   // to file-level IPCs since there's no composite frame pipeline.
   const runVideoAction = useCallback(async (btn: ActionBtn) => {
-    if (!videoFilePath) return
+    // Trimmed copy when a trim is applied, else the original recording.
+    const effectivePath = trimmedPath || videoFilePath
+    if (!effectivePath) return
     setActionBusy(btn.key)
     try {
       if (btn.actionType === 'clipboard') {
-        const res = await window.electronAPI?.videoCopyFile?.(videoFilePath)
+        const res = await window.electronAPI?.videoCopyFile?.(effectivePath)
         if (res?.fallback === 'text') showToast('Copied file path (clipboard file copy unsupported here)', 'content_copy')
         else                          showToast('Video copied', 'content_copy')
       } else if (btn.actionType === 'save') {
-        const res = await window.electronAPI?.videoSaveAs?.(videoFilePath)
+        const res = await window.electronAPI?.videoSaveAs?.(effectivePath)
         if (res && !res.canceled && res.savedPath) showToast('Recording saved', 'check_circle')
       } else if (btn.destinationIndex !== undefined) {
         const dest = activeTemplate?.destinations[btn.destinationIndex]
@@ -320,13 +416,13 @@ export default function Editor() {
         if (dest?.type === 'r2') {
           const res = historyId
             ? await window.electronAPI?.shareHistoryR2(historyId)
-            : await window.electronAPI?.videoUploadR2?.(videoFilePath)
+            : await window.electronAPI?.videoUploadR2?.(effectivePath)
           if (res?.success && res.url) showToast('Uploaded — link copied', 'check_circle')
           else                         showToast(res?.error ?? 'Upload failed', 'error', 'error')
         } else if (dest?.type === 'google-drive') {
           const res = historyId
             ? await window.electronAPI?.shareHistoryGoogleDrive(historyId)
-            : await window.electronAPI?.videoUploadGoogleDrive?.(videoFilePath)
+            : await window.electronAPI?.videoUploadGoogleDrive?.(effectivePath)
           if (res?.success && res.url) showToast('Uploaded to Drive — link copied', 'check_circle')
           else                         showToast(res?.error ?? 'Upload failed', 'error', 'error')
         }
@@ -336,7 +432,88 @@ export default function Editor() {
     } finally {
       setActionBusy(null)
     }
-  }, [videoFilePath, activeTemplate, showToast, historyId])
+  }, [videoFilePath, trimmedPath, activeTemplate, showToast, historyId])
+
+  // ── Trim actions ─────────────────────────────────────────────────────────
+  // Only ids + numbers + a ≤480 px JPEG go to main; ffmpeg streams the cut
+  // from disk to disk there. One trim at a time (buttons disabled while busy,
+  // and main rejects overlapping requests).
+  const applyTrim = useCallback(async () => {
+    if (!historyId || trimBusy || durationMs <= 0) return
+    if (sel.end - sel.start < MIN_TRIM_SELECTION_MS) return
+    // Selecting the whole clip again is the same as removing the trim.
+    if (selIsFull && !appliedTrim) return
+    setTrimBusy(true)
+    try {
+      videoRef.current?.pause()
+      const thumb = await grabVideoFrame(videoSrc, selIsFull ? 0 : sel.start)
+      const res = selIsFull
+        ? await window.electronAPI?.videoClearTrim(historyId, thumb)
+        : await window.electronAPI?.videoTrim(historyId, sel.start, sel.end, thumb)
+      if (!res?.ok) { showToast(res?.error ?? 'Trim failed', 'error', 'error'); return }
+      setTrimmedPath(res.item?.annotatedFilePath)
+      setAppliedTrim(res.item?.trim)
+      seekVideo(selIsFull ? 0 : sel.start)
+      showToast(selIsFull ? 'Trim removed' : 'Trimmed — original kept', 'cut')
+    } catch (err: any) {
+      showToast(err?.message ?? 'Trim failed', 'error', 'error')
+    } finally {
+      setTrimBusy(false)
+    }
+  }, [historyId, trimBusy, durationMs, sel, selIsFull, appliedTrim, videoSrc, showToast, seekVideo])
+
+  const resetTrim = useCallback(async () => {
+    if (!historyId || trimBusy) return
+    // Unapplied selection change: just snap the handles back. Only a Reset
+    // with nothing pending removes the applied trim.
+    if (trimDirty) {
+      setSel(appliedTrim
+        ? { start: appliedTrim.startMs, end: Math.min(appliedTrim.endMs, durationMs) }
+        : { start: 0, end: durationMs })
+      return
+    }
+    if (!appliedTrim) return
+    setTrimBusy(true)
+    try {
+      const thumb = await grabVideoFrame(videoSrc, 0)
+      const res = await window.electronAPI?.videoClearTrim(historyId, thumb)
+      if (!res?.ok) { showToast(res?.error ?? 'Reset failed', 'error', 'error'); return }
+      setTrimmedPath(undefined)
+      setAppliedTrim(undefined)
+      showToast('Trim removed', 'undo')
+    } catch (err: any) {
+      showToast(err?.message ?? 'Reset failed', 'error', 'error')
+    } finally {
+      setTrimBusy(false)
+    }
+  }, [historyId, trimBusy, trimDirty, appliedTrim, durationMs, videoSrc, showToast])
+
+  // I / O set the selection edge at the playhead; Space plays/pauses (skipped
+  // when the native player or a button has focus — they handle Space already).
+  useEffect(() => {
+    if (!isVideo || !historyId || durationMs <= 0) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.ctrlKey || e.metaKey || e.altKey || trimBusy) return
+      const t = e.target as HTMLElement | null
+      if (t?.closest?.('input, textarea, [contenteditable="true"]')) return
+      const v = videoRef.current
+      if (!v) return
+      const now = Math.round(v.currentTime * 1000)
+      const k = e.key.toLowerCase()
+      if (k === 'i') {
+        e.preventDefault()
+        setSel(s => ({ start: Math.max(0, Math.min(now, s.end - MIN_TRIM_SELECTION_MS)), end: s.end }))
+      } else if (k === 'o') {
+        e.preventDefault()
+        setSel(s => ({ start: s.start, end: Math.min(durationMs, Math.max(now, s.start + MIN_TRIM_SELECTION_MS)) }))
+      } else if (e.key === ' ' && !t?.closest?.('video, button')) {
+        e.preventDefault()
+        if (v.paused) void v.play(); else v.pause()
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [isVideo, historyId, durationMs, trimBusy])
 
   // Debounce timer for auto-saving annotation JSON as the user draws. Full
   // saves (with the flattened PNG sidecar + fresh thumbnail) happen on every
@@ -663,7 +840,7 @@ export default function Editor() {
             onClick={() => isVideo
               ? runVideoAction(btn)
               : triggerAction(btn.key, btn.templateId, btn.destinationIndex, btn.actionType)}
-            disabled={!!actionBusy || (isVideo && !videoFilePath)}
+            disabled={!!actionBusy || trimBusy || (isVideo && !videoFilePath)}
             title={btn.label}
             className={`h-7 px-2.5 rounded-lg flex items-center gap-1.5 transition-all flex-shrink-0 disabled:opacity-40 text-[11px] font-semibold ${
               actionBusy === btn.key
@@ -705,6 +882,9 @@ export default function Editor() {
                   playsInline
                   preload="auto"
                   onLoadedMetadata={onVideoMeta}
+                  onDurationChange={onVideoDuration}
+                  onTimeUpdate={onVideoTime}
+                  onPlay={onVideoPlay}
                   style={
                     videoDisplaySize
                       ? { width: videoDisplaySize.width, height: videoDisplaySize.height }
@@ -808,8 +988,25 @@ export default function Editor() {
         </div>
       )}
 
-      {/* No playback bar — the native HTML5 <video controls> provides
-           play/pause/seek/volume without any custom UI. */}
+      {/* Trim bar — recordings opened from history only (the trim lives on
+           the history row). Playback itself stays on native <video controls>. */}
+      {isVideo && historyId && durationMs > 0 && (
+        <VideoTrimBar
+          durationMs={durationMs}
+          currentMs={currentMs}
+          startMs={sel.start}
+          endMs={sel.end}
+          onChange={(start, end) => setSel({ start, end })}
+          onSeek={seekVideo}
+          dirty={trimDirty}
+          hasAppliedTrim={!!appliedTrim}
+          snappedMs={appliedTrim ? appliedTrim.startMs - appliedTrim.actualStartMs : 0}
+          busy={trimBusy}
+          disabled={!!actionBusy}
+          onApply={applyTrim}
+          onReset={resetTrim}
+        />
+      )}
 
     </div>
   )
