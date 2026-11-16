@@ -1,5 +1,5 @@
 import { app, BrowserWindow, clipboard, desktopCapturer, dialog, ipcMain, screen } from 'electron'
-import { basename, dirname, extname, join } from 'path'
+import { basename, dirname, extname, join, normalize, resolve as resolvePath } from 'path'
 import { homedir } from 'os'
 import type { WriteStream } from 'fs'
 import {
@@ -20,12 +20,12 @@ import { resetOverlayMode, setOverlayMode } from './scroll-capture'
 import { showNotification } from './notify'
 import { getSettings, resolveSaveStartDir, rememberSaveDir } from './settings'
 import { localTimestamp } from './utils'
-import { writeThumbnailFromDataUrl } from './thumbnail'
+import { writeThumbnailFromDataUrl, resolveThumbnailUrl } from './thumbnail'
 import { openAnnotation, closeAnnotation, destroyAnnotation, isAnnotationOpen, setupAnnotation } from './annotation'
 import { forceWindowsExcludeFromCapture } from './native-input'
 import { getSinglePickTarget } from './window-list'
 import { getWatermarkLogoDataUrl } from './watermark'
-import { remuxWebmInPlace } from './ffmpeg-remux'
+import { remuxWebmInPlace, trimWebm, isTrimRunning } from './ffmpeg-remux'
 
 const HIDE_DELAY_MS = process.platform === 'darwin' ? 250 : 200
 const OVERLAY_GONE_DELAY_MS = 120
@@ -778,6 +778,28 @@ export function requestStop() {
 
 // ── Action IPC: Save / Copy / Upload for an existing video file ──────────
 
+/** Shortest trim we accept — anything below is almost certainly a misclick. */
+const MIN_TRIM_MS = 500
+/** Free space required on top of the original's size before trimming. */
+const DISK_HEADROOM_BYTES = 50 * 1024 * 1024
+
+/** Best-effort delete of a superseded trimmed file. On Windows an open handle
+ *  (e.g. an upload still streaming it) makes unlink fail with EBUSY/EPERM, so
+ *  retry once later instead of leaving it behind. Bounded to the home dir. */
+async function removeTrimmedFile(path: string, retry = true): Promise<void> {
+  const target = resolvePath(normalize(path))
+  if (!target.startsWith(homedir())) return
+  const { unlink } = await import('fs/promises')
+  try {
+    await unlink(target)
+  } catch (err: unknown) {
+    const code = (err as NodeJS.ErrnoException)?.code
+    if (code === 'ENOENT') return
+    if (retry) setTimeout(() => { void removeTrimmedFile(path, false) }, 60_000)
+    else console.error('[video:trim] could not remove old trimmed file', target, err)
+  }
+}
+
 export function setupVideoActions() {
   /** Save-As dialog, then copy the recording file to the chosen path. The
    *  original at ~/Pictures/Lumia/ is untouched — this creates a copy. */
@@ -833,6 +855,87 @@ export function setupVideoActions() {
       clipboard.writeText(filePath)
       return { ok: true, fallback: 'text', error: err?.message ?? String(err) }
     }
+  })
+
+  // ── Trim ──────────────────────────────────────────────────────────────
+  // Non-destructive: the original recording is never touched. The trimmed
+  // copy is stored in `annotatedFilePath` (same "edited copy" slot images use),
+  // so Share / Save-As / Copy / delete cleanup pick it up with no extra wiring.
+  // Only ids + numbers + a small thumbnail cross IPC — never file contents.
+
+  ipcMain.handle('video:trim', async (_e, historyId: string, startMs: number, endMs: number, thumbnailDataUrl?: string) => {
+    if (typeof historyId !== 'string' || !Number.isFinite(startMs) || !Number.isFinite(endMs)) {
+      return { ok: false, error: 'Invalid trim request' }
+    }
+    startMs = Math.max(0, Math.round(startMs))
+    endMs = Math.round(endMs)
+    if (endMs - startMs < MIN_TRIM_MS) return { ok: false, error: 'Selection is too short' }
+    if (isTrimRunning()) return { ok: false, error: 'Another trim is already running' }
+
+    const store = getHistoryStore()
+    const item = store?.getAll().find(i => i.id === historyId)
+    if (!store || !item) return { ok: false, error: 'Recording not found' }
+    if (item.type !== 'recording' || !item.filePath) return { ok: false, error: 'Not a recording' }
+    const original = resolvePath(normalize(item.filePath))
+    if (!original.startsWith(homedir())) return { ok: false, error: 'Access denied' }
+
+    const { stat, statfs } = await import('fs/promises')
+    let originalSize: number
+    try {
+      originalSize = (await stat(original)).size
+    } catch {
+      return { ok: false, error: 'Original recording is missing on disk' }
+    }
+    // The trimmed copy is at most the size of the original. Refuse up front
+    // rather than fill the disk and fail half-way.
+    try {
+      const fsInfo = await statfs(dirname(original))
+      const free = Number(fsInfo.bavail) * Number(fsInfo.bsize)
+      if (free < originalSize + DISK_HEADROOM_BYTES) return { ok: false, error: 'Not enough free disk space to trim' }
+    } catch { /* statfs unsupported here — let ffmpeg report a real failure */ }
+
+    // Fresh name per trim: the previous trimmed file may still be held open
+    // (an upload streaming it, Explorer preview) and Windows can't replace an
+    // open file. The old one is removed after the new one is in place.
+    const ext = extname(original) || '.webm'
+    const stem = basename(original, ext)
+    const dst = join(dirname(original), `${stem}-trimmed-${Date.now().toString(36)}${ext}`)
+
+    const res = await trimWebm(original, dst, startMs, endMs)
+    if (!res.ok) return { ok: false, error: res.error ?? 'Trim failed' }
+
+    // Where the cut really starts: output length minus what was asked for is
+    // how far back the keyframe snap went.
+    const requested = endMs - startMs
+    const snapMs = res.outputDurationMs != null ? Math.max(0, res.outputDurationMs - requested) : 0
+    const actualStartMs = Math.max(0, startMs - snapMs)
+
+    const fresh = store.getAll().find(i => i.id === historyId) ?? item
+    const updated = store.update(historyId, {
+      annotatedFilePath: dst,
+      trim: { startMs, endMs, actualStartMs },
+      // Cached links point at the untrimmed file — drop them so the next
+      // Share uploads the trimmed clip and returns a new link.
+      uploads: [],
+      thumbnailFile: writeThumbnailFromDataUrl(historyId, thumbnailDataUrl, fresh.thumbnailFile) ?? fresh.thumbnailFile,
+    })
+    if (fresh.annotatedFilePath && fresh.annotatedFilePath !== dst) void removeTrimmedFile(fresh.annotatedFilePath)
+    return { ok: true, item: updated && resolveThumbnailUrl(updated) }
+  })
+
+  ipcMain.handle('video:clear-trim', async (_e, historyId: string, thumbnailDataUrl?: string) => {
+    const store = getHistoryStore()
+    const item = store?.getAll().find(i => i.id === historyId)
+    if (!store || !item) return { ok: false, error: 'Recording not found' }
+    if (item.type !== 'recording') return { ok: false, error: 'Not a recording' }
+    const updated = store.update(historyId, {
+      annotatedFilePath: undefined,
+      trim: undefined,
+      uploads: [],
+      thumbnailFile: writeThumbnailFromDataUrl(historyId, thumbnailDataUrl, item.thumbnailFile) ?? item.thumbnailFile,
+    })
+    if (item.annotatedFilePath) void removeTrimmedFile(item.annotatedFilePath)
+    return { ok: true, item: updated && resolveThumbnailUrl(updated) }
   })
 
   /** Upload the raw video file to R2. Content-addressable key keeps uploads

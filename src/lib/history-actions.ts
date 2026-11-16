@@ -19,8 +19,10 @@ export async function copyHistoryItem(
   // Video: copy the file reference to clipboard (file on Win/Mac, path on
   // Linux). Image: copy the pixels via the builtin-clipboard workflow.
   if (item.type === 'recording') {
-    if (!item.filePath) return { ok: false, error: 'No source file' }
-    const res = await window.electronAPI?.videoCopyFile?.(item.filePath)
+    // Trimmed copy (stored in annotatedFilePath) when present, else original.
+    const videoPath = item.annotatedFilePath ?? item.filePath
+    if (!videoPath) return { ok: false, error: 'No source file' }
+    const res = await window.electronAPI?.videoCopyFile?.(videoPath)
     return { ok: !!res?.ok, error: res?.error }
   }
   let dataUrl: string | null | undefined = item.dataUrl

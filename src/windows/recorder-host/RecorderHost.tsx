@@ -22,6 +22,8 @@ const VIDEO_QUALITY_FACTOR = 0.25
 const VIDEO_BITRATE_CAP = 50_000_000
 const VIDEO_BITRATE_FLOOR = 4_000_000
 const AUDIO_BITRATE = 192_000
+/** Keyframe spacing requested from MediaRecorder — bounds trim snapping (see onBegin). */
+const KEYFRAME_INTERVAL_MS = 1000
 // Region/window crops smaller than this (long-side, physical px) get
 // uniformly upscaled to this baseline at draw time. Two reasons:
 //   1. Players viewing the recording at full-screen or in the editor pane
@@ -210,11 +212,17 @@ export default function RecorderHost() {
       const videoBitsPerSecond = computeVideoBitrate(outW, outH, TARGET_FPS)
 
       const hasAudio = out.getAudioTracks().length > 0
-      const recorder = new MediaRecorder(out, {
+      const options: MediaRecorderOptions & { videoKeyFrameIntervalDuration?: number } = {
         mimeType: mime,
         videoBitsPerSecond,
+        // A keyframe every second keeps the lossless trim (ffmpeg -c copy,
+        // which can only start a clip on a keyframe) accurate to ~1 s.
+        // Chromium's default can space keyframes very far apart. Not in TS's
+        // DOM lib yet; browsers that don't know it ignore it.
+        videoKeyFrameIntervalDuration: KEYFRAME_INTERVAL_MS,
         ...(hasAudio ? { audioBitsPerSecond: AUDIO_BITRATE } : {}),
-      })
+      }
+      const recorder = new MediaRecorder(out, options)
       recorder.ondataavailable = (e) => { if (e.data.size > 0) chunksRef.current.push(e.data) }
       recorder.onstop = finalizeRecording
       recorder.start(1000)

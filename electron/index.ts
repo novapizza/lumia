@@ -278,6 +278,8 @@ export async function openHistoryItemInEditor(
     state = {
       kind: 'video',
       filePath: item.filePath,
+      trimmedFilePath: item.annotatedFilePath,
+      trim: item.trim,
       name: item.name ?? (item.filePath ? basename(item.filePath) : 'Recording'),
       historyId: item.id,
       annotations: item.annotations,

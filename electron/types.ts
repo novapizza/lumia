@@ -84,5 +84,11 @@ export interface HistoryItem {
   // every saveHistoryAnnotations call that carries a flattened dataUrl, so
   // surfaces outside the Editor (Dashboard Share/Copy, thumbnail) operate
   // on the annotated version without re-running Konva.
+  // Recordings reuse this field for the trimmed copy (see video:trim), so
+  // Share / Save-As / delete cleanup all pick it up with no extra wiring.
   annotatedFilePath?: string
+  // Recording only: the applied trim, always cut from `filePath` (the
+  // untouched original). `actualStartMs` is where the lossless cut really
+  // begins — the keyframe at or before `startMs`.
+  trim?: { startMs: number; endMs: number; actualStartMs: number }
 }
