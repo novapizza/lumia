@@ -468,6 +468,29 @@ export default function Editor() {
     setExportTrigger((n) => n + 1)
   }
 
+  // Cmd/Ctrl+C copies the *annotated* image, same as the Copy button. Without
+  // this the chord fell through to the menu's role:'copy' (a no-op with no DOM
+  // text selected), and the clipboard kept the raw screenshot that capture.ts
+  // auto-copies at capture time — so pasting dropped every drawing/text.
+  const triggerActionRef = useRef(triggerAction)
+  triggerActionRef.current = triggerAction
+  useEffect(() => {
+    if (isVideo) return
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey) return
+      if (e.key.toLowerCase() !== 'c' || e.repeat) return
+      // Let native copy work while typing in a text annotation / input, or
+      // when the user has deliberately selected DOM text.
+      if ((e.target as HTMLElement | null)?.closest?.('textarea, input, [contenteditable="true"]')) return
+      if (window.getSelection()?.toString()) return
+      if (actionBusy) return
+      e.preventDefault()
+      triggerActionRef.current('clipboard', activeTemplate?.id ?? '', undefined, 'clipboard')
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [isVideo, actionBusy, activeTemplate])
+
   const handleHistoryChange = useCallback((u: boolean, r: boolean, userEdited?: boolean) => {
     setCanUndo(u)
     setCanRedo(r)
