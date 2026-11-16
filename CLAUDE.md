@@ -28,7 +28,7 @@ Headline features:
 
 `postinstall` runs `node node_modules/electron/install.js && electron-builder install-app-deps`. As of Electron 42 the `electron` package no longer downloads its binary via its own postinstall script (it would otherwise download lazily on first launch), so we fetch it explicitly — otherwise `electron-vite dev` fails with `Error: Electron uninstall`. `preinstall` enforces pnpm.
 
-There is **no test framework, linter, or formatter** configured. Type-check via `pnpm build` (note: electron-vite uses esbuild and does **not** type-check — run `tsc --noEmit -p tsconfig.node.json` / `-p tsconfig.web.json` for a real type-check).
+There is **no test framework, linter, or formatter** configured. Type-check via `pnpm build` (note: electron-vite 6 / Vite 8 transpiles with Oxc + Rolldown and does **not** type-check — run `tsc --noEmit -p tsconfig.node.json` / `-p tsconfig.web.json` for a real type-check).
 
 > If `pnpm dev` crashes at startup with `require('electron')` returning a path / `app` undefined, or a V8 `snapshot_data() != nullptr` assertion, check that `ELECTRON_RUN_AS_NODE` is **not** set in your environment — when present (even empty) it makes the Electron binary run as plain Node.
 >
