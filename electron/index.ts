@@ -205,7 +205,26 @@ export function getOverlayWindow() {
   if (activeOverlayDisplayId == null) return null
   return overlayWindows.get(activeOverlayDisplayId) ?? null
 }
-export function getOverlayDisplayId() { return activeOverlayDisplayId }
+/** Display the overlay session is targeting. Pass the IPC `e.sender` from a
+ *  confirm handler: the display is then resolved from the overlay window that
+ *  SENT the rect, which is authoritative. The global active id alone is racy —
+ *  the overlay releases its `overlay:drawing` lock on mouseup and only then
+ *  sends the confirm, so the 100 ms cursor poll can flip the active display in
+ *  between (drag ending on/near the neighbouring monitor) and the rect would be
+ *  applied to the wrong display. */
+export function getOverlayDisplayId(sender?: Electron.WebContents, warnOnMismatch = true): number | null {
+  if (sender) {
+    for (const [displayId, win] of overlayWindows) {
+      if (!win.isDestroyed() && win.webContents === sender) {
+        if (warnOnMismatch && displayId !== activeOverlayDisplayId) {
+          console.warn(`[overlay] confirm from display ${displayId} while active was ${activeOverlayDisplayId} — using sender's display`)
+        }
+        return displayId
+      }
+    }
+  }
+  return activeOverlayDisplayId
+}
 
 export function broadcastToOverlays(channel: string, ...args: unknown[]) {
   for (const [, win] of overlayWindows) {
