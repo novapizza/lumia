@@ -42,11 +42,9 @@ module.exports = {
 
   files: [
     'out/**/*',
-    // ffmpeg-static ships an ~80 MB host-arch binary used only in dev. Packaged
-    // builds get the correct per-arch ffmpeg placed in Resources by the
-    // afterPack hook (build/embed-ffmpeg.cjs), so drop the bundled one.
-    '!**/ffmpeg-static/ffmpeg',
-    '!**/ffmpeg-static/ffmpeg.exe',
+    // (ffmpeg-static is a devDependency — its GPL binary + package never reach
+    // the app. Packaged builds get the minimal LGPL ffmpeg in Resources from
+    // the afterPack hook, build/embed-ffmpeg.cjs.)
     // koffi prebuilds a koffi.node for 18 platforms (~26 MB total). We only ever
     // package Windows x64 and macOS x64/arm64, so the other ~15 are dead weight
     // shipped in (and asarUnpacked from) every installer. Keep only the three
@@ -63,6 +61,8 @@ module.exports = {
     { from: 'resources/icons/png/icon.png', to: 'icons/png/icon.png' },
     { from: 'resources/icon.png', to: 'icon.png' },
     { from: 'resources/picker.html', to: 'picker.html' },
+    // LGPL notice + licence text for the bundled ffmpeg (required to ship it).
+    { from: 'resources/licenses', to: 'licenses' },
     // Companion browser extension for the Scroll capture "Browser Extension"
     // method — users load it unpacked from Resources/extension (the
     // scroll-extension:open-folder IPC opens this directory for them).

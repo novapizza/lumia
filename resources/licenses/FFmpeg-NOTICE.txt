@@ -1,0 +1,39 @@
+FFmpeg notice
+=============
+
+Lumia includes FFmpeg (https://ffmpeg.org), which it uses only to repair and
+cut its own screen recordings (WebM container remux, no re-encoding).
+
+FFmpeg is licensed under the GNU Lesser General Public License version 2.1 or
+later (LGPL v2.1+). The full licence text is in FFmpeg-LGPL-2.1.txt, next to
+this file. FFmpeg is a trademark of Fabrice Bellard, originator of the FFmpeg
+project. Lumia is not affiliated with or endorsed by the FFmpeg project.
+
+What is shipped
+---------------
+- FFmpeg version 6.1.1, unmodified, as a separate program:
+    Windows: resources\ffmpeg.exe
+    macOS:   Lumia.app/Contents/Resources/ffmpeg
+  Lumia runs it as a child process; it is not linked into Lumia. You may
+  replace it with your own build of FFmpeg.
+- Built LGPL-only: without --enable-gpl, --enable-nonfree or --enable-version3,
+  and without any external library (--disable-autodetect).
+- Configure options (besides compiler / target settings):
+    --disable-autodetect --disable-network --disable-doc --disable-debug
+    --disable-shared --enable-static --enable-small --disable-ffplay
+    --disable-ffprobe --disable-avdevice --disable-swscale --disable-swresample
+    --disable-postproc --disable-encoders --disable-decoders --disable-filters
+    --disable-devices --disable-bsfs
+    --disable-parsers --enable-parser=vp8,vp9,opus,vorbis
+    --disable-demuxers --enable-demuxer=matroska
+    --disable-muxers --enable-muxer=webm,matroska
+    --disable-protocols --enable-protocol=file,pipe
+  Running `ffmpeg -version` prints the exact configuration of the shipped file.
+
+Source code
+-----------
+The complete corresponding source code is the official FFmpeg 6.1.1 release:
+    https://ffmpeg.org/releases/ffmpeg-6.1.1.tar.xz
+    SHA-256: 8684f4b00f94b85461884c3719382f1261f0d9eb3d59640a1f4ac0873616f968
+built with the scripts build-minimal-ffmpeg-win.sh / build-minimal-ffmpeg-mac.sh
+using the options above.
