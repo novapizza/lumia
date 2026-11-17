@@ -7,10 +7,13 @@ import { resolve } from 'path'
 // `build.externalizeDeps` (the old externalizeDepsPlugin is deprecated).
 // uuid (v14+) and electron-store (v9+) are pure ESM — exclude them so they get
 // bundled into the CJS main output instead of being emitted as require()s.
+// ffmpeg-static is a devDependency (GPL — must never ship) that main only
+// require()s in dev, so it's listed in `include` to stay an external require
+// (dev resolves it from node_modules) instead of being inlined into the bundle.
 export default defineConfig({
   main: {
     build: {
-      externalizeDeps: { exclude: ['uuid', 'electron-store'] },
+      externalizeDeps: { exclude: ['uuid', 'electron-store'], include: ['ffmpeg-static'] },
       lib: {
         entry: resolve(__dirname, 'electron/index.ts')
       }

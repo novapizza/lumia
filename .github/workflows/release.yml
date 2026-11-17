@@ -62,8 +62,8 @@ jobs:
         run: bash build/compile-mac-helpers.sh
 
       # Minimal matroska-only ffmpeg for both arches (see
-      # build/build-minimal-ffmpeg-mac.sh) — embed-ffmpeg.cjs picks these up
-      # per-arch over the full ~78 MB ffmpeg-static download. macos-latest is
+      # build/build-minimal-ffmpeg-mac.sh) — embed-ffmpeg.cjs requires these
+      # per arch (LGPL-only; packaging fails without them). macos-latest is
       # arm64, so the x64 binary is cross-compiled via `clang -arch x86_64`.
       - name: Build minimal ffmpeg (arm64 + x64)
         run: |
@@ -158,8 +158,8 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # embed-ffmpeg.cjs (afterPack) looks here before falling back to the full
-      # ffmpeg-static download — see resolveMinimalWinFfmpeg().
+      # embed-ffmpeg.cjs (afterPack) requires it here — there is no fallback
+      # (ffmpeg-static is GPL) — see resolveMinimalWinFfmpeg().
       - name: Download minimal ffmpeg
         uses: actions/download-artifact@v8
         with:
