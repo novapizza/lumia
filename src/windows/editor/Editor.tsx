@@ -55,6 +55,11 @@ function fixWebmDuration(e: React.SyntheticEvent<HTMLVideoElement>) {
  *  isn't disturbed, draws straight at thumbnail size (never a full-res frame),
  *  and releases the decoder afterwards. Resolves undefined on any failure —
  *  the trim still goes ahead with the old thumbnail. */
+/** One frame at the recorder's target rate (RecorderHost TARGET_FPS = 60).
+ *  Screen recordings are variable-frame-rate, so on a static screen a step
+ *  can land on the same picture — the playhead readout still moves. */
+const FRAME_MS = 1000 / 60
+
 function grabVideoFrame(src: string, ms: number, maxWidth = 480): Promise<string | undefined> {
   return new Promise((resolve) => {
     const v = document.createElement('video')
@@ -451,10 +456,20 @@ export default function Editor() {
         ? await window.electronAPI?.videoClearTrim(historyId, thumb)
         : await window.electronAPI?.videoTrim(historyId, sel.start, sel.end, thumb)
       if (!res?.ok) { showToast(res?.error ?? 'Trim failed', 'error', 'error'); return }
-      setTrimmedPath(res.item?.annotatedFilePath)
+      const trimmedFile = res.item?.annotatedFilePath
+      setTrimmedPath(trimmedFile)
       setAppliedTrim(res.item?.trim)
       seekVideo(selIsFull ? 0 : sel.start)
-      showToast(selIsFull ? 'Trim removed' : 'Trimmed — original kept', 'cut')
+      if (selIsFull || !trimmedFile) {
+        showToast(selIsFull ? 'Trim removed' : 'Trimmed — original kept', 'cut')
+      } else {
+        // Put the trimmed clip straight on the clipboard so it can be pasted
+        // into chat / Explorer / Finder without another click. A clipboard
+        // failure doesn't undo the trim — just say so.
+        const copy = await window.electronAPI?.videoCopyFile?.(trimmedFile).catch(() => undefined)
+        if (copy?.ok && copy.fallback !== 'text') showToast('Trimmed — clip copied to clipboard', 'content_copy')
+        else showToast('Trimmed — original kept (could not copy clip)', 'cut')
+      }
     } catch (err: any) {
       showToast(err?.message ?? 'Trim failed', 'error', 'error')
     } finally {
@@ -490,6 +505,9 @@ export default function Editor() {
 
   // I / O set the selection edge at the playhead; Space plays/pauses (skipped
   // when the native player or a button has focus — they handle Space already).
+  // ←/→ step one frame, Shift+←/→ ten. Listened in the capture phase so a
+  // focused native <video> doesn't also run its own ±5 s arrow-key seek
+  // (Blink skips an element's default handler once defaultPrevented).
   useEffect(() => {
     if (!isVideo || !historyId || durationMs <= 0) return
     const onKey = (e: KeyboardEvent) => {
@@ -506,14 +524,23 @@ export default function Editor() {
       } else if (k === 'o') {
         e.preventDefault()
         setSel(s => ({ start: s.start, end: Math.min(durationMs, Math.max(now, s.start + MIN_TRIM_SELECTION_MS)) }))
+      } else if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+        e.preventDefault()
+        e.stopPropagation()
+        v.pause()
+        const dir = e.key === 'ArrowRight' ? 1 : -1
+        const step = (e.shiftKey ? 10 : 1) * FRAME_MS * dir
+        // Read currentTime (not React state) so held / rapid presses
+        // accumulate even before the seek lands and timeupdate fires.
+        seekVideo(Math.min(durationMs, Math.max(0, v.currentTime * 1000 + step)))
       } else if (e.key === ' ' && !t?.closest?.('video, button')) {
         e.preventDefault()
         if (v.paused) void v.play(); else v.pause()
       }
     }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [isVideo, historyId, durationMs, trimBusy])
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
+  }, [isVideo, historyId, durationMs, trimBusy, seekVideo])
 
   // Debounce timer for auto-saving annotation JSON as the user draws. Full
   // saves (with the flattened PNG sidecar + fresh thumbnail) happen on every
@@ -992,6 +1019,7 @@ export default function Editor() {
            the history row). Playback itself stays on native <video controls>. */}
       {isVideo && historyId && durationMs > 0 && (
         <VideoTrimBar
+          videoSrc={videoSrc}
           durationMs={durationMs}
           currentMs={currentMs}
           startMs={sel.start}
