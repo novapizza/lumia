@@ -2,7 +2,7 @@ import { desktopCapturer, ipcMain, screen, nativeImage, clipboard, app } from 'e
 import { homedir } from 'os'
 import { join } from 'path'
 import { getMainWindow, createOverlayWindows, closeAllOverlays, getHistoryStore, getOverlayDisplayId, getOverlayWindow, broadcastToOverlays, restoreFromOverlayCancel, waitForViewMounted, openHistoryItemInEditor, isMainDismissed } from './index'
-import { getWindowAtPointPhysical, focusOwnWindowForeground } from './native-input'
+import { getWindowAtPointPhysical, focusOwnWindowForeground, waitForDwmFrames } from './native-input'
 import { getMacWindowAtPoint } from './mac-window-pick'
 import { resolveWin32PickRect, resolveMacPickRect, getSinglePickTarget, getActivePickTarget, PickTarget } from './window-list'
 import { setOverlayMode, resetOverlayMode, getOverlayMode } from './scroll-capture'
@@ -17,6 +17,7 @@ import { convertBgraToSrgbInPlace } from './icc-to-srgb'
 import { tagPngWithIcc } from './png-icc'
 import { captureDisplayNative, type NativeCapture } from './native-screen'
 import { macSnapAvailable } from './mac-screen-snap'
+import { traceBegin, traceMark } from './capture-trace'
 import { pickCornerRadiusPhys, maskCornersInPlace } from './rounded-corners'
 
 /** Canonical folder for original captures (both images and videos). Not
@@ -96,6 +97,18 @@ function hideMainWindow(): Promise<void> {
     if (process.platform === 'darwin' && macSnapAvailable()) {
       hideWaitSkipped = true
       resolve()
+      return
+    }
+    // Windows: main has DWM transitions disabled (no fade-out), so it is off
+    // the screen as soon as DWM presents the next composition. Wait for that
+    // directly instead of a flat 200 ms — two flushes (~16–33 ms at 60 Hz)
+    // for margin — and keep the fixed delay as the cap / fallback when
+    // DwmFlush is unavailable.
+    if (process.platform === 'win32') {
+      let done = false
+      const finish = () => { if (!done) { done = true; resolve() } }
+      setTimeout(finish, HIDE_DELAY_MS)
+      void waitForDwmFrames(2).then(ok => { if (ok) finish() })
       return
     }
     setTimeout(resolve, HIDE_DELAY_MS)
@@ -197,7 +210,11 @@ async function freezeAllDisplays(): Promise<void> {
   const fallbackDisplays: Electron.Display[] = []
   await Promise.all(allDisplays.map(async d => {
     const nat: NativeCapture | null = await captureDisplayNative(d, { includeSelf })
-    if (nat) frozenImages.set(d.id, await toSrgbFrame(nat.image, nat.raw, d.id))
+    traceMark(`grab ${d.id}`)
+    if (nat) {
+      frozenImages.set(d.id, await toSrgbFrame(nat.image, nat.raw, d.id))
+      traceMark(`srgb ${d.id}`)
+    }
     else fallbackDisplays.push(d)
   }))
   if (fallbackDisplays.length === 0) return
@@ -639,8 +656,10 @@ async function captureWindowTarget(target: PickTarget): Promise<string> {
 }
 
 async function captureWindow(): Promise<void> {
+  traceBegin('window')
   setOverlayMode('window-pick')
   await hideMainWindow()
+  traceMark('hide')
   try {
     // Freeze and the window-list query are independent (the query reads window
     // rects, not pixels) — run them concurrently. On macOS the list goes
@@ -651,6 +670,7 @@ async function captureWindow(): Promise<void> {
     // outright instead of surfacing the picker. The freeze already banked the
     // pixels, so this is the same crop a click would produce.
     const [, single] = await Promise.all([freezeAllDisplays(), getSinglePickTarget(includeSelfInCapture())])
+    traceMark('freeze+list')
     if (single) {
       resetOverlayMode()
       await captureWindowTarget(single)
@@ -670,9 +690,12 @@ async function captureWindow(): Promise<void> {
 }
 
 async function captureRegion(): Promise<void> {
+  traceBegin('region')
   await hideMainWindow()
+  traceMark('hide')
   try {
     await freezeAllDisplays()
+    traceMark('freeze')
     createOverlayWindows()
   } catch (err) {
     console.error('[capture] region startup failed', err)
@@ -840,10 +863,13 @@ async function captureActiveMonitor(): Promise<string | void> {
   }
 
   // Multiple displays → show overlays, let the user click one.
+  traceBegin('monitor')
   setOverlayMode('monitor-pick')
   await hideMainWindow()
+  traceMark('hide')
   try {
     await freezeAllDisplays()
+    traceMark('freeze')
     createOverlayWindows()
   } catch (err) {
     console.error('[capture] monitor-pick startup failed', err)

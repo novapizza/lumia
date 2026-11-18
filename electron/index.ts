@@ -3,6 +3,7 @@ import { join, dirname } from 'path'
 import fs from 'fs/promises'
 import { setupCapture, ORIGINALS_DIR, getFrozenBgrForDisplay, prewarmDesktopCapturer } from './capture'
 import { prewarmNativeCapture } from './native-screen'
+import { traceMark, traceExpect, traceSettle, traceFlush } from './capture-trace'
 import { prewarmMacWindowPick } from './mac-window-pick'
 import { setupMemoryLogging, labelWebContents, logMilestone } from './mem-metrics'
 import { getIccFromPng, tagPngWithIcc } from './png-icc'
@@ -686,6 +687,7 @@ function revealOverlayWhenBgReady(win: BrowserWindow, displayId: number, isActiv
     clearTimeout(timer)
     ipcMain.off('overlay:bg-ready', handler)
     if (win.isDestroyed() || !overlayWindows.has(displayId)) return
+    traceSettle(`reveal ${displayId}`)
     if (isActive) {
       win.setIgnoreMouseEvents(false)
       // Bring to top + grab keyboard focus so the renderer's ESC handler
@@ -734,6 +736,7 @@ export function createOverlayWindows(): Map<number, BrowserWindow> {
   }
 
   const currentMode = getOverlayMode()
+  let pendingReveals = 0
 
   for (const display of allDisplays) {
     const win = overlayPool.get(display.id)
@@ -768,6 +771,8 @@ export function createOverlayWindows(): Map<number, BrowserWindow> {
     overlayWindows.set(display.id, win)
 
     if (frozenBgr) {
+      pendingReveals++
+      traceExpect(1)
       revealOverlayWhenBgReady(win, display.id, isActive)
     } else {
       // Video flow: no snapshot to wait for, surface immediately.
@@ -780,6 +785,9 @@ export function createOverlayWindows(): Map<number, BrowserWindow> {
       win.setOpacity(1)
     }
   }
+
+  traceMark('sent')
+  if (pendingReveals === 0) traceFlush()
 
   // Poll cursor position to switch active overlay when mouse moves between
   // displays. Pointless with a single display — the active overlay is already
