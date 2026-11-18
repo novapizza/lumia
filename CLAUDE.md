@@ -35,6 +35,8 @@ There is **no test framework, linter, or formatter** configured. Type-check via 
 > A dev instance and the installed build share `%APPDATA%\Lumia` (package `name` and `productName` collide on case-insensitive filesystems) and therefore the single-instance lock — the dev instance quits silently while the tray instance is alive. To run both, give dev its own profile: `pnpm exec electron-vite dev -- --user-data-dir=<dir>`.
 >
 > **Memory**: every launch logs a per-process breakdown (`[mem] startup +10s` / `+60s` from `electron/mem-metrics.ts`) — the browser process, GPU process, the main renderer and one renderer per pooled overlay are listed separately. Set `LUMIA_MEM_LOG_INTERVAL_MS=30000` to keep sampling while profiling.
+>
+> **Capture latency**: every region / window / monitor capture logs one `[capture-trace]` line (`electron/capture-trace.ts`) with ms-since-hotkey marks — `hide`, per-display `grab` / `srgb`, `freeze`, `sent` (frames pushed to the overlays), and `reveal` per display (overlay visible). Check it before and after touching the freeze/overlay path.
 
 ### Releases
 

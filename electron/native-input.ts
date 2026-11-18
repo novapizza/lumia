@@ -54,6 +54,7 @@ let _DwmGetWindowAttribute: (hwnd: any, attr: number, pvAttribute: any, cbAttrib
 // would over-allocate and read garbage past the first 4 bytes.
 let _DwmGetWindowAttributeDword: (hwnd: any, attr: number, pvAttribute: any, cbAttribute: number) => number
 let _DwmSetWindowAttribute: (hwnd: any, attr: number, pvAttribute: any, cbAttribute: number) => number
+let _DwmFlush: any
 let _IsIconic: (hwnd: any) => boolean
 let _GetLayeredWindowAttributes: (hwnd: any, key: any, alpha: any, flags: any) => boolean
 let _SetThreadDpiAwarenessContext: (ctx: any) => any
@@ -114,6 +115,7 @@ function ensureLoaded(): boolean {
     _DwmGetWindowAttribute = dwmapi.func('int32_t __stdcall DwmGetWindowAttribute(intptr_t hwnd, uint32_t dwAttribute, _Out_ RECT *pvAttribute, uint32_t cbAttribute)')
     _DwmGetWindowAttributeDword = dwmapi.func('int32_t __stdcall DwmGetWindowAttribute(intptr_t hwnd, uint32_t dwAttribute, _Out_ uint32_t *pvAttribute, uint32_t cbAttribute)')
     _DwmSetWindowAttribute = dwmapi.func('int32_t __stdcall DwmSetWindowAttribute(intptr_t hwnd, uint32_t dwAttribute, _In_ uint32_t *pvAttribute, uint32_t cbAttribute)')
+    _DwmFlush = dwmapi.func('int32_t __stdcall DwmFlush()')
     _IsIconic = user32.func('bool __stdcall IsIconic(intptr_t hWnd)')
     _GetLayeredWindowAttributes = user32.func('bool __stdcall GetLayeredWindowAttributes(intptr_t hWnd, _Out_ uint32_t *pcrKey, _Out_ uint8_t *pbAlpha, _Out_ uint32_t *pdwFlags)')
     void RECT // suppress unused warning
@@ -511,6 +513,27 @@ export function disableDwmTransitions(win: { isDestroyed(): boolean; getNativeWi
     _DwmSetWindowAttribute(hwnd, DWMWA_TRANSITIONS_FORCEDISABLED, [1], 4)
   } catch (err) {
     console.warn('[native-input] DwmSetWindowAttribute(TRANSITIONS_FORCEDISABLED) failed', err)
+  }
+}
+
+/** Resolve once DWM has presented `frames` more compositions — i.e. once a
+ *  window change made before the call (hide, opacity) is actually off the
+ *  screen. DwmFlush blocks, so it runs on koffi's worker pool. Resolves
+ *  false when unavailable (non-Windows, DWM call failed) so the caller can
+ *  fall back to a fixed delay. */
+export async function waitForDwmFrames(frames: number): Promise<boolean> {
+  if (process.platform !== 'win32') return false
+  if (!ensureLoaded() || !_DwmFlush) return false
+  try {
+    for (let i = 0; i < frames; i++) {
+      const hr = await new Promise<number>((resolve, reject) => {
+        _DwmFlush.async((err: unknown, res: number) => (err ? reject(err) : resolve(res)))
+      })
+      if (hr !== 0) return false
+    }
+    return true
+  } catch {
+    return false
   }
 }
 

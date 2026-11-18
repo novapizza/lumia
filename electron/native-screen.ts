@@ -85,16 +85,32 @@ export interface NativeCapture {
   raw: { buffer: Buffer; width: number; height: number }
 }
 
+/** Run a koffi-bound function on koffi's worker pool instead of the main
+ *  thread. */
+function callAsync<T>(fn: any, ...args: unknown[]): Promise<T> {
+  return new Promise((resolve, reject) => {
+    fn.async(...args, (err: unknown, res: T) => (err ? reject(err) : resolve(res)))
+  })
+}
+
 /**
  * Capture a physical-pixel rect from the virtual desktop using GDI BitBlt.
  * Returns the capture (BGRA, fully opaque) or null if GDI is unavailable.
  *
  * Coordinates must be in virtual-screen physical pixels — i.e. the same space
  * that screen.dipToScreenPoint() returns on Windows.
+ *
+ * The two expensive calls (BitBlt and GetDIBits) run on koffi's worker
+ * threads. A screen BitBlt under DWM blocks until the next composition
+ * (~16 ms floor even for 1×1) plus the GPU readback (~45 ms total for a
+ * 1080p display), so running it synchronously serialized every display on
+ * the main thread. Async, the displays of a multi-monitor freeze blit
+ * concurrently (measured: 2×1080p 130 ms → ~65 ms) and the main thread can
+ * run the sRGB pass of one display while another is still being read back.
  */
-export function captureRectGdi(
+export async function captureRectGdi(
   physX: number, physY: number, physW: number, physH: number
-): NativeCapture | null {
+): Promise<NativeCapture | null> {
   if (!ensureLoaded()) return null
 
   const w = Math.max(1, Math.round(physW))
@@ -120,18 +136,19 @@ export function captureRectGdi(
     // CAPTUREBLT ensures layered/transparent windows are included.
     // On failure GetDIBits would read an uninitialized/garbage bitmap, so bail
     // out and let the caller fall back to desktopCapturer.
-    if (!_BitBlt(hdcMem, 0, 0, w, h, hdcScreen, x, y, SRCCOPY | CAPTUREBLT)) return null
+    if (!await callAsync<boolean>(_BitBlt, hdcMem, 0, 0, w, h, hdcScreen, x, y, SRCCOPY | CAPTUREBLT)) return null
 
     // GetDIBits requires the bitmap NOT be selected into any DC, so deselect it
     // here (restoring the DC's default bitmap) rather than waiting for finally.
     _SelectObject(hdcMem, hOld)
     hOld = 0
 
-    // Zero-fill (not allocUnsafe): if GetDIBits underfills the buffer we return
-    // black rather than leaking uninitialized heap memory into the screenshot.
-    const pixels = Buffer.alloc(w * h * 4)
+    // allocUnsafe is safe here: we only use the buffer when GetDIBits reports
+    // it copied every scan line, so no uninitialized heap memory can reach a
+    // screenshot (an underfill bails out to the desktopCapturer fallback).
+    const pixels = Buffer.allocUnsafe(w * h * 4)
     // GetDIBits returns the number of scan lines copied, or 0 on failure.
-    const scanLines = _GetDIBits(hdcScreen, hbmp, 0, h, pixels, {
+    const scanLines = await callAsync<number>(_GetDIBits, hdcScreen, hbmp, 0, h, pixels, {
       biSize:          40,  // sizeof(BITMAPINFOHEADER)
       biWidth:         w,
       biHeight:        -h,  // negative → top-down row order
@@ -144,7 +161,7 @@ export function captureRectGdi(
       biClrUsed:       0,
       biClrImportant:  0,
     }, DIB_RGB_COLORS)
-    if (!scanLines) return null
+    if (scanLines !== h) return null
 
     // GDI leaves the alpha byte (byte 3 of each BGRA pixel) as 0, which
     // NativeImage treats as fully transparent. Set it to 0xFF (opaque) via a
@@ -169,7 +186,7 @@ export function captureRectGdi(
  * Capture a full Electron Display using GDI.
  * Returns null if GDI is unavailable (non-Windows or load failure).
  */
-export function captureDisplayGdi(display: Electron.Display): NativeCapture | null {
+export function captureDisplayGdi(display: Electron.Display): Promise<NativeCapture | null> {
   const origin = screen.dipToScreenPoint({ x: display.bounds.x, y: display.bounds.y })
   const sf = display.scaleFactor || 1
   const physW = Math.round(display.size.width  * sf)
@@ -180,7 +197,7 @@ export function captureDisplayGdi(display: Electron.Display): NativeCapture | nu
 // ── Unified entry point ───────────────────────────────────────────────────────
 
 /**
- * Fast display capture. Windows uses synchronous GDI; macOS goes through the
+ * Fast display capture. Windows uses GDI (off the main thread); macOS goes through the
  * warm ScreenCaptureKit helper; anything else (or any failure) returns null
  * so the caller falls back to desktopCapturer.
  *
@@ -208,15 +225,16 @@ export async function captureDisplayNative(
  * the cost never lands on the user's first hotkey capture.
  *
  * Windows: the first call does koffi.load + user32/gdi32 binding (~tens of
- * ms) inside ensureLoaded() — a 1×1 BitBlt forces the bindings without
- * grabbing a full display.
+ * ms) inside ensureLoaded() — a 1×1 BitBlt forces the bindings (and koffi's
+ * async worker pool) without grabbing a full display.
  *
  * macOS: spawns the screen-snap helper and pre-fetches its SCShareableContent
  * cache (~200–500 ms), the slow part of a cold ScreenCaptureKit capture.
  */
 export function prewarmNativeCapture(): void {
   if (process.platform === 'win32') {
-    try { captureRectGdi(0, 0, 1, 1) } catch { /* silent — best-effort */ }
+    // Also spins up koffi's async worker pool used by every real capture.
+    captureRectGdi(0, 0, 1, 1).catch(() => { /* silent — best-effort */ })
     return
   }
   if (process.platform === 'darwin') prewarmMacScreenSnap()
