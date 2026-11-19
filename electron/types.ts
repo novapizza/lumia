@@ -73,7 +73,7 @@ export interface HistoryItem {
   size?: number
   type: 'screenshot' | 'recording'
   uploads: UploadResult[]
-  // Computed at read time by history:get. True when filePath is set but the
+  // Computed at read time by history:days / history:recent. True when filePath is set but the
   // file is gone from disk. Never persisted — set only on the IPC response.
   fileMissing?: boolean
   // Vector annotations layered over the original. Re-editable: the Editor

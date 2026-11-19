@@ -1,177 +1,133 @@
-import Store from 'electron-store'
+import { existsSync, readFileSync, unlinkSync } from 'fs'
 import { unlink } from 'fs/promises'
-import { resolve, normalize } from 'path'
+import { join, resolve, normalize } from 'path'
 import { homedir } from 'os'
 import type { HistoryItem } from './types'
 import { thumbnailPathFor, writeThumbnailBytesFromDataUrl } from './thumbnail'
+import { DayHistory, dayKey, type HistoryStats } from './history-days'
 
+/**
+ * Capture history: one file per day plus history_stat.json (storage in
+ * history-days.ts, design in design/HISTORY-BY-DAY.md). This class adds the
+ * Electron-side parts: migrating the old single history.json, unlinking a
+ * row's files on delete / prune, and telling listeners which days changed.
+ *
+ * One instance for the whole app (created in index.ts, shared through
+ * getHistoryStore() and passed to WorkflowEngine), so its caches never go
+ * stale against another copy.
+ */
 export class HistoryStore {
-  private store: Store<{ items: HistoryItem[]; cleanupVersion?: number }>
-  // In-memory cache of the items array for this instance. Populated lazily on
-  // first read and kept in sync on every write, so repeated getAll/get within
-  // one instance don't re-parse history.json each time. NOTE: this cache is
-  // per-instance — two HistoryStore instances exist (WorkflowEngine + the IPC
-  // layer) and do NOT share it, so each only trusts writes made through itself.
-  // That's acceptable here because each instance always writes through its own
-  // store.set (which refreshes its cache) before any await, so its cache never
-  // lags its own mutations. Cross-instance staleness was already possible with
-  // the previous read-from-disk approach (conf has no shared cache either).
-  private cache: HistoryItem[] | null = null
+  private readonly store: DayHistory
+  private readonly listeners: ((days: string[]) => void)[] = []
 
-  constructor() {
-    this.store = new Store<{ items: HistoryItem[]; cleanupVersion?: number }>({
-      name: 'history',
-      defaults: { items: [] },
-      // A corrupted history.json should reset to empty rather than crash the
-      // app at first read.
-      clearInvalidConfig: true
-    })
-    this.migrateInlineThumbnails()
+  constructor(userDataDir: string) {
+    this.store = new DayHistory(userDataDir)
+    this.migrateLegacyFile(join(userDataDir, 'history.json'))
   }
 
-  // One-time: rows written before thumbnails moved to files carry the JPEG
-  // inline as a data URL (~16 KB each — 2.5 MB of history.json for 150 rows,
-  // parsed on every read and shipped whole to the Dashboard on every mount).
-  // Write each one out byte for byte (no re-encode) and keep just the file
-  // name. A row whose write fails keeps its data URL, which the renderer
-  // still displays. Synchronous and cheap (~0.2 ms/row), so it runs in the
-  // constructor before anything can read or write the store.
-  private migrateInlineThumbnails(): void {
-    const items = this.readItems()
-    let moved = 0
-    const migrated = items.map(it => {
-      if (it.thumbnailFile || !it.thumbnailUrl?.startsWith('data:')) return it
-      const file = writeThumbnailBytesFromDataUrl(it.id, it.thumbnailUrl)
-      if (!file) return it
-      moved++
-      const next: HistoryItem = { ...it, thumbnailFile: file }
-      delete next.thumbnailUrl
-      return next
-    })
-    if (moved > 0) {
-      this.setItems(migrated)
-      console.log(`[history] moved ${moved} inline thumbnail(s) to files`)
-    }
+  /** Called after every write with the day keys that changed. */
+  onChange(listener: (days: string[]) => void): void {
+    this.listeners.push(listener)
   }
 
-  // Read the items array, preferring the in-memory cache. The cached array is
-  // returned directly (not cloned) for read speed; callers must not mutate it
-  // in place — they go through setItems for writes.
-  private readItems(): HistoryItem[] {
-    if (this.cache === null) this.cache = this.store.get('items')
-    return this.cache
+  getStats(): HistoryStats {
+    return this.store.getStats()
   }
 
-  // Single write path: persist to disk and refresh the cache in lockstep.
-  private setItems(items: HistoryItem[]): void {
-    this.store.set('items', items)
-    this.cache = items
+  getDays(days: string[]): Record<string, HistoryItem[]> {
+    return this.store.getDays(days)
   }
 
-  getAll(): HistoryItem[] {
-    return [...this.readItems()].sort((a, b) => b.timestamp - a.timestamp)
+  get(id: string): HistoryItem | null {
+    return this.store.get(id)
   }
 
-  add(item: HistoryItem) {
-    const items = [...this.readItems()]
-    items.unshift(item)
-    // Keep last 1000 items. At ~4 KB per item (thumbnail-only) that caps
-    // history.json at ~4 MB — still trivial to read/write on every call.
-    if (items.length > 1000) {
-      // Evicted rows still have app-managed artifacts (annotated sidecars) on
-      // disk — drop those, mirroring delete/prune. We do NOT unlink filePath
-      // originals here: those live under ~/Pictures/Lumia and belong to the
-      // user, not the app's eviction policy.
-      const evicted = items.splice(1000)
-      void Promise.all(evicted.map(it => this.unlinkItemFiles(it, { originals: false })))
-    }
-    this.setItems(items)
+  getRecent(limit: number, type?: HistoryItem['type']): HistoryItem[] {
+    return this.store.getRecent(limit, type)
   }
 
-  async delete(id: string): Promise<boolean> {
-    const items = this.readItems()
-    const victim = items.find(i => i.id === id)
-    if (!victim) return false
-    // Write the kept list BEFORE awaiting unlinks so the store write doesn't
-    // span an await — otherwise a concurrent add() landing during the unlink
-    // window would be clobbered by a stale snapshot. Explicit user delete is
-    // allowed to remove the original too.
-    this.setItems(items.filter(i => i.id !== id))
-    await this.unlinkItemFiles(victim, { originals: true })
-    return true
-  }
-
-  // Bulk delete in a single read → filter → write so N concurrent single
-  // deletes can't race and resurrect orphans. The store write happens before
-  // any await (same reasoning as delete()), then victim files are unlinked.
-  async deleteMany(ids: string[]): Promise<number> {
-    if (ids.length === 0) return 0
-    const idSet = new Set(ids)
-    const items = this.readItems()
-    const kept: HistoryItem[] = []
-    const victims: HistoryItem[] = []
-    for (const it of items) (idSet.has(it.id) ? victims : kept).push(it)
-    if (victims.length === 0) return 0
-    this.setItems(kept)
-    await Promise.all(victims.map(it => this.unlinkItemFiles(it, { originals: true })))
-    return victims.length
+  add(item: HistoryItem): void {
+    this.emit([this.store.add(item)])
   }
 
   update(id: string, patch: Partial<HistoryItem>): HistoryItem | null {
-    const items = [...this.readItems()]
-    const idx = items.findIndex(i => i.id === id)
-    if (idx < 0) return null
-    const updated = { ...items[idx], ...patch }
-    items[idx] = updated
-    this.setItems(items)
-    return updated
+    const res = this.store.update(id, patch)
+    if (!res) return null
+    this.emit([res.day])
+    return res.item
+  }
+
+  /** Explicit user delete: also removes the original capture file. */
+  async delete(id: string): Promise<boolean> {
+    return (await this.deleteMany([id])) > 0
+  }
+
+  async deleteMany(ids: string[]): Promise<number> {
+    if (ids.length === 0) return 0
+    // The day files are written synchronously before any await, so a
+    // concurrent add() can't be lost to a stale snapshot.
+    const { removed, days } = this.store.deleteMany(ids)
+    this.emit(days)
+    await Promise.all(removed.map(it => this.unlinkItemFiles(it, { originals: true })))
+    return removed.length
   }
 
   // Drops items older than `days` days. `days <= 0` means keep forever (no-op).
-  // Returns the number of items removed. Unlinks each pruned item's source +
-  // annotated-sidecar files so retention cleanup mirrors the manual delete
-  // button — without this, history.json shrinks but disk bloat persists.
+  // Unlinks each pruned item's source + sidecar files, like the manual delete.
   async pruneOlderThan(days: number): Promise<number> {
     if (!Number.isFinite(days) || days <= 0) return 0
     const cutoff = Date.now() - days * 24 * 60 * 60 * 1000
-    const items = this.readItems()
-    const kept: HistoryItem[] = []
-    const pruned: HistoryItem[] = []
-    for (const it of items) (it.timestamp >= cutoff ? kept : pruned).push(it)
-    if (pruned.length === 0) return 0
-    // Write kept list before awaiting unlinks so the store.set no longer spans
-    // the await — closes the race with a concurrent add().
-    this.setItems(kept)
-    await Promise.all(pruned.map(it => this.unlinkItemFiles(it, { originals: true })))
-    return pruned.length
+    const res = this.store.pruneOlderThan(cutoff)
+    this.emit(res.days)
+    await Promise.all(res.removed.map(it => this.unlinkItemFiles(it, { originals: true })))
+    return res.removed.length
   }
 
   // One-time data reset for upgrade paths where on-disk formats changed
   // enough that carrying the old history forward is worse than starting
-  // fresh (e.g. thumbnail payload switched from full dataUrls to JPEGs,
-  // annotation sidecar model added, settings shape reworked). Guarded by a
-  // `cleanupVersion` marker in history.json so it only runs once per bump:
-  // bump the target to rerun on the next release. Fresh installs hit this
-  // path too but trivially — no items to unlink, just seals the marker.
+  // fresh. Guarded by `cleanupVersion` in history_stat.json so it only runs
+  // once per bump. Never deletes the user's original captures.
   async runStartupCleanup(targetVersion: number): Promise<number> {
-    const current = (this.store.get('cleanupVersion') as number | undefined) ?? 0
-    if (current >= targetVersion) return 0
-    const items = this.readItems()
-    this.setItems([])
-    this.store.set('cleanupVersion', targetVersion)
-    // Startup cleanup only resets the app's own metadata + artifacts. It must
-    // NEVER delete filePath originals under ~/Pictures/Lumia — a future version
-    // bump would otherwise mass-delete the user's screenshot library.
-    await Promise.all(items.map(it => this.unlinkItemFiles(it, { originals: false })))
-    return items.length
+    const removed = this.store.cleanupIfBelow(targetVersion)
+    if (removed.length === 0) return 0
+    this.emit([...new Set(removed.map(it => dayKey(it.timestamp)))])
+    await Promise.all(removed.map(it => this.unlinkItemFiles(it, { originals: false })))
+    return removed.length
   }
 
-  // Shared file cleanup for delete + prune + eviction + startup. Bounded to the
-  // user's home directory so a tampered history entry can't coax us into
-  // unlinking system files; ENOENT is swallowed because the goal state (file
-  // gone) is already achieved. `originals` gates whether the user's original
-  // capture (filePath, under ~/Pictures/Lumia) is removed: only explicit user
-  // delete + retention prune opt in; eviction and startup cleanup do not.
+  private emit(days: string[]): void {
+    if (days.length === 0) return
+    for (const l of this.listeners) {
+      try { l(days) } catch (err) { console.error('[history] change listener failed', err) }
+    }
+  }
+
+  /**
+   * First launch after the switch to day files: move the rows of the old
+   * electron-store history.json into day files, then delete it (the capture
+   * files in ~/Pictures/Lumia are the real data, no backup is kept). On any
+   * error the file stays and the next launch retries; rows already moved
+   * are skipped by id. Runs in the constructor, before any IPC is set up.
+   */
+  private migrateLegacyFile(path: string): void {
+    if (!existsSync(path)) return
+    try {
+      const legacy = JSON.parse(readFileSync(path, 'utf8')) as { items?: HistoryItem[]; cleanupVersion?: number }
+      const rows = moveInlineThumbnails(Array.isArray(legacy.items) ? legacy.items : [])
+      const { added } = this.store.importLegacy(rows, legacy.cleanupVersion ?? 0)
+      unlinkSync(path)
+      console.log(`[history] moved ${added} row(s) from history.json to day files`)
+    } catch (err) {
+      console.error('[history] migrating history.json failed, will retry next launch', err)
+    }
+  }
+
+  // Shared file cleanup for delete + prune + startup. Bounded to the user's
+  // home directory so a tampered history entry can't coax us into unlinking
+  // system files; ENOENT is swallowed because the goal state (file gone) is
+  // already achieved. `originals` gates whether the user's original capture
+  // (filePath, under ~/Pictures/Lumia) is removed: only explicit user delete
+  // + retention prune opt in; startup cleanup does not.
   private async unlinkItemFiles(item: HistoryItem, opts: { originals: boolean }): Promise<void> {
     const paths = [
       opts.originals ? item.filePath : undefined,
@@ -190,4 +146,19 @@ export class HistoryStore {
       }
     }
   }
+}
+
+// Rows written before thumbnails moved to files carry the JPEG inline as a
+// data URL. Write each one out byte for byte (no re-encode) and keep just the
+// file name, so day files never carry data URLs. A row whose write fails
+// keeps its data URL, which the renderer still displays.
+function moveInlineThumbnails(items: HistoryItem[]): HistoryItem[] {
+  return items.map(it => {
+    if (it.thumbnailFile || !it.thumbnailUrl?.startsWith('data:')) return it
+    const file = writeThumbnailBytesFromDataUrl(it.id, it.thumbnailUrl)
+    if (!file) return it
+    const next: HistoryItem = { ...it, thumbnailFile: file }
+    delete next.thumbnailUrl
+    return next
+  })
 }

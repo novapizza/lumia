@@ -272,7 +272,7 @@ export async function openHistoryItemInEditor(
   const main = mainWindow
   if (!main || main.isDestroyed()) return
 
-  const item = historyStoreInstance?.getAll().find(i => i.id === historyId)
+  const item = historyStoreInstance?.get(historyId) ?? undefined
 
   // Latch surfacedFromTray *before* the show call so the X-close handler
   // sees a stable value regardless of when 'show' fires. Either the
@@ -1125,9 +1125,18 @@ app.whenReady().then(async () => {
     navigateTo(route)
   })
 
+  // History: one shared store (day files + history_stat.json). Created
+  // before anything that reads or writes history, the workflow engine
+  // included; its constructor also migrates an old history.json.
+  const historyStore = new HistoryStore(app.getPath('userData'))
+  historyStoreInstance = historyStore
+  historyStore.onChange(days => {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('history:changed', { days })
+  })
+
   // IPC: Workflow
   const templateStore = new TemplateStore()
-  const workflowEngine = new WorkflowEngine(templateStore)
+  const workflowEngine = new WorkflowEngine(templateStore, historyStore)
 
   ipcMain.handle('workflow:getTemplates', () => templateStore.getAll())
   ipcMain.handle('workflow:saveTemplate', (_e, template) => templateStore.save(template))
@@ -1140,8 +1149,6 @@ app.whenReady().then(async () => {
   })
 
   // IPC: History
-  const historyStore = new HistoryStore()
-  historyStoreInstance = historyStore
 
   // One-time upgrade cleanup. Bump HISTORY_CLEANUP_VERSION when the data
   // model diverges from prior releases badly enough that wiping existing
@@ -1176,12 +1183,12 @@ app.whenReady().then(async () => {
   const historyPruneTimer = setInterval(runHistoryPrune, HISTORY_PRUNE_INTERVAL_MS)
   app.on('will-quit', () => clearInterval(historyPruneTimer))
 
-  ipcMain.handle('history:get', async () => {
-    const items = historyStore.getAll()
+  // Renderer view of rows: thumbnailFile → lumia-media:// URL for <img src>,
+  // and `fileMissing` when the capture file is gone (fs.access is
+  // microsecond-fast on SSDs; a few hundred parallel probes are trivial).
+  const forRenderer = async (rows: HistoryItem[]): Promise<HistoryItem[]> => {
     const { access } = await import('fs/promises')
-    // fs.access is microsecond-fast on SSDs; 200 parallel probes are trivial.
-    return Promise.all(items.map(async (raw) => {
-      // Renderer view: thumbnailFile → lumia-media:// URL for <img src>.
+    return Promise.all(rows.map(async (raw) => {
       const item = resolveThumbnailUrl(raw)
       if (!item.filePath) return item
       try {
@@ -1191,6 +1198,18 @@ app.whenReady().then(async () => {
         return { ...item, fileMissing: true }
       }
     }))
+  }
+  ipcMain.handle('history:stats', () => historyStore.getStats())
+  ipcMain.handle('history:days', async (_e, days: string[]) => {
+    if (!Array.isArray(days)) return {}
+    const byDay = historyStore.getDays(days.filter(d => typeof d === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(d)))
+    const out: Record<string, HistoryItem[]> = {}
+    for (const [day, rows] of Object.entries(byDay)) out[day] = await forRenderer(rows)
+    return out
+  })
+  ipcMain.handle('history:recent', async (_e, limit: number, type?: 'screenshot' | 'recording') => {
+    const n = Number.isFinite(limit) ? Math.max(0, Math.min(200, Math.floor(limit))) : 20
+    return forRenderer(historyStore.getRecent(n, type === 'screenshot' || type === 'recording' ? type : undefined))
   })
   ipcMain.handle('history:delete', async (_e, id: string) => {
     // Store.delete unlinks filePath + annotatedFilePath (bounded to homedir,
@@ -1205,8 +1224,11 @@ app.whenReady().then(async () => {
     if (!Array.isArray(ids) || ids.length === 0) return 0
     return historyStore.deleteMany(ids)
   })
-  ipcMain.handle('history:cleanupMissing', async () => {
-    const items = historyStore.getAll()
+  // Removes rows whose capture file is gone, among `ids` (the Dashboard
+  // passes the missing rows of its loaded days).
+  ipcMain.handle('history:cleanupMissing', async (_e, ids: string[]) => {
+    if (!Array.isArray(ids)) return 0
+    const items = ids.map(id => historyStore.get(id)).filter((i): i is HistoryItem => !!i)
     const { access } = await import('fs/promises')
     const orphanIds: string[] = []
     await Promise.all(items.map(async (item) => {
@@ -1222,8 +1244,7 @@ app.whenReady().then(async () => {
   // sidecar) for a history item. Reopening the item replays each shape as
   // its own Canvas commit so native Undo walks back through them in order.
   ipcMain.handle('history:saveAnnotations', async (_e, id: string, annotations: unknown[], flattenedDataUrl?: string) => {
-    const items = historyStore.getAll()
-    const item = items.find(i => i.id === id)
+    const item = historyStore.get(id)
     if (!item) throw new Error('History item not found')
     if (!item.filePath) throw new Error('History item has no source file')
 
@@ -1308,8 +1329,7 @@ app.whenReady().then(async () => {
   // clicks don't re-issue requests (uploadToR2 itself is content-addressable
   // too, but this path short-circuits before even reading the file).
   ipcMain.handle('history:shareR2', async (_e, id: string) => {
-    const items = historyStore.getAll()
-    const item = items.find(i => i.id === id)
+    const item = historyStore.get(id)
     if (!item) throw new Error('History item not found')
     if (!item.filePath) throw new Error('History item has no source file')
 
@@ -1362,8 +1382,7 @@ app.whenReady().then(async () => {
   // URL. Mirrors the R2 path: dedup if already uploaded, refresh OAuth token if
   // expired, persist the upload result so subsequent clicks short-circuit.
   ipcMain.handle('history:shareGoogleDrive', async (_e, id: string) => {
-    const items = historyStore.getAll()
-    const item = items.find(i => i.id === id)
+    const item = historyStore.get(id)
     if (!item) throw new Error('History item not found')
     if (!item.filePath) throw new Error('History item has no source file')
 
@@ -1457,7 +1476,7 @@ app.whenReady().then(async () => {
       const buf = await readFile(normalized)
       return `data:${mime};base64,${buf.toString('base64')}`
     } catch (err: unknown) {
-      // File deleted between history:get's fs.access probe and this read —
+      // File deleted between the history read's fs.access probe and this read —
       // return null so renderer can refresh into the orphan state instead of
       // surfacing an ENOENT handler error on stderr.
       if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return null

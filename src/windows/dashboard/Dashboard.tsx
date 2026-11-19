@@ -3,7 +3,8 @@ import { useNavigate } from 'react-router-dom'
 import type { HistoryItem } from '../../types'
 import ScrollCaptureDialog from '../../components/ScrollCaptureDialog'
 import BrowserPickerDialog from '../../components/BrowserPickerDialog'
-import { DateGroupedGrid } from '../../components/DateGroupedGrid'
+import { DaySections } from '../../components/DaySections'
+import { useDayHistory } from './useDayHistory'
 import { HistoryListRow } from '../../components/HistoryListRow'
 import { copyHistoryItem, shareHistoryItem, shareHistoryGoogleDrive } from '../../lib/history-actions'
 
@@ -81,7 +82,6 @@ function getGreeting(): string {
 
 export default function Dashboard() {
   const navigate = useNavigate()
-  const [recentItems, setRecentItems] = useState<HistoryItem[]>([])
   const [showScrollCapture, setShowScrollCapture] = useState(false)
   const [filter, setFilter] = useState<FilterType>('all')
   const [hotkeys, setHotkeys] = useState<Record<string, string>>({})
@@ -98,6 +98,8 @@ export default function Dashboard() {
   const [isSelecting, setIsSelecting] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [isBulkDeleting, setIsBulkDeleting] = useState(false)
+  // History by day: stats for every count, rows only for loaded days.
+  const { stats, days, rows, loadDays, dropDays, refresh } = useDayHistory(filter)
   const [sharingId, setSharingId] = useState<string | null>(null)
   const [sharingGdriveId, setSharingGdriveId] = useState<string | null>(null)
   const [gdriveReady, setGdriveReady] = useState(false)
@@ -110,7 +112,6 @@ export default function Dashboard() {
   }, [])
 
   useEffect(() => {
-    window.electronAPI?.getHistory().then(setRecentItems)
     window.electronAPI?.getHotkeys().then(h => { if (h) setHotkeys(h) })
     const refreshGdriveReady = () => {
       window.electronAPI?.getSettings().then(s => {
@@ -138,15 +139,11 @@ export default function Dashboard() {
     window.electronAPI?.onScrollExtensionPick?.(() => setShowBrowserPicker(true))
     // Settings can change while we're on this view (user goes to Settings,
     // connects Drive, comes back) — refresh on connect events + window focus.
+    // History needs no refetch here: main pushes history:changed after every
+    // write (useDayHistory), including captures made while hidden in the tray.
     window.electronAPI?.onGdriveConnected(refreshGdriveReady)
-    // Re-fetch history every time the window regains focus. Captures fired
-    // while the window was hidden in tray (hotkey path) add entries to the
-    // store but the renderer can't observe that — it's still alive with its
-    // stale recentItems array, so the user opens the window back up and
-    // sees pre-capture state until something else triggers a refetch.
     const onWindowFocus = () => {
       refreshGdriveReady()
-      window.electronAPI?.getHistory().then(setRecentItems)
     }
     window.addEventListener('focus', onWindowFocus)
 
@@ -215,23 +212,24 @@ export default function Dashboard() {
     }
   }
 
-  const screenshots = recentItems.filter(i => i.type === 'screenshot')
-  const recordings = recentItems.filter(i => i.type === 'recording')
-
-  const counts = useMemo(() => ({
-    all: recentItems.length,
-    screenshot: screenshots.length,
-    recording: recordings.length,
-  }), [recentItems, screenshots.length, recordings.length])
-
-  const filtered = useMemo(() => {
-    const result = filter === 'all' ? recentItems : recentItems.filter(i => i.type === filter)
-    return [...result].sort((a, b) => b.timestamp - a.timestamp)
-  }, [recentItems, filter])
+  // Totals come from history_stat.json, not from the loaded rows.
+  const counts = {
+    all: stats?.total ?? 0,
+    screenshot: stats?.screenshot ?? 0,
+    recording: stats?.recording ?? 0,
+  }
+  // Rows of the loaded days only (missing-file count and cleanup).
+  const loadedItems = useMemo(() => [...rows.values()].flat(), [rows])
+  // Days holding selected rows are never dropped while selecting.
+  const pinnedDays = useMemo(() => {
+    const out = new Set<string>()
+    if (selectedIds.size === 0) return out
+    for (const [day, items] of rows) if (items.some(i => selectedIds.has(i.id))) out.add(day)
+    return out
+  }, [rows, selectedIds])
 
   const handleDelete = async (id: string) => {
     await window.electronAPI?.deleteHistoryItem(id)
-    setRecentItems(prev => prev.filter(i => i.id !== id))
     setSelectedIds(prev => { const next = new Set(prev); next.delete(id); return next })
   }
 
@@ -245,7 +243,6 @@ export default function Dashboard() {
       // concurrent read-modify-writes that clobbered each other — deleted rows
       // resurrected as "Missing" orphans on the next refetch.
       await window.electronAPI?.deleteHistoryItems(ids)
-      setRecentItems(prev => prev.filter(i => !selectedIds.has(i.id)))
       setSelectedIds(new Set())
       setIsSelecting(false)
     } finally {
@@ -267,13 +264,12 @@ export default function Dashboard() {
     setSelectedIds(new Set())
   }
 
-  // Refresh `recentItems` — used after a race where a file disappears between
-  // the boot-time fs.access probe and the user's click, so the UI flips from
+  // Reload the loaded days — used after a race where a file disappears
+  // between the fs.access probe and the user's click, so the UI flips from
   // "clickable" to orphan state on the next interaction.
   const refreshHistory = useCallback(async () => {
-    const items = await window.electronAPI?.getHistory()
-    if (items) setRecentItems(items)
-  }, [])
+    await refresh()
+  }, [refresh])
 
   const openItem = async (item: HistoryItem) => {
     if (item.fileMissing) return
@@ -327,32 +323,30 @@ export default function Dashboard() {
     }
   }
 
-  const missingCount = useMemo(() => recentItems.filter(i => i.fileMissing).length, [recentItems])
+  // Missing files among the loaded days only; cleanup removes those.
+  const missingIds = useMemo(() => loadedItems.filter(i => i.fileMissing).map(i => i.id), [loadedItems])
+  const missingCount = missingIds.length
   const handleCleanupMissing = useCallback(async () => {
-    const removed = await window.electronAPI?.cleanupMissingHistory()
-    if (removed && removed > 0) await refreshHistory()
-  }, [refreshHistory])
+    await window.electronAPI?.cleanupMissingHistory(missingIds)
+  }, [missingIds])
 
   // Persist view mode
   useEffect(() => {
     localStorage.setItem('lumia:history-view', viewMode)
   }, [viewMode])
 
-  // Ctrl/Cmd+A to select all when in selecting mode; Escape to exit
+  // Escape leaves selection mode. (No Cmd+A select-all: only some days are
+  // loaded at a time.)
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape' && isSelecting) {
         setIsSelecting(false)
         setSelectedIds(new Set())
       }
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'a' && isSelecting) {
-        e.preventDefault()
-        setSelectedIds(new Set(filtered.map(i => i.id)))
-      }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [isSelecting, filtered])
+  }, [isSelecting])
 
   return (
     <div className="h-full flex flex-col">
@@ -379,9 +373,9 @@ export default function Dashboard() {
             {getGreeting()}
           </h1>
           <p className="text-sm text-slate-500 mt-1.5" style={{ fontFamily: 'Manrope, sans-serif' }}>
-            {recentItems.length === 0
+            {counts.all === 0
               ? 'Start your first capture to get going'
-              : `${screenshots.length} screenshot${screenshots.length !== 1 ? 's' : ''} · ${recordings.length} recording${recordings.length !== 1 ? 's' : ''}`}
+              : `${counts.screenshot} screenshot${counts.screenshot !== 1 ? 's' : ''} · ${counts.recording} recording${counts.recording !== 1 ? 's' : ''}`}
           </p>
         </div>
       </header>
@@ -763,37 +757,33 @@ export default function Dashboard() {
           </div>
         )}
 
-        <div className="flex-1 min-h-0 overflow-y-auto pr-1 -mr-1">
-          {viewMode === 'grid' ? (
-            <DateGroupedGrid
-              items={filtered}
-              getTimestamp={item => item.timestamp}
-              gridClassName="grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-3"
-              renderItem={(item) => (
-                <HistoryCard
-                  key={item.id}
-                  item={item}
-                  isSelecting={isSelecting}
-                  isSelected={selectedIds.has(item.id)}
-                  isSharing={sharingId === item.id}
-                  isSharingGdrive={sharingGdriveId === item.id}
-                  gdriveReady={gdriveReady}
-                  onToggleSelect={() => toggleSelect(item.id)}
-                  onOpen={() => openItem(item)}
-                  onDelete={() => handleDelete(item.id)}
-                  onCopy={() => copyItem(item)}
-                  onShare={() => shareItem(item)}
-                  onShareGdrive={() => shareGdriveItem(item)}
-                />
-              )}
-              emptyState={<EmptyState filter={filter} />}
-            />
-          ) : (
-            <DateGroupedGrid
-              items={filtered}
-              getTimestamp={item => item.timestamp}
-              gridClassName="flex flex-col gap-1"
-              renderItem={(item) => (
+        <DaySections
+          className="flex-1 min-h-0 overflow-y-auto pr-1 -mr-1"
+          days={days}
+          rows={rows}
+          filter={filter}
+          view={viewMode}
+          gridClassName={viewMode === 'grid' ? 'grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-3' : 'flex flex-col gap-1'}
+          loadDays={loadDays}
+          dropDays={dropDays}
+          pinnedDays={pinnedDays}
+          renderItem={(item) => viewMode === 'grid' ? (
+              <HistoryCard
+                key={item.id}
+                item={item}
+                isSelecting={isSelecting}
+                isSelected={selectedIds.has(item.id)}
+                isSharing={sharingId === item.id}
+                isSharingGdrive={sharingGdriveId === item.id}
+                gdriveReady={gdriveReady}
+                onToggleSelect={() => toggleSelect(item.id)}
+                onOpen={() => openItem(item)}
+                onDelete={() => handleDelete(item.id)}
+                onCopy={() => copyItem(item)}
+                onShare={() => shareItem(item)}
+                onShareGdrive={() => shareGdriveItem(item)}
+              />
+            ) : (
                 <HistoryListRow
                   key={item.id}
                   item={item}
@@ -809,11 +799,9 @@ export default function Dashboard() {
                   onShare={() => shareItem(item)}
                   onShareGdrive={() => shareGdriveItem(item)}
                 />
-              )}
-              emptyState={<EmptyState filter={filter} />}
-            />
-          )}
-        </div>
+            )}
+            emptyState={stats ? <EmptyState filter={filter} /> : null}
+          />
       </section>
 
       {showScrollCapture && <ScrollCaptureDialog onClose={() => setShowScrollCapture(false)} />}

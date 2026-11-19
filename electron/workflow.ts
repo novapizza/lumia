@@ -15,9 +15,8 @@ import { showNotification } from './notify'
 import { v4 as uuidv4 } from 'uuid'
 
 export class WorkflowEngine {
-  private historyStore = new HistoryStore()
 
-  constructor(private templateStore: TemplateStore) {}
+  constructor(private templateStore: TemplateStore, private historyStore: HistoryStore) {}
 
   async run(templateId: string, imageData: string, destinationIndex?: number, historyId?: string): Promise<WorkflowResult> {
     const template = this.templateStore.getById(templateId)
@@ -124,7 +123,7 @@ export class WorkflowEngine {
     // duplicate row. Without this, clicking Share on a history-opened item
     // created a second identical entry every time.
     if (historyId) {
-      const existing = this.historyStore.getAll().find(i => i.id === historyId)
+      const existing = this.historyStore.get(historyId)
       if (existing) {
         // Merge per destination, but only let a NEW result replace an existing
         // entry when the new one succeeded. A failed re-upload (e.g. offline)
@@ -216,7 +215,7 @@ export class WorkflowEngine {
    *  (user has annotations), otherwise the original capture file. Returns
    *  null when neither exists or the history row is gone. */
   private resolveSourceForCopy(historyId: string): string | null {
-    const item = this.historyStore.getAll().find(i => i.id === historyId)
+    const item = this.historyStore.get(historyId)
     if (!item) return null
     const candidate = item.annotatedFilePath || item.filePath
     return candidate || null

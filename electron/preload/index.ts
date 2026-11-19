@@ -26,13 +26,20 @@ contextBridge.exposeInMainWorld('electronAPI', {
   deleteTemplate: (id: string) => ipcRenderer.invoke('workflow:deleteTemplate', id),
 
   // History
-  getHistory: () => ipcRenderer.invoke('history:get'),
+  getHistoryStats: () => ipcRenderer.invoke('history:stats'),
+  getHistoryDays: (days: string[]) => ipcRenderer.invoke('history:days', days),
+  getRecentHistory: (limit: number, type?: 'screenshot' | 'recording') => ipcRenderer.invoke('history:recent', limit, type),
+  onHistoryChanged: (cb: (p: { days: string[] }) => void) => {
+    const listener = (_e: unknown, p: { days: string[] }) => cb(p)
+    ipcRenderer.on('history:changed', listener)
+    return () => { ipcRenderer.removeListener('history:changed', listener) }
+  },
   deleteHistoryItem: (id: string) => ipcRenderer.invoke('history:delete', id),
   deleteHistoryItems: (ids: string[]) => ipcRenderer.invoke('history:deleteMany', ids),
   openHistoryFile: (filePath: string) => ipcRenderer.invoke('history:openFile', filePath),
   addHistoryItem: (item: unknown) => ipcRenderer.invoke('history:addCapture', item),
   readHistoryFile: (filePath: string) => ipcRenderer.invoke('history:readAsDataUrl', filePath),
-  cleanupMissingHistory: () => ipcRenderer.invoke('history:cleanupMissing'),
+  cleanupMissingHistory: (ids: string[]) => ipcRenderer.invoke('history:cleanupMissing', ids),
   shareHistoryR2: (id: string) => ipcRenderer.invoke('history:shareR2', id),
   shareHistoryGoogleDrive: (id: string) => ipcRenderer.invoke('history:shareGoogleDrive', id),
   saveHistoryAnnotations: (id: string, annotations: unknown[], flattenedDataUrl?: string) =>

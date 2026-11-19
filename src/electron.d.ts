@@ -52,13 +52,16 @@ declare global {
       saveTemplate: (template: import('./types').WorkflowTemplate) => Promise<import('./types').WorkflowTemplate>
       deleteTemplate: (id: string) => Promise<boolean>
 
-      getHistory: () => Promise<import('./types').HistoryItem[]>
+      getHistoryStats: () => Promise<import('./types').HistoryStats>
+      getHistoryDays: (days: string[]) => Promise<Record<string, import('./types').HistoryItem[]>>
+      getRecentHistory: (limit: number, type?: 'screenshot' | 'recording') => Promise<import('./types').HistoryItem[]>
+      onHistoryChanged: (cb: (p: { days: string[] }) => void) => () => void
       deleteHistoryItem: (id: string) => Promise<boolean>
       deleteHistoryItems: (ids: string[]) => Promise<number>
       openHistoryFile: (filePath: string) => Promise<void>
       addHistoryItem: (item: import('./types').HistoryItem) => Promise<void>
       readHistoryFile: (filePath: string) => Promise<string | null>
-      cleanupMissingHistory: () => Promise<number>
+      cleanupMissingHistory: (ids: string[]) => Promise<number>
       shareHistoryR2: (id: string) => Promise<import('./types').UploadResult>
       shareHistoryGoogleDrive: (id: string) => Promise<import('./types').UploadResult>
       saveHistoryAnnotations: (id: string, annotations: import('./types').AnnotationObject[], flattenedDataUrl?: string) => Promise<import('./types').HistoryItem | null>
