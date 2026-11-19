@@ -191,7 +191,7 @@ lumia/
 │   │   ├── TitleBar · Sidebar · AppMenu
 │   │   ├── ShareDialog · WorkflowSelector
 │   │   ├── BackgroundPanel · StickerPicker
-│   │   ├── HistoryListRow · DateGroupedGrid
+│   │   ├── HistoryListRow · DaySections
 │   │   ├── ScrollCaptureDialog · BrowserPickerDialog
 │   │   ├── UpdateNotification · AboutDialog · PrintScreenPromptDialog
 │   │   └── AnnotationCanvas/
