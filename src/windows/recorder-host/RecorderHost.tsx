@@ -10,17 +10,20 @@ interface RecordingTarget {
   outputSize?: { width: number; height: number }
 }
 
-const TARGET_FPS = 60
-// Bits-per-pixel-per-frame quality factor. VP9 real-time mode is conservative
-// for screen content with motion (scroll, animation), so we run hot: 0.25
-// puts 1920×1080@60 at ≈30 Mbps and 1922×1200@60 at ≈34 Mbps. The
-// MediaRecorder default is roughly 2.5 Mbps regardless of resolution, which
-// crushes UI text on high-DPI displays.
-const VIDEO_QUALITY_FACTOR = 0.25
-// Hard ceiling so 4K@60 doesn't ask for the encoder to fill ~120 Mbps. WebM
-// playback above ~50 Mbps gives diminishing returns for screen content.
-const VIDEO_BITRATE_CAP = 50_000_000
-const VIDEO_BITRATE_FLOOR = 4_000_000
+// 30 fps is plenty for screen content, and the desktop-capture → canvas
+// pipeline only delivered ~34 fps in practice when asked for 60 — so the old
+// 60 fps target sized the bitrate for frames that never arrived.
+const TARGET_FPS = 30
+// Bits-per-pixel-per-frame quality factor. The previous 0.25 @ 60 fps asked
+// for ~28 Mbps on a 1932×970 region and produced ~250 MB per 2 min of
+// mostly-static UI. 0.08 @ 30 fps puts 1920×1080 at ≈5 Mbps and 2560×1440 at
+// ≈8.8 Mbps; text stays legible because the track is hinted as 'detail'
+// (see buildOutputStream). The MediaRecorder default (~2.5 Mbps regardless of
+// resolution) is still too low for high-DPI UI text, hence the explicit value.
+const VIDEO_QUALITY_FACTOR = 0.08
+// Hard ceiling so 4K/5K screens don't ask for more than screen content needs.
+const VIDEO_BITRATE_CAP = 12_000_000
+const VIDEO_BITRATE_FLOOR = 2_000_000
 const AUDIO_BITRATE = 192_000
 /** Keyframe spacing requested from MediaRecorder — bounds trim snapping (see onBegin). */
 const KEYFRAME_INTERVAL_MS = 1000
@@ -31,9 +34,9 @@ const KEYFRAME_INTERVAL_MS = 1000
 //      browser bilinear is visibly soft. Doing the upscale once at encode
 //      time with high-quality canvas smoothing keeps subsequent playback
 //      a pure downscale (which always looks crisper than upscale).
-//   2. The encoder gets more pixels to spread bits over — at 0.25 bpp,
-//      a 600×450 region was hitting the 4 Mbps floor; the same content
-//      at 1280×960 lands at ~18 Mbps, so text strokes survive intact.
+//   2. The encoder gets more pixels to spread bits over, so text strokes
+//      survive intact. The bitrate is sized from the upscaled canvas, not
+//      the raw crop (see onBegin).
 // Trade-off: small-region recordings now produce noticeably bigger files.
 const MIN_OUTPUT_LONG_SIDE = 1280
 
@@ -201,20 +204,30 @@ export default function RecorderHost() {
 
       const mime = pickMimeType()
 
-      // Resolve actual output dimensions for bitrate sizing. Region/window
-      // record from the canvas (outputSize); screen mode passes the full
-      // physical desktop stream through.
+      // Size the bitrate from what is actually encoded: the output canvas,
+      // which buildOutputStream sized (crop, small-region upscale, even dims).
+      // Fall back to the target's dims if the canvas isn't sized yet.
       const target = targetRef.current
-      const outW = target?.outputSize?.width
-        ?? Math.round((target?.displayDipSize.width  ?? 1920) * (target?.displayScaleFactor ?? 1))
-      const outH = target?.outputSize?.height
-        ?? Math.round((target?.displayDipSize.height ?? 1080) * (target?.displayScaleFactor ?? 1))
+      const canvas = canvasElRef.current
+      const outW = canvas?.width
+        || target?.outputSize?.width
+        || Math.round((target?.displayDipSize.width  ?? 1920) * (target?.displayScaleFactor ?? 1))
+      const outH = canvas?.height
+        || target?.outputSize?.height
+        || Math.round((target?.displayDipSize.height ?? 1080) * (target?.displayScaleFactor ?? 1))
       const videoBitsPerSecond = computeVideoBitrate(outW, outH, TARGET_FPS)
 
       const hasAudio = out.getAudioTracks().length > 0
-      const options: MediaRecorderOptions & { videoKeyFrameIntervalDuration?: number } = {
+      const options: MediaRecorderOptions & {
+        videoKeyFrameIntervalDuration?: number
+        videoBitrateMode?: 'constant' | 'variable'
+      } = {
         mimeType: mime,
         videoBitsPerSecond,
+        // Variable bitrate: static stretches of UI spend far fewer bits than
+        // the target, so the budget goes to scrolls and animations. Chromium's
+        // default is already variable; set explicitly so it can't drift.
+        videoBitrateMode: 'variable',
         // A keyframe every second keeps the lossless trim (ffmpeg -c copy,
         // which can only start a clip on a keyframe) accurate to ~1 s.
         // Chromium's default can space keyframes very far apart. Not in TS's
@@ -515,7 +528,12 @@ function buildOutputStream(
     loopRef.current = () => { cancelled = true; cancelAnimationFrame(raf) }
   }
 
-  return canvas.captureStream(TARGET_FPS)
+  const stream = canvas.captureStream(TARGET_FPS)
+  // Screen recordings are mostly text and UI edges: ask the encoder to keep
+  // detail sharp and give up frame rate first when bits run short.
+  const track = stream.getVideoTracks()[0]
+  if (track) track.contentHint = 'detail'
+  return stream
 }
 
 /** Extract a JPEG thumbnail from ~25% into the recorded blob. Handles the

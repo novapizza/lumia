@@ -217,14 +217,21 @@ export default function Editor() {
   const trimDirty = durationMs > 0 && (appliedTrim
     ? Math.abs(sel.start - appliedTrim.startMs) > 1 || Math.abs(sel.end - Math.min(appliedTrim.endMs, durationMs)) > 1
     : !selIsFull)
-  // Keep playback inside the selection (applied or pending).
+  // Keep the playhead inside the selection (applied or pending): playback
+  // stops at the end, and a seek past either edge (e.g. the native scrubber)
+  // is pulled back to it. 1 ms of slack so a seek to the edge itself, which
+  // reads back with float error, doesn't trigger another one.
+  const selReady = durationMs > 0 && !selIsFull && sel.end > sel.start
   const onVideoTime = (e: React.SyntheticEvent<HTMLVideoElement>) => {
     const v = e.currentTarget
     const ms = v.currentTime * 1000
     setCurrentMs(ms)
-    if (durationMs > 0 && !selIsFull && !v.paused && ms >= sel.end) {
+    if (!selReady) return
+    if (ms > sel.end + 1 || (!v.paused && ms >= sel.end)) {
       v.pause()
       v.currentTime = sel.end / 1000
+    } else if (ms < sel.start - 1) {
+      v.currentTime = sel.start / 1000
     }
   }
   const onVideoPlay = (e: React.SyntheticEvent<HTMLVideoElement>) => {
@@ -239,6 +246,15 @@ export default function Editor() {
     if (v) v.currentTime = ms / 1000
     setCurrentMs(ms)
   }, [])
+  // When the selection changes (seeded from an applied trim, D / F, a handle
+  // drag), pull a playhead left outside it onto the nearest edge.
+  useEffect(() => {
+    const v = videoRef.current
+    if (!v || !selReady) return
+    const ms = v.currentTime * 1000
+    if (ms < sel.start - 1) seekVideo(sel.start)
+    else if (ms > sel.end + 1) seekVideo(sel.end)
+  }, [sel, selReady, seekVideo])
 
   const onVideoMeta = (e: React.SyntheticEvent<HTMLVideoElement>) => {
     fixWebmDuration(e)
@@ -505,7 +521,7 @@ export default function Editor() {
     }
   }, [historyId, trimBusy, trimDirty, appliedTrim, durationMs, videoSrc, showToast])
 
-  // I / O set the selection edge at the playhead; Space plays/pauses (skipped
+  // D / F set the selection edge at the playhead; Space plays/pauses (skipped
   // when the native player or a button has focus — they handle Space already).
   // ←/→ step one frame, Shift+←/→ ten. Listened in the capture phase so a
   // focused native <video> doesn't also run its own ±5 s arrow-key seek
@@ -520,10 +536,10 @@ export default function Editor() {
       if (!v) return
       const now = Math.round(v.currentTime * 1000)
       const k = e.key.toLowerCase()
-      if (k === 'i') {
+      if (k === 'd') {
         e.preventDefault()
         setSel(s => ({ start: Math.max(0, Math.min(now, s.end - MIN_TRIM_SELECTION_MS)), end: s.end }))
-      } else if (k === 'o') {
+      } else if (k === 'f') {
         e.preventDefault()
         setSel(s => ({ start: s.start, end: Math.min(durationMs, Math.max(now, s.start + MIN_TRIM_SELECTION_MS)) }))
       } else if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
@@ -534,7 +550,7 @@ export default function Editor() {
         const step = (e.shiftKey ? 10 : 1) * FRAME_MS * dir
         // Read currentTime (not React state) so held / rapid presses
         // accumulate even before the seek lands and timeupdate fires.
-        seekVideo(Math.min(durationMs, Math.max(0, v.currentTime * 1000 + step)))
+        seekVideo(Math.min(sel.end, Math.max(sel.start, v.currentTime * 1000 + step)))
       } else if (e.key === ' ' && !t?.closest?.('video, button')) {
         e.preventDefault()
         if (v.paused) void v.play(); else v.pause()
@@ -542,7 +558,7 @@ export default function Editor() {
     }
     window.addEventListener('keydown', onKey, true)
     return () => window.removeEventListener('keydown', onKey, true)
-  }, [isVideo, historyId, durationMs, trimBusy, seekVideo])
+  }, [isVideo, historyId, durationMs, trimBusy, seekVideo, sel.start, sel.end])
 
   // Debounce timer for auto-saving annotation JSON as the user draws. Full
   // saves (with the flattened PNG sidecar + fresh thumbnail) happen on every
@@ -908,6 +924,9 @@ export default function Editor() {
                   ref={el => { videoRef.current = el }}
                   src={videoSrc}
                   controls
+                  // The trim bar below is the timeline when it's shown, so
+                  // the player's own scrubber is hidden (see index.css).
+                  className={historyId && durationMs > 0 ? 'hide-native-timeline' : undefined}
                   playsInline
                   preload="auto"
                   onLoadedMetadata={onVideoMeta}

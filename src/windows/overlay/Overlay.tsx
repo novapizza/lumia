@@ -233,9 +233,8 @@ export default function Overlay() {
     }
   }, [])
 
-  // Paint the BGRA buffer directly to the canvas. We swizzle B↔R in-place via
-  // a Uint32Array view (4× fewer iterations than per-byte) — on a 4K image
-  // that's ~10ms vs ~40ms. ImageData wants RGBA so the swizzle is mandatory.
+  // Paint the BGRA buffer directly to the canvas — via a WebCodecs VideoFrame
+  // when available (no CPU swizzle), else a B↔R swizzle into RGBA ImageData.
   // Two rAFs after putImageData guarantees the GPU has shown the bitmap, then
   // we ack main so it can ramp opacity to 1.
   useEffect(() => {
@@ -262,14 +261,33 @@ export default function Overlay() {
     // correct. For each px (little-endian BB GG RR AA → uint32 0xAARRGGBB),
     // swap the B and R bytes.
     const src = frozenBgr.buffer
-    const srcU32 = new Uint32Array(src.buffer, src.byteOffset, src.byteLength >>> 2)
-    const out = new Uint8ClampedArray(src.byteLength)
-    const outU32 = new Uint32Array(out.buffer)
-    for (let i = 0; i < srcU32.length; i++) {
-      const v = srcU32[i]
-      outU32[i] = (v & 0xFF00FF00) | ((v & 0x00FF0000) >>> 16) | ((v & 0x000000FF) << 16)
+    // Fast path: hand the BGRA bytes to the GPU as-is via a WebCodecs
+    // VideoFrame ('BGRX' — alpha ignored) and drawImage it. Skips the JS
+    // swizzle loop, the second full-frame RGBA allocation and putImageData's
+    // CPU-side copy.
+    let painted = false
+    if (typeof VideoFrame !== 'undefined') {
+      try {
+        const frame = new VideoFrame(src, {
+          format: 'BGRX',
+          codedWidth: frozenBgr.width,
+          codedHeight: frozenBgr.height,
+          timestamp: 0,
+        })
+        try { ctx.drawImage(frame, 0, 0) } finally { frame.close() }
+        painted = true
+      } catch { /* fall back to the swizzle path below */ }
     }
-    ctx.putImageData(new ImageData(out, frozenBgr.width, frozenBgr.height), 0, 0)
+    if (!painted) {
+      const srcU32 = new Uint32Array(src.buffer, src.byteOffset, src.byteLength >>> 2)
+      const out = new Uint8ClampedArray(src.byteLength)
+      const outU32 = new Uint32Array(out.buffer)
+      for (let i = 0; i < srcU32.length; i++) {
+        const v = srcU32[i]
+        outU32[i] = (v & 0xFF00FF00) | ((v & 0x00FF0000) >>> 16) | ((v & 0x000000FF) << 16)
+      }
+      ctx.putImageData(new ImageData(out, frozenBgr.width, frozenBgr.height), 0, 0)
+    }
 
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
