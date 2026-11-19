@@ -6,6 +6,7 @@
   "main": "out/main/index.js",
   "packageManager": "pnpm@10.33.1",
   "scripts": {
+    "test": "node --experimental-strip-types --test \"tests/**/*.test.ts\"",
     "preinstall": "npx only-allow pnpm",
     "icons": "node build/generate-icons.cjs",
     "icons:subset": "python scripts/subset-material-symbols.py",

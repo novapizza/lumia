@@ -339,7 +339,9 @@ export default function Editor() {
   }, [])
 
   useEffect(() => {
-    window.electronAPI?.getHistory().then((items: HistoryItem[]) => {
+    // Newest screenshots only (history is stored per day); a few extra so
+    // rows with missing files still leave 20 to show.
+    window.electronAPI?.getRecentHistory(40, 'screenshot').then((items: HistoryItem[]) => {
       setClipboardHistory(
         items
           .filter((i) => i.type === 'screenshot' && !i.fileMissing && (i.thumbnailUrl || i.dataUrl))

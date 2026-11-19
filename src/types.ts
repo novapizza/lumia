@@ -64,7 +64,7 @@ export interface HistoryItem {
   size?: number
   type: 'screenshot' | 'recording'
   uploads: UploadResult[]
-  // Set by main on history:get when filePath is missing from disk. Never
+  // Set by main on history:days / history:recent when filePath is missing from disk. Never
   // persisted — the store keeps items even when files are gone so the user
   // can clean them up explicitly.
   fileMissing?: boolean
@@ -134,4 +134,17 @@ export interface UnsplashPhoto {
     username: string
     link: string
   }
+}
+
+/** Totals from history_stat.json (mirror of electron/history-days.ts). */
+export interface DayStat { day: string; total: number; screenshot: number; recording: number }
+
+export interface HistoryStats {
+  version: 1
+  cleanupVersion: number
+  total: number
+  screenshot: number
+  recording: number
+  /** Days with at least one capture, newest first. */
+  days: DayStat[]
 }

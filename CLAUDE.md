@@ -25,10 +25,11 @@ Headline features:
 | `pnpm build:win` | Build + package Windows NSIS installer (x64 + arm64) into `release/` |
 | `pnpm build:mac` | Build + package macOS DMG (x64 + arm64) into `release/` |
 | `pnpm icons` | Regenerate platform icon sets from `resources/icon.png` |
+| `pnpm test` | Unit tests (`node --test` with type stripping, no dependency) for `tests/*.test.ts`. Tests import `.ts` files directly, so tested modules must not import Electron |
 
 `postinstall` runs `node node_modules/electron/install.js && electron-builder install-app-deps`. As of Electron 42 the `electron` package no longer downloads its binary via its own postinstall script (it would otherwise download lazily on first launch), so we fetch it explicitly — otherwise `electron-vite dev` fails with `Error: Electron uninstall`. `preinstall` enforces pnpm.
 
-There is **no test framework, linter, or formatter** configured. Type-check via `pnpm build` (note: electron-vite 6 / Vite 8 transpiles with Oxc + Rolldown and does **not** type-check — run `tsc --noEmit -p tsconfig.node.json` / `-p tsconfig.web.json` for a real type-check).
+There is **no linter or formatter** configured, and tests cover only the history storage and its Dashboard helpers (`pnpm test`). Type-check via `pnpm build` (note: electron-vite 6 / Vite 8 transpiles with Oxc + Rolldown and does **not** type-check — run `tsc --noEmit -p tsconfig.node.json` / `-p tsconfig.web.json` for a real type-check).
 
 > If `pnpm dev` crashes at startup with `require('electron')` returning a path / `app` undefined, or a V8 `snapshot_data() != nullptr` assertion, check that `ELECTRON_RUN_AS_NODE` is **not** set in your environment — when present (even empty) it makes the Electron binary run as plain Node.
 >
@@ -82,10 +83,11 @@ Releases are produced by **GitHub Actions** (`.github/workflows/release.yml`), n
 | `notify.ts` | Single entry point for toast notifications; on Windows builds custom `toastXml` with hero image so the screenshot renders above the text |
 | `workflow.ts` | `WorkflowEngine` — three-phase pipeline: after-capture → uploads (parallel) → after-upload; merges into existing history items when re-shared |
 | `templates.ts` | `TemplateStore` — CRUD for workflow templates + 2 built-ins (`builtin-clipboard`, `builtin-r2`) |
-| `history.ts` | `HistoryStore` — capture history persistence (max 1000 items, ~4 KB each), file-cleanup on delete |
+| `history.ts` | `HistoryStore` — the one shared history store (also passed to `WorkflowEngine`): migrates an old `history.json` into day files on first start, unlinks a row's files on delete / prune, and reports changed days (`onChange` → `history:changed` to the main window). Reads by day (`getDays`), by id (`get`), newest (`getRecent`); no row cap |
+| `history-days.ts` | Day-file storage under `HistoryStore`, Node `fs` only (unit-tested): `history/YYYY-MM-DD.json` (local day of the capture, newest first) + `history_stat.json` (totals and per-day counts per type). Atomic writes (tmp + rename), day file then stats; startup recounts day files newer than the stats file (crash between the two writes); a corrupt day file is renamed `*.corrupt-<ts>.json`, never overwritten. Design: `design/HISTORY-BY-DAY.md` |
 | `settings.ts` | `AppSettings` interface + electron-store wrapper, `resolveSaveStartDir` helper |
 | `startup.ts` | Launch-at-startup OS integration; `wasLaunchedAtStartup()` for `--hidden` boot |
-| `thumbnail.ts` | History previews as ≤300 px JPEG **files** under `userData/thumbnails/` (`writeThumbnail` / `writeThumbnailFromDataUrl`; file names embed the row id + a write stamp so a re-thumbnail gets a fresh URL). `resolveThumbnailUrl` derives the renderer-facing `lumia-media://` URL from `HistoryItem.thumbnailFile` at read time; `thumbnailNotifyOpts` feeds the toast hero. Legacy rows with inline data-URL thumbnails are migrated to files by `HistoryStore`'s constructor |
+| `thumbnail.ts` | History previews as ≤300 px JPEG **files** under `userData/thumbnails/` (`writeThumbnail` / `writeThumbnailFromDataUrl`; file names embed the row id + a write stamp so a re-thumbnail gets a fresh URL). `resolveThumbnailUrl` derives the renderer-facing `lumia-media://` URL from `HistoryItem.thumbnailFile` at read time; `thumbnailNotifyOpts` feeds the toast hero. Legacy rows with inline data-URL thumbnails are moved to files when `HistoryStore` migrates `history.json` |
 | `watermark.ts` | Stamps the Lumia logo onto every screenshot — `applyWatermarkToImage` is bitmap in / bitmap out. `capture.ts`'s `sendCaptureToEditor` accepts the cropped `NativeImage`, stamps it, PNG-encodes **once**, and reuses those bytes for the clipboard, the saved original, the thumbnail and the editor payload (the old data-URL-only path re-encoded/decoded the same pixels several times per capture) |
 | `native-input.ts` | Win32 input via koffi FFI — `SetCursorPos`, `mouse_event`, `keybd_event`, `SendMessageW`. Replaces PowerShell-based scroll/key sim (~0 ms vs ~200–500 ms cold start). Windows-only |
 | `printscreen-key.ts` | Windows-only — toggles the `PrintScreenKeyForSnippingEnabled` registry value so PrintScreen reaches Lumia's global hotkey instead of the Snipping Tool (`setSnippingHijack()`) |
@@ -110,7 +112,7 @@ Releases are produced by **GitHub Actions** (`.github/workflows/release.yml`), n
 - **Entry**: `src/main.tsx` → `HashRouter`. The pooled capture overlay has its **own lean entry** — `src/overlay.html` → `src/overlay-main.tsx` renders `windows/overlay/Overlay.tsx` directly (no router, no dashboard/editor chunks, no Manrope). One of those renderers lives per display for the whole session, so keep that entry's imports minimal.
 - **Layout**: `App.tsx` wraps standard routes with `TitleBar` + `Sidebar`. The `/editor` route runs full-width (its own toolbars replace the sidebar).
 - **Routes** (each in `src/windows/<route>/<Pascal>.tsx`):
-  - `/dashboard` — capture launcher (Image / Video / Scroll kind toggle; the Scroll tab offers Browser Extension vs Screen Scroll method cards with live extension-connection status) + history grid (legacy `/history` redirects here)
+  - `/dashboard` — capture launcher (Image / Video / Scroll kind toggle; the Scroll tab offers Browser Extension vs Screen Scroll method cards with live extension-connection status) + history grid (legacy `/history` redirects here). History loads a day at a time (`windows/dashboard/useDayHistory.ts` + `components/DaySections.tsx`): counts come from the stats, a day loads when it comes within a screen of the viewport and is dropped from memory when it is more than three screens away (its block keeps its height). No Cmd+A select-all; the missing-file count covers loaded days
   - `/editor` — annotation editor for both image and video (legacy `/video-annotator` redirects here)
   - `/workflow` — template manager
   - `/settings` — preferences + Google Drive auth
@@ -133,12 +135,12 @@ Releases are produced by **GitHub Actions** (`.github/workflows/release.yml`), n
 - **Close behavior**: clicking close on the main window hides to tray; on `/editor` it instead navigates back to `/dashboard` (X is "discard capture" there). Real quit only via tray menu / `ExitLumia` hotkey / explicit `markQuitting()`.
 - **Single-instance lock**: `app.requestSingleInstanceLock()` prevents Chromium cache lock errors when relaunching while the tray instance is still alive.
 
-### Persistence (electron-store)
+### Persistence
 
-Four isolated stores under the OS userData dir:
+Under the OS userData dir (`settings.json`, `templates.json` and `hotkeys.json` are electron-store files):
 - `settings.json` — `AppSettings` (theme, default save path, active workflow, Google Drive tokens, last capture mode/kind — `lastCaptureKind` is `image | video | scroll` — scroll method (`scrollCaptureMethod`: `extension | screen`), history retention, last annotation style — `annotationStyle: { color, strokeWidth }`, written on toolbar picks and restored when the editor opens)
 - `templates.json` — user workflow templates (built-ins are code-defined, never persisted)
-- `history.json` — capture history (capped at 1000 entries). Thumbnails are **not** inline any more: each row's `thumbnailFile` names a JPEG under `userData/thumbnails/`, `history:get` derives the `lumia-media://` URL the renderer puts in `<img src>` (so `loading="lazy"` actually defers offscreen previews — data: URLs never did), and rows from older builds that still carry a data-URL `thumbnailUrl` are moved to files on first start
+- `history/YYYY-MM-DD.json` + `history_stat.json` — capture history, one file per local day plus totals (see `history-days.ts`; no row cap, the retention setting is the only limit). The old single `history.json` (an electron-store file, capped at 1000 rows) is moved into day files on first start and deleted, no backup (the capture files in `~/Pictures/Lumia` are the real data). Older builds don't read day files and show an empty history on the same profile. Thumbnails are **not** inline any more: each row's `thumbnailFile` names a JPEG under `userData/thumbnails/`, `history:days` / `history:recent` derive the `lumia-media://` URL the renderer puts in `<img src>` (so `loading="lazy"` actually defers offscreen previews — data: URLs never did), and rows from older builds that still carry a data-URL `thumbnailUrl` are moved to files on first start
 - `hotkeys.json` — `HotkeyConfig` with `schemaVersion` for forward migrations of capture-mode bindings
 
 ### Workflow pipeline

@@ -928,7 +928,7 @@ export function setupVideoActions() {
     if (isTrimRunning()) return { ok: false, error: 'Another trim is already running' }
 
     const store = getHistoryStore()
-    const item = store?.getAll().find(i => i.id === historyId)
+    const item = store?.get(historyId)
     if (!store || !item) return { ok: false, error: 'Recording not found' }
     if (item.type !== 'recording' || !item.filePath) return { ok: false, error: 'Not a recording' }
     const original = resolvePath(normalize(item.filePath))
@@ -965,7 +965,7 @@ export function setupVideoActions() {
     const snapMs = res.outputDurationMs != null ? Math.max(0, res.outputDurationMs - requested) : 0
     const actualStartMs = Math.max(0, startMs - snapMs)
 
-    const fresh = store.getAll().find(i => i.id === historyId) ?? item
+    const fresh = store.get(historyId) ?? item
     const updated = store.update(historyId, {
       annotatedFilePath: dst,
       trim: { startMs, endMs, actualStartMs },
@@ -980,7 +980,7 @@ export function setupVideoActions() {
 
   ipcMain.handle('video:clear-trim', async (_e, historyId: string, thumbnailDataUrl?: string) => {
     const store = getHistoryStore()
-    const item = store?.getAll().find(i => i.id === historyId)
+    const item = store?.get(historyId)
     if (!store || !item) return { ok: false, error: 'Recording not found' }
     if (item.type !== 'recording') return { ok: false, error: 'Not a recording' }
     const updated = store.update(historyId, {
