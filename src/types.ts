@@ -54,6 +54,21 @@ export interface AnnotationObject {
   isBlur?: boolean
 }
 
+/** The app and window a capture came from (electron/capture-source.ts). */
+export interface CaptureSource {
+  /** App name: macOS the owner name ("Google Chrome"), Windows the exe name
+   *  without ".exe" ("chrome"), the browser for extension captures. */
+  app?: string
+  /** Window title, or the page title for extension captures. */
+  title?: string
+  /** A region or screen showing two or more windows (2026-11-23): no app or
+   *  title, shown as "Region / Multiple". */
+  multiple?: boolean
+}
+
+/** How a clip was captured (HistoryItem.captureMode). */
+export type ClipCaptureMode = 'region' | 'window' | 'screen' | 'scroll'
+
 export interface HistoryItem {
   id: string
   timestamp: number
@@ -63,6 +78,15 @@ export interface HistoryItem {
   thumbnailUrl?: string
   size?: number
   type: 'screenshot' | 'recording'
+  // Where it was captured: the app and window under the captured area,
+  // resolved at confirm time. Absent on rows from before 2026-11-21 and
+  // when the OS wouldn't say.
+  source?: CaptureSource
+  // How it was captured: a region, one window, a whole screen, or a page
+  // scrolled by the browser extension. Set from 2026-11-21; the list view
+  // shows the source only for window and scroll captures, and names the
+  // kind for the others ("Region", "Screen").
+  captureMode?: ClipCaptureMode
   uploads: UploadResult[]
   // Set by main on history:days / history:recent when filePath is missing from disk. Never
   // persisted — the store keeps items even when files are gone so the user
@@ -79,6 +103,22 @@ export interface HistoryItem {
   annotatedFilePath?: string
   // Recording only: the applied trim (cut from the original). Absent = untrimmed.
   trim?: VideoTrim
+  // Recording only: length of the original file in ms (the trimmed length is
+  // trim.endMs - trim.actualStartMs). Absent until main has read it.
+  durationMs?: number
+  // Recording only, set by main on the rows it hands over: no card preview
+  // / no filmstrip yet (src/lib/strip-jobs.ts makes them).
+  needsPreview?: boolean
+  needsStrip?: boolean
+  // Recording only: the frame rate it was recorded at (absent on rows from
+  // before 2026-11-27; see shared/recording.ts recordingFps).
+  fps?: number
+  // Screenshot only: pixel size of the file the card stands for (the edited
+  // copy when there is one, else the original), read from its PNG header by
+  // history:days / history:recent. Never persisted — set only on the IPC
+  // response, like fileMissing.
+  width?: number
+  height?: number
 }
 
 /** Applied trim on a recording. `startMs`/`endMs` are what the user picked;
@@ -111,30 +151,7 @@ export interface StickerManifest {
   categories: StickerCategory[]
 }
 
-export interface UnsplashPhoto {
-  id: string
-  description: string | null
-  width: number
-  height: number
-  color: string | null
-  blurHash: string | null
-  urls: {
-    raw: string
-    full: string
-    regular: string
-    small: string
-    thumb: string
-  }
-  links: {
-    html: string
-    downloadLocation: string
-  }
-  user: {
-    name: string
-    username: string
-    link: string
-  }
-}
+export type { WallpaperPhoto } from '../shared/wallpapers'
 
 /** Totals from history_stat.json (mirror of electron/history-days.ts). */
 export interface DayStat { day: string; total: number; screenshot: number; recording: number }

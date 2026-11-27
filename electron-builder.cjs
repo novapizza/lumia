@@ -58,7 +58,8 @@ module.exports = {
       to: 'tray',
       filter: ['**/*.png', '**/*.ico']
     },
-    { from: 'resources/icons/png/icon.png', to: 'icons/png/icon.png' },
+    // The capture watermark (mark + name, two inks; scripts/make-watermark.py).
+    { from: 'resources/watermark', to: 'watermark' },
     { from: 'resources/icon.png', to: 'icon.png' },
     { from: 'resources/picker.html', to: 'picker.html' },
     // LGPL notice + licence text for the bundled ffmpeg (required to ship it).

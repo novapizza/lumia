@@ -15,6 +15,7 @@ import { spawn, type ChildProcess } from 'child_process'
 import { rename, unlink } from 'fs/promises'
 import { dirname, join, basename } from 'path'
 import { app } from 'electron'
+import { fpsFromFfmpegInfo } from '../shared/recording'
 
 /** Resolve the ffmpeg binary.
  *  - Packaged: the afterPack hook (build/embed-ffmpeg.cjs) places a per-arch
@@ -123,20 +124,43 @@ export function isTrimRunning(): boolean {
  *  real length (verified: 4.0 s asked → 4.30 s file with 1 s keyframes,
  *  9.30 s file with a single keyframe at 0). */
 async function probeDurationMs(ffmpeg: string, file: string): Promise<number | undefined> {
+  return (await probeInfo(ffmpeg, file)).durationMs
+}
+
+/** What `ffmpeg -i` says about a file: its length, and its video stream's
+ *  frame rate when the header names one. Both undefined when the file can't
+ *  be read. */
+async function probeInfo(ffmpeg: string, file: string): Promise<{ durationMs?: number; fps?: number }> {
   return new Promise((resolve) => {
     const proc = spawn(ffmpeg, ['-hide_banner', '-i', file], { windowsHide: true })
     let err = ''
     proc.stderr?.on('data', (d) => { if (err.length < 8000) err += d.toString() })
     const timer = setTimeout(() => { try { proc.kill('SIGKILL') } catch { /* ignore */ } }, 15_000)
-    proc.on('error', () => { clearTimeout(timer); resolve(undefined) })
+    proc.on('error', () => { clearTimeout(timer); resolve({}) })
     proc.on('close', () => {
       clearTimeout(timer)
       const m = /Duration:\s*(\d+):(\d{2}):(\d{2}(?:\.\d+)?)/.exec(err)
-      if (!m) return resolve(undefined)
+      if (!m) return resolve({})
       const ms = (Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3])) * 1000
-      resolve(Number.isFinite(ms) ? Math.round(ms) : undefined)
+      resolve({ durationMs: Number.isFinite(ms) ? Math.round(ms) : undefined, fps: fpsFromFfmpegInfo(err) })
     })
   })
+}
+
+/** Length of a media file in ms from its Duration header, or undefined when
+ *  ffmpeg is missing or the file has no readable header. */
+export async function probeWebmDurationMs(file: string): Promise<number | undefined> {
+  const ffmpeg = resolveFfmpegPath()
+  if (!ffmpeg) return undefined
+  return probeDurationMs(ffmpeg, file)
+}
+
+/** Length and (when the header names one) frame rate of a media file, from
+ *  one ffmpeg run. `{}` when ffmpeg is missing or the file can't be read. */
+export async function probeWebmInfo(file: string): Promise<{ durationMs?: number; fps?: number }> {
+  const ffmpeg = resolveFfmpegPath()
+  if (!ffmpeg) return {}
+  return probeInfo(ffmpeg, file)
 }
 
 /** Losslessly cut [startMs, endMs) of `src` into a new file at `dst`. The

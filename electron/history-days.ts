@@ -1,5 +1,5 @@
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import type { HistoryItem } from './types'
 
 /**
@@ -78,12 +78,36 @@ function statFor(day: string, items: HistoryItem[]): DayStat {
   return { day, total: items.length, screenshot, recording }
 }
 
+/** The one DayHistory of a root for this session. Everything that reads or
+ *  writes a history goes through it, so no second copy with its own cache
+ *  can write an older picture of a day over a newer one (a folder move
+ *  running while a recording that began in the old folder is saved there,
+ *  2026-11-27). */
+const openHistories = new Map<string, DayHistory>()
+export function dayHistoryFor(rootDir: string): DayHistory {
+  const key = resolve(rootDir)
+  let h = openHistories.get(key)
+  if (!h) {
+    h = new DayHistory(key)
+    openHistories.set(key, h)
+  }
+  return h
+}
+/** Forget a root's instance (it couldn't be opened for writing): the next
+ *  ask opens it afresh. */
+export function forgetDayHistory(rootDir: string): void {
+  openHistories.delete(resolve(rootDir))
+}
+
 export class DayHistory {
   private readonly dir: string
   private readonly statsPath: string
   private stats: HistoryStats
   private readonly cache = new Map<string, HistoryItem[]>()
   private readonly idDay = new Map<string, string>()
+  /** Days whose ids are in `idDay` (read or written this session), also
+   *  after the day left the cache: see `locate`. */
+  private readonly indexedDays = new Set<string>()
   /** Days whose file couldn't be read or moved aside: never written this
    *  session, so the file's content survives for a later look. */
   private readonly blocked = new Set<string>()
@@ -214,6 +238,40 @@ export class DayHistory {
     return { item, day }
   }
 
+  /** Several row changes at once, each day written a single time (the file
+   *  fingerprints of a whole day's rows, file-relink.ts: one `update` per row
+   *  rewrote the day file and the stats for every row). Same result as
+   *  calling `update` for each in order; unknown ids are skipped. Returns the
+   *  days written. */
+  updateMany(patches: { id: string; patch: Partial<HistoryItem> }[]): string[] {
+    const byDay = new Map<string, { id: string; patch: Partial<HistoryItem> }[]>()
+    for (const p of patches) {
+      const day = this.locate(p.id)
+      if (!day) continue
+      if (!byDay.has(day)) byDay.set(day, [])
+      byDay.get(day)!.push(p)
+    }
+    const written: string[] = []
+    for (const [day, list] of byDay) {
+      const items = [...this.readDay(day)]
+      let changed = false
+      for (const { id, patch } of list) {
+        const idx = items.findIndex(i => i.id === id)
+        if (idx < 0) continue
+        // Already so (two reads of a day found the same fingerprints): no write.
+        const now = items[idx] as unknown as Record<string, unknown>
+        if (Object.entries(patch).every(([k, v]) => k === 'timestamp' || now[k] === v)) continue
+        // A row never changes day: its timestamp is fixed.
+        items[idx] = { ...items[idx], ...patch, timestamp: items[idx].timestamp }
+        changed = true
+      }
+      if (!changed) continue
+      this.writeDay(day, items)
+      written.push(day)
+    }
+    return written
+  }
+
   deleteMany(ids: string[]): { removed: HistoryItem[]; days: string[] } {
     const byDay = new Map<string, Set<string>>()
     for (const id of ids) {
@@ -340,18 +398,23 @@ export class DayHistory {
     this.cache.delete(day)
     this.cache.set(day, items)
     for (const it of items) this.idDay.set(it.id, day)
+    this.indexedDays.add(day)
     while (this.cache.size > DAY_CACHE_SIZE) {
       const oldest = this.cache.keys().next().value as string
       this.cache.delete(oldest)
     }
   }
 
-  /** Which day holds `id`: the id map, else day files newest first. */
+  /** Which day holds `id`: the id map, else day files newest first. Once
+   *  every day has been read the id map is complete (writes keep it so), and
+   *  an id it doesn't have is unknown without reading the files again (a
+   *  folder move asks for every moved row's id, 2026-11-27). */
   private locate(id: string): string | null {
     const known = this.idDay.get(id)
     if (known) return known
+    if (this.indexedDays.size >= this.stats.days.length && this.stats.days.every(d => this.indexedDays.has(d.day))) return null
     for (const d of this.stats.days) {
-      if (this.cache.has(d.day)) continue // already in idDay if present
+      if (this.indexedDays.has(d.day)) continue // its ids are in idDay
       if (this.readDay(d.day).some(i => i.id === id)) return d.day
     }
     return null

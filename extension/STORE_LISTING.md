@@ -43,8 +43,9 @@ WHAT YOU CAN CAPTURE
 • Full page — scroll the whole page (or an app's inner scroll pane) and stitch
   it into one tall image, keeping the header and sidebar chrome instead of
   cropping them away.
-• Select area — pick any element on the page (a d-pad / arrow keys walk the DOM
-  tree: parent, child, siblings) and capture exactly that box.
+• Part of page — hover any part of the page; a path bar shows where it sits,
+  and the arrow keys step out, in, or to the part next to it. Capture exactly
+  that part.
 
 HOW IT WORKS
 The extension scrolls the page in exact viewport steps, photographs each step,
@@ -93,7 +94,7 @@ Optional, off by default. Only needed when the user starts a capture from the
 Lumia DESKTOP APP instead of the popup (there is no browser gesture in that
 flow, so activeTab cannot apply) and for the live tab preview shown in Lumia's
 multi-browser picker. Requested with a single explicit opt-in button in the
-popup ("Allow captures from the app"); every capture is still user-initiated.
+popup ("Allow site access"); every capture is still user-initiated.
 ```
 
 `scripting`
@@ -144,11 +145,11 @@ public URL, e.g. GitHub Pages, or `https://lumia.asia/extension-privacy`.
 Suggested shots (crop/scale your desktop to 1280×800):
 
 1. The extension popup open over a long article — three mode buttons + the green
-   "Connected" dot. Caption: *"Three capture modes, one click."*
-2. A full-page capture mid-scroll: the on-page status pill ("Lumia capturing
-   4/11…") with the Stop & save button. Caption: *"Watch it scroll — stop
+   connected check. Caption: *"Three capture modes, one click."*
+2. A full-page capture mid-scroll: the on-page status toast ("Capturing page
+   (4 of 11)…") with the Stop and save button. Caption: *"Watch it scroll — stop
    anytime and keep what's captured."*
-3. The Select-area picker highlighting an element with the d-pad visible.
+3. The part-of-page picker outlining an element, its path bar and key hints visible.
    Caption: *"Pick exactly the element you want."*
 4. The finished tall screenshot open in the Lumia desktop editor. Caption:
    *"Lands straight in Lumia to annotate and share."*

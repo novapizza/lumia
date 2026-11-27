@@ -15,10 +15,14 @@
  * (stop / cancel) tears the overlay down via destroyAnnotation().
  */
 
+import { dockTrace } from './dock-trace'
 import { app, BrowserWindow, ipcMain, screen } from 'electron'
 import { join } from 'path'
-
-const isDev = !app.isPackaged
+import { getSettings, setSetting } from './settings'
+import { frontMacAppBundle, activateMacApp } from './mac-window-pick'
+import { loadRoute } from './load-route'
+import { useFullTheme } from './index'
+import { DEFAULT_ANNOTATION_COLOR } from '../shared/annotation'
 
 let overlayWin: BrowserWindow | null = null
 // Tracks the user-visible "Annotate" toggle. Distinct from "the overlay
@@ -34,29 +38,44 @@ let annotationActive = false
  *  overlay turn into strokes — that keeps the first click after enabling
  *  annotation from being an accidental drag. */
 interface AnnotationState {
-  tool: 'none' | 'select' | 'pen' | 'arrow' | 'rect' | 'ellipse' | 'highlighter'
+  // The image editor's tools without Sticker and Blur (2026-11-24).
+  tool: 'none' | 'pen' | 'highlighter' | 'arrow' | 'rect' | 'ellipse' | 'text'
   color: string
   strokeWidth: number
 }
 
 const state: AnnotationState = {
   tool: 'none',
-  color: '#f87171',
+  color: DEFAULT_ANNOTATION_COLOR,
   strokeWidth: 4,
 }
 
-function loadRoute(win: BrowserWindow, route: string) {
-  if (isDev) {
-    win.loadURL(`http://localhost:5173/#${route}`)
-  } else {
-    win.loadFile(join(__dirname, '../renderer/index.html'), { hash: route })
-  }
+/** What the overlay reports about its drawings (2026-11-24, the image
+ *  editor's toolbar behaviour): the selected shape's kind (its options show
+ *  in the toolbar) and whether Undo / Redo have steps. Forwarded to the
+ *  recording toolbar as `annotation:edit-state`. */
+interface AnnotationEditState { selectedKind: AnnotationState['tool'] | null; canUndo: boolean; canRedo: boolean }
+let editState: AnnotationEditState = { selectedKind: null, canUndo: false, canRedo: false }
+
+/** Colour and stroke are the image editor's saved style (`annotationStyle`):
+ *  read when the overlay opens, written on a toolbar pick (debounced, as the
+ *  editor does). A pick that only mirrors a selected shape isn't saved. */
+let persistTimer: ReturnType<typeof setTimeout> | null = null
+function persistStyle() {
+  if (persistTimer) clearTimeout(persistTimer)
+  persistTimer = setTimeout(() => {
+    persistTimer = null
+    setSetting('annotationStyle', { color: state.color, strokeWidth: state.strokeWidth })
+  }, 300)
 }
 
 function createOverlayWindow(display: Electron.Display) {
   const { x, y, width, height } = display.bounds
   const win = new BrowserWindow({
     x, y, width, height,
+    // Square corners: macOS rounds a frameless window's by default, which
+    // would clip strokes drawn into the display's corners.
+    roundedCorners: false,
     transparent: true,
     backgroundColor: '#00000000',
     frame: false,
@@ -71,11 +90,10 @@ function createOverlayWindow(display: Electron.Display) {
     // before the transparent body is drawn — causes a visible flash on
     // every "Annotate" toggle. ready-to-show below brings it back.
     show: false,
-    // Non-focusable so the OS doesn't raise the overlay above the recording
-    // toolbar when it briefly takes focus (e.g., during stroke draw, when
-    // creating it). Without this Windows can place the topmost overlay
-    // ahead of the topmost toolbar and swallow clicks meant for buttons.
-    focusable: false,
+    // Focusable since 2026-11-24 (the editor keys while drawing, see
+    // annotation-overlay:want-focus). Taking focus can raise it over the
+    // recording toolbar on Windows, so the toolbar and border are re-raised
+    // each time it does.
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       contextIsolation: true,
@@ -101,9 +119,15 @@ function createOverlayWindow(display: Electron.Display) {
   // below to keep the toolbar buttons clickable despite the overlay
   // being a fullscreen click-capturing window.
   win.setAlwaysOnTop(true, 'screen-saver')
-  win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true })
+  // skipTransformProcessType (2026-11-24): without it Electron briefly
+  // switches the whole app's process type on macOS, which took activation
+  // from Lumia (the countdown lost focus) and confused the Dock state.
+  win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true, skipTransformProcessType: true })
+  // Not a window the user manages: keep it out of Mission Control / Exposé.
+  if (process.platform === 'darwin') win.setHiddenInMissionControl(true)
   // Overlay is intentionally NOT content-protected — strokes have to land
   // in the recording, that's the whole feature.
+  useFullTheme(win.webContents)
   loadRoute(win, '/annotation-overlay')
   win.on('closed', () => { overlayWin = null })
   return win
@@ -147,9 +171,14 @@ export function openAnnotation(
   if (annotationActive) return
   const display = screen.getAllDisplays().find(d => d.id === displayId) ?? screen.getPrimaryDisplay()
 
-  // Always start without a tool selected so the user picks deliberately —
-  // color and stroke width carry over from the previous session.
+  // Always start without a tool selected so the user picks deliberately;
+  // colour and stroke are the editor's saved style.
   state.tool = 'none'
+  const saved = getSettings().annotationStyle
+  if (saved && typeof saved.color === 'string' && typeof saved.strokeWidth === 'number') {
+    state.color = saved.color
+    state.strokeWidth = saved.strokeWidth
+  }
 
   const reusingOverlay = hasLiveAnnotations()
   if (!reusingOverlay) {
@@ -182,6 +211,7 @@ export function openAnnotation(
   // group and visible. The +50ms timer is a safety net for the cached-
   // paint case where ready-to-show has already fired.
   const wins = [...topmostAfter]
+  raiseWins = wins
   if (overlayWin) {
     overlayWin.once('ready-to-show', () => raiseAboveOverlay(wins))
   }
@@ -194,6 +224,7 @@ export function openAnnotation(
  *  underneath while their annotations remain visible (and being
  *  recorded). Strokes only go away on destroyAnnotation(). */
 export function closeAnnotation() {
+  releaseFocus()
   annotationActive = false
   if (overlayWin && !overlayWin.isDestroyed()) {
     overlayWin.setIgnoreMouseEvents(true, { forward: true })
@@ -208,6 +239,40 @@ export function destroyAnnotation() {
     try { overlayWin.close() } catch { /* ignore */ }
   }
   overlayWin = null
+  editState = { selectedKind: null, canUndo: false, canRedo: false }
+  focusTaken = false
+  prevFrontBundle = null
+}
+
+/** Keyboard focus for the drawing layer (2026-11-24): taken while a drawing
+ *  tool or a selection is active, so the image editor's keys work; given
+ *  back to the app that was in front (the recorded one) afterwards. On
+ *  macOS that means making Lumia the active app, then activating the other
+ *  app again. The toolbar and border are re-raised over the layer after it
+ *  takes focus (Windows orders topmost windows by the last raise). */
+let raiseWins: BrowserWindow[] = []
+let focusTaken = false
+let prevFrontBundle: Promise<string> | null = null
+
+function takeFocus() {
+  if (focusTaken || !overlayWin || overlayWin.isDestroyed()) return
+  focusTaken = true
+  if (process.platform === 'darwin') {
+    prevFrontBundle = frontMacAppBundle()
+    dockTrace('app.focus steal (drawing layer)')
+    app.focus({ steal: true })
+  }
+  overlayWin.focus()
+  raiseAboveOverlay(raiseWins)
+}
+
+function releaseFocus() {
+  if (!focusTaken) return
+  focusTaken = false
+  if (process.platform !== 'darwin') return
+  const pending = prevFrontBundle
+  prevFrontBundle = null
+  void pending?.then(activateMacApp)
 }
 
 /** Re-raise each window above the live annotation overlay on Windows.
@@ -283,16 +348,27 @@ export function setupAnnotation() {
     }
     broadcastAnnotationState()
   })
-  ipcMain.handle('annotation:set-color', (_e, color: string) => {
+  // `mirror`: the overlay showing a selected shape's own style, not a pick.
+  ipcMain.handle('annotation:set-color', (_e, color: string, mirror?: boolean) => {
     state.color = color
     broadcastAnnotationState()
+    if (!mirror) persistStyle()
   })
-  ipcMain.handle('annotation:set-stroke', (_e, strokeWidth: number) => {
+  ipcMain.handle('annotation:set-stroke', (_e, strokeWidth: number, mirror?: boolean) => {
     state.strokeWidth = strokeWidth
     broadcastAnnotationState()
+    if (!mirror) persistStyle()
   })
   ipcMain.handle('annotation:clear', () => sendToOverlay('annotation:clear'))
   ipcMain.handle('annotation:undo', () => sendToOverlay('annotation:undo'))
+  ipcMain.handle('annotation:redo', () => sendToOverlay('annotation:redo'))
+  ipcMain.handle('annotation:get-edit-state', () => editState)
+  ipcMain.on('annotation:edit-state', (_e, s: AnnotationEditState) => {
+    editState = s
+    for (const w of BrowserWindow.getAllWindows()) {
+      if (!w.isDestroyed()) w.webContents.send('annotation:edit-state', s)
+    }
+  })
 
   // Renderer-driven hover hit-test for tool='none' mode. The overlay is in
   // pass-through (setIgnoreMouseEvents true,forward) by default so the
@@ -300,6 +376,12 @@ export function setupAnnotation() {
   // existing stroke, the renderer flips the overlay back to capture so
   // the click registers as a select; on leave, back to pass-through.
   // Sent on transition only.
+  ipcMain.on('annotation-overlay:want-focus', (_e, want: boolean) => {
+    if (!annotationActive) return
+    if (want) takeFocus()
+    else releaseFocus()
+  })
+
   ipcMain.on('annotation-overlay:set-interactive', (_e, interactive: boolean) => {
     if (!overlayWin || overlayWin.isDestroyed()) return
     // Don't override drawing/select modes — those want full capture

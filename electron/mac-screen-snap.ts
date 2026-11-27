@@ -19,6 +19,7 @@
  * hosts don't pay a spawn attempt on every capture.
  */
 
+import { dockTrace } from './dock-trace'
 import { spawn, ChildProcessWithoutNullStreams } from 'child_process'
 import { app, nativeImage, screen } from 'electron'
 import { existsSync } from 'fs'
@@ -179,6 +180,7 @@ function startHelper(): boolean {
     // capture at the compositor level (window-at-point convention). Lets the
     // freeze run without waiting for the main window's hide to settle.
     proc = spawn(bin, [String(process.pid)], { stdio: ['pipe', 'pipe', 'pipe'] })
+    dockTrace(`helper spawned: screen-snap pid ${proc.pid}`)
   } catch (err) {
     console.error('[mac-screen-snap] failed to spawn helper:', err)
     proc = null
@@ -254,6 +256,23 @@ export async function captureDisplayMacSnap(
     return { image, raw: { buffer: reply.data, width: reply.width, height: reply.height } }
   } catch (err) {
     console.error('[mac-screen-snap] createFromBitmap failed:', err)
+    return null
+  }
+}
+
+/** One window on its own by CGWindowID, like macOS's window screenshot: its
+ *  own pixels with alpha (transparent rounded corners, nothing behind or over
+ *  it), no shadow, already sRGB. Null on any failure (the caller falls back
+ *  to the cut-out from the screen). */
+export async function captureMacWindow(windowId: number): Promise<Electron.NativeImage | null> {
+  if (process.platform !== 'darwin' || unsupported) return null
+  if (!startHelper() || !proc) return null
+  const reply = await request(`window ${Math.round(windowId)}`)
+  if (!reply) return null
+  try {
+    return nativeImage.createFromBitmap(reply.data, { width: reply.width, height: reply.height })
+  } catch (err) {
+    console.error('[mac-screen-snap] createFromBitmap (window) failed:', err)
     return null
   }
 }

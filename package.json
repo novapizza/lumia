@@ -8,8 +8,8 @@
   "scripts": {
     "test": "node --experimental-strip-types --test \"tests/**/*.test.ts\"",
     "preinstall": "npx only-allow pnpm",
-    "icons": "node build/generate-icons.cjs",
-    "icons:subset": "python scripts/subset-material-symbols.py",
+    "icons": "python3 scripts/make-app-icons.py && node build/generate-icons.cjs",
+    "watermark": "python3 scripts/make-watermark.py",
     "ffmpeg:min:win": "docker build -f build/minimal-ffmpeg/Dockerfile -o type=local,dest=build/minimal-ffmpeg/dist --target export build",
     "ffmpeg:min:mac": "bash build/build-minimal-ffmpeg-mac.sh arm64 build/minimal-ffmpeg/dist && bash build/build-minimal-ffmpeg-mac.sh x64 build/minimal-ffmpeg/dist",
     "dev": "electron-vite dev",
@@ -20,11 +20,13 @@
     "postinstall": "node node_modules/electron/install.js && electron-builder install-app-deps"
   },
   "dependencies": {
+    "@fontsource/manrope": "^5.3.0",
     "electron-log": "^5.4.4",
     "electron-store": "^11.0.2",
     "electron-updater": "^6.8.12",
     "fft.js": "^4.0.4",
     "koffi": "^3.0.2",
+    "lucide-react": "1.77.0",
     "uuid": "^14.0.0",
     "ws": "^8.21.1"
   },
@@ -39,8 +41,6 @@
   },
   "devDependencies": {
     "@electron/notarize": "^3.1.1",
-    "@fontsource/inter": "^5.2.8",
-    "@fontsource/manrope": "^5.2.8",
     "@tailwindcss/vite": "^4.3.5",
     "@types/node": "^26.0.0",
     "@types/react": "^19.2.17",
@@ -53,7 +53,6 @@
     "electron-vite": "^6.0.0",
     "ffmpeg-static": "^5.3.0",
     "konva": "^10.3.0",
-    "material-symbols": "^0.45.2",
     "png2icons": "^2.0.1",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",

@@ -1,4 +1,5 @@
 import type { HistoryItem } from '../types'
+import { uploadLinksOf } from './upload-choice'
 
 // Shared action handlers for history items. The same entry points drive the
 // Dashboard card hover buttons and the list-row inline buttons, and should
@@ -7,6 +8,22 @@ import type { HistoryItem } from '../types'
 // All handlers take a `refreshHistory` callback so they can re-fetch the
 // history after a mutation (orphan flips, new uploads) — keeps the UI honest
 // without each caller reimplementing that glue.
+
+/** The editor's location.state for a history row, the way the Dashboard
+ *  opens a clip: a recording by its files and trim, an image by its ORIGINAL
+ *  file (annotations ride along as vectors, Canvas replays them one commit
+ *  each so Undo walks back through them). Null when the file can't be read;
+ *  the caller decides what a missing file means. */
+export async function editorStateFor(item: HistoryItem): Promise<Record<string, unknown> | null> {
+  if (item.fileMissing) return null
+  if (item.type === 'recording') {
+    return { kind: 'video', filePath: item.filePath, trimmedFilePath: item.annotatedFilePath, trim: item.trim, fps: item.fps, name: item.name, historyId: item.id, annotations: item.annotations, uploadLinks: uploadLinksOf(item.uploads) }
+  }
+  let dataUrl: string | null | undefined = item.dataUrl
+  if (!dataUrl && item.filePath) dataUrl = await window.electronAPI?.readHistoryFile(item.filePath) ?? null
+  if (!dataUrl) return null
+  return { kind: 'image', dataUrl, source: 'history', historyId: item.id, annotations: item.annotations, uploadLinks: uploadLinksOf(item.uploads) }
+}
 
 export interface CopyResult { ok: boolean; error?: string }
 export interface ShareResult { ok: boolean; url?: string; error?: string }
@@ -44,7 +61,9 @@ export async function shareHistoryItem(
   item: HistoryItem,
   refreshHistory: () => Promise<void>,
 ): Promise<ShareResult> {
-  if (item.fileMissing || !item.filePath) return { ok: false, error: 'File missing on disk' }
+  // Already on R2: main hands back the existing link, no file needed.
+  const onR2 = item.uploads?.some(u => u.destination === 'r2' && u.success && u.url)
+  if (!onR2 && (item.fileMissing || !item.filePath)) return { ok: false, error: 'File missing on disk' }
   const res = await window.electronAPI?.shareHistoryR2(item.id)
   // Repopulate so the "Synced" badge flips on and the repeat-share fast path
   // in main has an up-to-date uploads array to short-circuit against.
@@ -60,7 +79,8 @@ export async function shareHistoryGoogleDrive(
   item: HistoryItem,
   refreshHistory: () => Promise<void>,
 ): Promise<ShareResult> {
-  if (item.fileMissing || !item.filePath) return { ok: false, error: 'File missing on disk' }
+  // Already on Drive: main hands back the existing link, no file needed.
+  if (!getGoogleLink(item) && (item.fileMissing || !item.filePath)) return { ok: false, error: 'File missing on disk' }
   const res = await window.electronAPI?.shareHistoryGoogleDrive(item.id)
   await refreshHistory()
   return { ok: !!res?.success, url: res?.url, error: res?.error }

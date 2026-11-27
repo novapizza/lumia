@@ -1,4 +1,43 @@
+import { BAR_TOP_DEFAULT } from '../../../shared/capture-bar'
 import { useState, useEffect, useRef, useCallback } from 'react'
+
+import { Segmented } from '../../components/Segmented'
+import { TooltipLayer } from '../../components/TooltipLayer'
+import { KIND_ICON } from '../../utils/captureLabels'
+
+/** A camera pointer like macOS's screenshot one (Apple: "the screenshot you
+ *  take is of an entire window"), for the window and monitor picks; the
+ *  region pick keeps the crosshair (2026-11-22; both picks used the
+ *  crosshair or the pointing hand). Chromium has no camera cursor and the
+ *  system's own (HIServices cursors/screenshotwindow) is Apple's artwork, so
+ *  this is our own drawing to its measurements, in its 28x25 frame: black
+ *  body 20x13.5 (x 4 to 24, y 5 to 18.5, corners 2.5) with a raised top
+ *  to y 3, a 1px white outline outside it (the stroke painted under the
+ *  fill), a white lens ring 10px across centred on the click point (14,
+ *  11.5), a 2px flash dot at 20,7, and the soft shadow macOS gives its
+ *  pointers (blur 2, 45% black, 1px down). 1x and 2x so it stays sharp on
+ *  Retina. */
+const CAMERA_PATH = 'M6.5 5H9.6L10.9 3.6Q11.4 3 12.5 3H15.5Q16.6 3 17.1 3.6L18.4 5H21.5A2.5 2.5 0 0 1 24 7.5V16A2.5 2.5 0 0 1 21.5 18.5H6.5A2.5 2.5 0 0 1 4 16V7.5A2.5 2.5 0 0 1 6.5 5Z'
+/** The Video modes' window and screen picks (2026-11-24): a video camera in
+ *  the same style, frame and shadow, its body 15x13 (x 3 to 18, y 6 to 19,
+ *  corners 2.5) with the lens wedge to x 25; click point in the body's
+ *  middle (11, 12). */
+const VIDEO_PATH = 'M5.5 6H15.5A2.5 2.5 0 0 1 18 8.5V10.3L23.6 7.3Q25 6.6 25 8.1V16.9Q25 18.4 23.6 17.7L18 14.7V16.5A2.5 2.5 0 0 1 15.5 19H5.5A2.5 2.5 0 0 1 3 16.5V8.5A2.5 2.5 0 0 1 5.5 6Z'
+function pointerSvg(scale: number, path: string, extra: string): string {
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${28 * scale}" height="${25 * scale}" viewBox="0 0 28 25">`
+    + `<defs><filter id="s" x="-20%" y="-20%" width="140%" height="150%"><feDropShadow dx="0" dy="1" stdDeviation="1" flood-color="#000" flood-opacity="0.45"/></filter></defs>`
+    + `<g filter="url(#s)">`
+    + `<path d="${path}" fill="#000" stroke="#fff" stroke-width="2" stroke-linejoin="round" paint-order="stroke"/>`
+    + extra
+    + `</g></svg>`
+  return `url("data:image/svg+xml,${encodeURIComponent(svg)}")`
+}
+function pointer(path: string, extra: string, hx: number, hy: number): string {
+  return `-webkit-image-set(${pointerSvg(1, path, extra)} 1x, ${pointerSvg(2, path, extra)} 2x) ${hx} ${hy}, ${pointerSvg(1, path, extra)} ${hx} ${hy}, default`
+}
+const CAMERA_CURSOR = pointer(CAMERA_PATH,
+  `<circle cx="14" cy="11.5" r="4.25" fill="none" stroke="#fff" stroke-width="1.5"/><circle cx="20" cy="7" r="1" fill="#fff"/>`, 14, 11)
+const VIDEO_CURSOR = pointer(VIDEO_PATH, '', 11, 12)
 
 interface Rect { x: number; y: number; width: number; height: number }
 
@@ -21,51 +60,46 @@ function baseOf(mode: Mode): Base | 'scroll' {
   return 'region'
 }
 
-const ACCENT = {
-  capture: {
-    border: 'rgba(182,160,255,0.8)',       // primary purple
-    highlightBorder: 'rgba(96,165,250,0.9)', // blue for window/monitor hover
-    highlightShadow: 'rgba(96,165,250,0.3)',
-    highlightFill: 'rgba(96,165,250,0.06)',
-    activeBg: 'rgba(59,130,246,0.06)',
-    tabGlow: '0 0 12px rgba(182,160,255,0.35)',
-  },
-  record: {
-    border: 'rgba(239,68,68,0.9)',          // red-500
-    highlightBorder: 'rgba(239,68,68,0.9)',
-    highlightShadow: 'rgba(239,68,68,0.3)',
-    highlightFill: 'rgba(239,68,68,0.08)',
-    activeBg: 'rgba(239,68,68,0.05)',
-    tabGlow: '0 0 12px rgba(239,68,68,0.45)',
-  },
-} as const
+// One look for every mode (design review 2026-11-24): the pick is framed by
+// a 1px line in the clip type's colour and everything outside it is dimmed.
+// No red in Video mode (red means danger; the recording border during an
+// actual recording stays red), no dashes, no tint over the pick (it would
+// misrepresent the screen's colours).
+/** The frame wears the clip type's colour (2026-11-24, trying it): blue
+ *  for Image, pink for Video, as on the clip cards' type icon. */
+const KIND_COLOR = { capture: 'var(--color-kind-image)', record: 'var(--color-kind-video)' } as const
+/** The capture overlay's dim; a box-shadow ring, not a shadow. */
+const DIM = 'rgba(0,0,0,0.18)'
+/** Over a transparent overlay (video modes have no frozen snapshot), a
+ *  barely-there fill so the window still takes the clicks. */
+const CATCH = 'rgba(0,0,0,0.03)'
 
-function HintCard({ icon, children }: { icon: string; children: React.ReactNode }) {
+/** The pick's size, under it: a small solid box (11px, tabular digits). */
+function SizeLabel({ rect }: { rect: Rect }) {
   return (
     <div
-      className="absolute top-8 left-1/2 -translate-x-1/2 glass-refractive rounded-full px-6 py-3 text-sm text-white font-semibold pointer-events-none"
-      style={{ fontFamily: 'Manrope, sans-serif' }}
+      className="absolute h-6 px-2 flex items-center rounded-md bg-toolbar ring-1 ring-inset ring-line text-[11px] font-medium tabular-nums text-fg pointer-events-none whitespace-nowrap"
+      style={{ left: rect.x + rect.width / 2, top: rect.y + rect.height + 8, transform: 'translateX(-50%)' }}
     >
-      <span className="material-symbols-outlined text-sm mr-2 align-middle">{icon}</span>
-      {children}
+      {Math.round(rect.width)} × {Math.round(rect.height)}
     </div>
   )
 }
 
-/** Floating top bar: mode switcher + hint. Visible only on the active overlay. */
-function ModeBar({
-  mode, hint, icon, intent,
-}: {
-  mode: Mode
-  hint: string
-  icon: string
-  intent: Intent
-}) {
+/** Floating bar at the top of the active display: Image / Video and the
+ *  area. Each area's how-to is its segment's tooltip (no hint row). */
+function ModeBar({ mode, intent, session, top }: { mode: Mode; intent: Intent; session: number; top: number }) {
   const base = baseOf(mode)
-  const accent = ACCENT[intent]
 
-  const switchTo = (nextBase: Base) => {
+  const switchTo = (nextBase: Base | 'scroll') => {
     if (nextBase === base) return
+    // Scroll (Image only, 2026-11-23): the classic screen scroll on a dragged
+    // region. Remembered like the other tools since 2026-11-27.
+    if (nextBase === 'scroll') {
+      window.electronAPI?.switchOverlayMode?.('scroll-region')
+      window.electronAPI?.setSetting?.('lastImageMode', 'scrolling')
+      return
+    }
     const next: Mode = intent === 'record'
       ? (nextBase === 'region' ? 'video-region' : nextBase === 'window' ? 'video-window' : 'video-screen')
       : (nextBase === 'region' ? 'region' : nextBase === 'window' ? 'window-pick' : 'monitor-pick')
@@ -82,97 +116,58 @@ function ModeBar({
       : (safeBase === 'region' ? 'region' : safeBase === 'window' ? 'window-pick' : 'monitor-pick')
     window.electronAPI?.switchOverlayMode?.(next)
     window.electronAPI?.setSetting?.('lastCaptureKind', nextIntent === 'record' ? 'video' : 'image')
+    // The tool carried over counts as picked for the other kind too.
+    window.electronAPI?.setSetting?.(nextIntent === 'record' ? 'lastVideoMode' : 'lastImageMode', safeBase)
   }
 
-  const TabBtn = ({ value, label, tabIcon }: { value: Base; label: string; tabIcon: string }) => {
-    const active = base === value
-    return (
-      <button
-        onMouseDown={(e) => e.stopPropagation()}
-        onMouseUp={(e) => e.stopPropagation()}
-        onClick={(e) => { e.stopPropagation(); switchTo(value) }}
-        className={`px-3 py-1.5 rounded-full text-xs font-semibold flex items-center gap-1 transition-all ${
-          active
-            ? (intent === 'record'
-                ? 'bg-red-500 text-white'
-                : 'bg-primary text-slate-900')
-            : 'text-slate-300 hover:text-white hover:bg-white/10'
-        }`}
-        style={{
-          fontFamily: 'Manrope, sans-serif',
-          boxShadow: active ? accent.tabGlow : undefined,
-        }}
-      >
-        <span className="material-symbols-outlined text-[14px]">{tabIcon}</span>
-        {label}
-      </button>
-    )
-  }
-
-  const IntentBtn = ({ value, label, iconName }: { value: Intent; label: string; iconName: string }) => {
-    const active = intent === value
-    return (
-      <button
-        onMouseDown={(e) => e.stopPropagation()}
-        onMouseUp={(e) => e.stopPropagation()}
-        onClick={(e) => { e.stopPropagation(); switchIntent(value) }}
-        className={`px-2.5 py-1 rounded-full text-[11px] font-semibold flex items-center gap-1 transition-all ${
-          active
-            ? (value === 'record' ? 'bg-red-500/20 text-red-200' : 'bg-primary/25 text-primary')
-            : 'text-slate-400 hover:text-white'
-        }`}
-        style={{ fontFamily: 'Manrope, sans-serif' }}
-      >
-        <span className="material-symbols-outlined text-[13px]">{iconName}</span>
-        {label}
-      </button>
-    )
-  }
+  const record = intent === 'record'
+  // Scroll is Image only; in Video it stays, disabled, so the bar keeps its
+  // width and nothing shifts between the two (2026-11-24).
+  const areas: { key: Base | 'scroll'; label: string; icon: string; tip: string; disabled?: boolean }[] = [
+    { key: 'region', label: 'Region', icon: KIND_ICON.region, tip: 'Drag to select an area' },
+    { key: 'window', label: 'Window', icon: KIND_ICON.window, tip: 'Click a window, or press Enter for the active one' },
+    { key: 'screen', label: 'Screen', icon: KIND_ICON.screen, tip: record ? 'Click to record this screen' : 'Click to capture this screen' },
+    record
+      ? { key: 'scroll', label: 'Scroll', icon: KIND_ICON.scroll, tip: 'Image only', disabled: true }
+      : { key: 'scroll', label: 'Scroll', icon: KIND_ICON.scroll, tip: 'Drag over the area to scroll, Esc stops' },
+  ]
 
   return (
     <div
-      className="absolute top-8 left-1/2 -translate-x-1/2 flex flex-col items-center gap-2"
-      style={{ fontFamily: 'Manrope, sans-serif' }}
+      // `top`: at the display's menu bar's bottom edge, from main
+      // (shared/capture-bar.ts; 32px where there's no menu bar). The
+      // recording toolbar's window is placed by the same number.
+      className="absolute left-1/2 -translate-x-1/2 flex items-center gap-3 p-2.5 rounded-lg bg-toolbar ring-1 ring-inset ring-line cursor-default"
+      style={{ top }}
+      // The overlay root drives region/window picking off POINTER events, so
+      // we must swallow pointer events here too — stopping only the mouse
+      // events lets `pointerdown` bubble through and start a drag (region) or
+      // confirm a window-pick (window) instead of switching modes, which also
+      // setPointerCapture-steals the tab's click. Keep the mouse handlers for
+      // screen mode, whose root listens on `onClick`.
+      onPointerDown={(e) => e.stopPropagation()}
+      onPointerMove={(e) => e.stopPropagation()}
+      onPointerUp={(e) => e.stopPropagation()}
+      onMouseDown={(e) => e.stopPropagation()}
+      onMouseMove={(e) => e.stopPropagation()}
+      onMouseUp={(e) => e.stopPropagation()}
+      onClick={(e) => e.stopPropagation()}
     >
-      <div
-        className="flex items-center gap-3 glass-refractive rounded-full pl-1.5 pr-3 py-1.5"
-        // The overlay root drives region/window picking off POINTER events, so
-        // we must swallow pointer events here too — stopping only the mouse
-        // events lets `pointerdown` bubble through and start a drag (region) or
-        // confirm a window-pick (window) instead of switching modes, which also
-        // setPointerCapture-steals the tab's click. Keep the mouse handlers for
-        // screen mode, whose root listens on `onClick`.
-        onPointerDown={(e) => e.stopPropagation()}
-        onPointerMove={(e) => e.stopPropagation()}
-        onPointerUp={(e) => e.stopPropagation()}
-        onMouseDown={(e) => e.stopPropagation()}
-        onMouseMove={(e) => e.stopPropagation()}
-        onMouseUp={(e) => e.stopPropagation()}
-        onClick={(e) => e.stopPropagation()}
-      >
-        {intent === 'record' && (
-          <div className="ml-2 mr-1 flex items-center gap-1.5 text-red-400">
-            <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse shadow-[0_0_8px_rgba(239,68,68,0.8)]" />
-            <span className="text-[10px] font-bold uppercase tracking-widest">REC</span>
-          </div>
-        )}
-        <div className="flex items-center gap-0.5 p-0.5 rounded-full bg-white/5 border border-white/10">
-          <IntentBtn value="capture" label="Image" iconName="photo_camera" />
-          <IntentBtn value="record"  label="Video" iconName="videocam" />
-        </div>
-        <div className="w-px h-4 bg-white/10" />
-        <div className="flex items-center gap-1">
-          <TabBtn value="region" label="Region" tabIcon="crop" />
-          <TabBtn value="window" label="Window" tabIcon="web_asset" />
-          <TabBtn value="screen" label="Screen" tabIcon="monitor" />
-        </div>
-      </div>
-
-      {/* Hint on its own row — never fights for space with the controls. */}
-      <div className="flex items-center gap-2 glass-refractive rounded-full px-4 py-1 whitespace-nowrap">
-        <span className="material-symbols-outlined text-sm text-white">{icon}</span>
-        <span className="text-xs font-semibold text-white">{hint}</span>
-      </div>
+      {/* Keyed by session: a fresh control at each open puts the pill where
+          it belongs at once (2026-11-24: the pooled overlay's controls slid
+          from the last session's pick to this one's). */}
+      <Segmented<Intent>
+        key={`intent-${session}`}
+        value={intent}
+        onChange={switchIntent}
+        pillColor={KIND_COLOR[intent]}
+        options={[
+          // The clip type icons from the Dashboard's cards (2026-11-24).
+          { key: 'capture', label: 'Image', icon: 'image' },
+          { key: 'record', label: 'Video', icon: 'smart_display' },
+        ]}
+      />
+      <Segmented<Base | 'scroll'> key={`area-${session}`} value={base} onChange={switchTo} options={areas} pillColor={KIND_COLOR[intent]} />
     </div>
   )
 }
@@ -188,10 +183,43 @@ export default function Overlay() {
   }, [])
 
   const [mode, setMode] = useState<Mode>('region')
+  // Bumped each time main (re)opens the pooled overlay, even in the same mode.
+  const [session, setSession] = useState(0)
+
+  // No focus left on a control (2026-11-24, as App.tsx does in the main
+  // window): a click doesn't keep it, and each open starts with none (the
+  // window taking focus could land it on the first button, ringed).
+  useEffect(() => {
+    const drop = () => { const el = document.activeElement as HTMLElement | null; if (el && el !== document.body) el.blur() }
+    const onClick = (e: MouseEvent) => { if (e.detail > 0) drop() }
+    const onFocus = () => setTimeout(drop, 0)
+    document.addEventListener('click', onClick, true)
+    window.addEventListener('focus', onFocus)
+    return () => {
+      document.removeEventListener('click', onClick, true)
+      window.removeEventListener('focus', onFocus)
+    }
+  }, [])
+  useEffect(() => {
+    const el = document.activeElement as HTMLElement | null
+    if (el && el !== document.body) el.blur()
+  }, [session])
   const [startPos, setStartPos] = useState<{ x: number; y: number } | null>(null)
   const [currentPos, setCurrentPos] = useState<{ x: number; y: number } | null>(null)
   const [isDrawing, setIsDrawing] = useState(false)
-  const [isActive, setIsActive] = useState(true)
+  // Starts inactive (2026-11-27; it started active): a pooled overlay sits
+  // parked and invisible over its display from launch, and while "active"
+  // its page asks for the crosshair. Main only said "inactive" to overlays
+  // that had been opened once, so a never-used one kept asking, and the +
+  // showed over everything as soon as Lumia became the active app (Open
+  // Lumia), until a click on the main window. Every reveal sends the real
+  // state first (`overlay:set-active`, index.ts), as it always did.
+  const [isActive, setIsActive] = useState(false)
+  // The mode bar's top on this display, sent by main at every open.
+  const [barTop, setBarTop] = useState(BAR_TOP_DEFAULT)
+  // Mission Control is up: shown but stepped aside (live screen, clicks pass
+  // through); the bar stays, the tint and frames go.
+  const [aside, setAside] = useState(false)
   const [hoveredWindow, setHoveredWindow] = useState<Rect | null>(null)
   // Frozen snapshot pushed from main at hotkey-press time as raw BGRA bytes
   // (no PNG encode round-trip — saves ~500-1000ms on 4K displays). The
@@ -205,12 +233,10 @@ export default function Overlay() {
   const [frozenBgReady, setFrozenBgReady] = useState(false)
   const frozenCanvasRef = useRef<HTMLCanvasElement>(null)
   const overlayRef = useRef<HTMLDivElement>(null)
-  const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const hoveredWindowRef = useRef<{ x: number; y: number; width: number; height: number } | null>(null)
 
   const intent = intentOf(mode)
   const base = baseOf(mode)
-  const accent = ACCENT[intent]
 
   useEffect(() => {
     window.electronAPI?.getOverlayMode().then(m => setMode(m as Mode))
@@ -218,16 +244,26 @@ export default function Overlay() {
 
   useEffect(() => {
     window.electronAPI?.onOverlaySetActive((active: boolean) => setIsActive(active))
+    window.electronAPI?.onOverlayBarTop?.((top: number) => { if (Number.isFinite(top) && top >= 0) setBarTop(top) })
+    window.electronAPI?.onOverlayAside?.((a: boolean) => {
+      setAside(a)
+      if (a) { setHoveredWindow(null); setStartPos(null); setCurrentPos(null); setIsDrawing(false) }
+    })
     window.electronAPI?.onOverlayModeChanged?.((m) => {
       setMode(m as Mode)
       setStartPos(null)
       setCurrentPos(null)
       setIsDrawing(false)
       setHoveredWindow(null)
+      pickRef.current.gen++
+      pickRef.current.next = null
+      setSession(n => n + 1)
     })
     window.electronAPI?.onOverlayFrozenBgraChanged?.((data) => setFrozenBgr(data))
     return () => {
       window.electronAPI?.removeAllListeners('overlay:set-active')
+      window.electronAPI?.removeAllListeners('overlay:bar-top')
+      window.electronAPI?.removeAllListeners('overlay:aside')
       window.electronAPI?.removeAllListeners('overlay:mode-changed')
       window.electronAPI?.removeAllListeners('overlay:frozen-bgra-changed')
     }
@@ -300,19 +336,47 @@ export default function Overlay() {
     // blank. Re-painting against the existing canvas is a no-op cost-wise.
   }, [frozenBgr, mode])
 
-  // Window-pick: poll window under cursor (throttled 80ms)
-  const pollWindowAt = useCallback(async (x: number, y: number) => {
-    if (base !== 'window' || !isActive) return
-    const rect = await window.electronAPI?.getWindowAt(x, y)
-    hoveredWindowRef.current = rect ?? null
-    setHoveredWindow(rect ?? null)
-  }, [base, isActive])
+  // Window pick: one lookup at a time. A move while one is out parks the
+  // newest point, sent as soon as the answer is back, so the frame follows
+  // the pointer as fast as lookups return (2026-11-24; it waited for the
+  // pointer to rest 80ms). `gen` drops answers that arrive after a confirm,
+  // a cancel or a mode switch.
+  const pickRef = useRef({ busy: false, next: null as { x: number; y: number } | 'cursor' | null, gen: 0 })
+  const liveRef = useRef({ base, isActive: isActive && !aside })
+  liveRef.current = { base, isActive: isActive && !aside }
+
+  const lookupWindow = useCallback((at: { x: number; y: number } | null) => {
+    const q = pickRef.current
+    if (q.busy) { q.next = at ?? 'cursor'; return }
+    const { base: b, isActive: active } = liveRef.current
+    if (b !== 'window' || !active) return
+    const gen = q.gen
+    q.busy = true
+    const req = at ? window.electronAPI?.getWindowAt(at.x, at.y) : window.electronAPI?.getWindowAtCursor?.()
+    Promise.resolve(req).then(rect => {
+      if (gen !== pickRef.current.gen) return
+      hoveredWindowRef.current = rect ?? null
+      setHoveredWindow(rect ?? null)
+    }).catch(() => { /* keep the last frame */ }).finally(() => {
+      q.busy = false
+      const next = q.next
+      q.next = null
+      if (next) lookupWindow(next === 'cursor' ? null : next)
+    })
+  }, [])
+
+  // Frame the window under a still pointer as soon as the pick opens.
+  useEffect(() => {
+    if (base === 'window' && isActive && !aside) lookupWindow(null)
+  }, [base, isActive, aside, session, lookupWindow])
 
   // Wipe transient drawing state. Called on confirm AND cancel so that the
   // pre-warmed overlay window comes up clean on the next session — without
   // this, the prior session's rect lingers in React state and flashes on
   // reopen until the async overlay:mode-changed event resets it.
   const resetDrawState = useCallback(() => {
+    pickRef.current.gen++
+    pickRef.current.next = null
     setStartPos(null)
     setCurrentPos(null)
     setIsDrawing(false)
@@ -362,7 +426,7 @@ export default function Overlay() {
     if (base === 'window') {
       const x = e.clientX
       const y = e.clientY
-      if (pollRef.current) clearTimeout(pollRef.current)
+      pickRef.current.next = null
       window.electronAPI?.getWindowAt(x, y).then(rect => {
         if (!rect) return
         resetDrawState()
@@ -383,10 +447,7 @@ export default function Overlay() {
 
   const handleMouseMove = (e: React.PointerEvent) => {
     if (base === 'window') {
-      const x = e.clientX
-      const y = e.clientY
-      if (pollRef.current) clearTimeout(pollRef.current)
-      pollRef.current = setTimeout(() => pollWindowAt(x, y), 80)
+      lookupWindow({ x: e.clientX, y: e.clientY })
       return
     }
     if (!isDrawing) return
@@ -434,11 +495,16 @@ export default function Overlay() {
   // and the picker UI elements already convey "capture mode active". For
   // inactive overlays (cursor on another display) the snapshot still shows
   // so the user can see what's on each monitor.
+  //
+  // Video modes never show it (2026-11-24): a recording starts from the live
+  // screen, so the pick does too. A session opened for an image and switched
+  // to Video used to keep the still picture over playing video.
+  const showFrozen = frozenBgReady && intent === 'capture'
   const FrozenBgLayer = (
     <canvas
       ref={frozenCanvasRef}
       className="absolute inset-0 w-full h-full pointer-events-none select-none"
-      style={{ zIndex: 0, visibility: frozenBgReady ? 'visible' : 'hidden' }}
+      style={{ zIndex: 0, visibility: showFrozen ? 'visible' : 'hidden' }}
     />
   )
 
@@ -449,32 +515,25 @@ export default function Overlay() {
       if (intent === 'record') window.electronAPI?.confirmVideoScreen?.()
       else window.electronAPI?.confirmMonitorPick()
     }
-    const hint = intent === 'record'
-      ? 'Click to record this monitor · ESC to cancel'
-      : 'Click to capture this monitor · ESC to cancel'
     return (
       <div
         className="fixed inset-0 select-none"
         style={{
-          cursor: isActive ? 'pointer' : 'default',
-          // Tint only over a transparent (video) overlay; over a frozen
-          // snapshot any darken misrepresents the user's screen colors.
-          background: !frozenBgReady && isActive ? accent.activeBg : 'transparent',
+          cursor: isActive && !aside ? (intent === 'record' ? VIDEO_CURSOR : CAMERA_CURSOR) : 'default',
+          background: !showFrozen && isActive && !aside ? CATCH : 'transparent',
         }}
         onClick={onClick}
       >
         {FrozenBgLayer}
+        {/* The picked screen is framed; the others are dimmed. */}
+        <div
+          className="absolute inset-0 pointer-events-none"
+          style={aside ? undefined : isActive ? { boxShadow: `inset 0 0 0 1px ${KIND_COLOR[intent]}` } : { background: DIM }}
+        />
         {isActive && (
           <>
-            <div
-              className="absolute inset-4 pointer-events-none"
-              style={{
-                border: `3px dashed ${accent.highlightBorder}`,
-                borderRadius: 8,
-                boxShadow: `inset 0 0 0 1px ${accent.highlightShadow}`,
-              }}
-            />
-            <ModeBar mode={mode} intent={intent} icon="monitor" hint={hint} />
+            <ModeBar mode={mode} intent={intent} session={session} top={barTop} />
+            <TooltipLayer />
           </>
         )}
       </div>
@@ -483,26 +542,19 @@ export default function Overlay() {
 
   // ── Window-pick / video-window UI ────────────────────────────────────────
   if (base === 'window') {
-    const hint = intent === 'record'
-      ? 'Click a window to record · Enter for active window · ESC to cancel'
-      : 'Click a window · Enter for active window · ESC to cancel'
     return (
       <div
         className="fixed inset-0 select-none"
         style={{
-          cursor: isActive ? 'crosshair' : 'default',
-          background: !frozenBgReady && isActive ? 'rgba(0,0,0,0.03)' : 'transparent',
+          cursor: isActive && !aside ? (intent === 'record' ? VIDEO_CURSOR : CAMERA_CURSOR) : 'default',
+          background: !showFrozen && isActive && !aside ? CATCH : 'transparent',
         }}
         onPointerMove={handleMouseMove}
         onPointerDown={handleMouseDown}
       >
         {FrozenBgLayer}
 
-        {isActive && (
-          <ModeBar mode={mode} intent={intent} icon="window" hint={hint} />
-        )}
-
-        {hoveredWindow && isActive && (
+        {hoveredWindow && isActive && !aside && (
           <>
             <div
               className="absolute pointer-events-none"
@@ -511,23 +563,18 @@ export default function Overlay() {
                 top: hoveredWindow.y,
                 width: hoveredWindow.width,
                 height: hoveredWindow.height,
-                border: `2px dashed ${accent.highlightBorder}`,
-                boxShadow: `0 0 0 9999px rgba(0,0,0,0.08), inset 0 0 0 1px ${accent.highlightShadow}`,
-                borderRadius: 4,
-                background: accent.highlightFill,
+                border: `1px solid ${KIND_COLOR[intent]}`,
+                boxShadow: `0 0 0 9999px ${DIM}`,
               }}
             />
-            <div
-              className="absolute glass-refractive text-xs text-white px-3 py-1.5 rounded-full pointer-events-none font-mono"
-              style={{
-                left: hoveredWindow.x + hoveredWindow.width / 2,
-                top: hoveredWindow.y + hoveredWindow.height + 10,
-                transform: 'translateX(-50%)',
-                fontFamily: 'Manrope, sans-serif',
-              }}
-            >
-              {hoveredWindow.width} × {hoveredWindow.height}
-            </div>
+            <SizeLabel rect={hoveredWindow} />
+          </>
+        )}
+
+        {isActive && (
+          <>
+            <ModeBar mode={mode} intent={intent} session={session} top={barTop} />
+            <TooltipLayer />
           </>
         )}
       </div>
@@ -535,20 +582,13 @@ export default function Overlay() {
   }
 
   // ── Region / scroll-region / video-region UI ─────────────────────────────
-  const hint = mode === 'scroll-region'
-    ? 'Drag to select scroll region · ESC to cancel'
-    : intent === 'record'
-      ? 'Drag to select recording area · ESC to cancel'
-      : 'Drag to select region · ESC to cancel'
-  const icon = mode === 'scroll-region' ? 'swipe_down' : intent === 'record' ? 'fiber_manual_record' : 'crop_free'
-
   return (
     <div
       ref={overlayRef}
       className="fixed inset-0 select-none"
       style={{
-        cursor: isActive ? 'crosshair' : 'default',
-        background: !frozenBgReady && isActive ? 'rgba(0,0,0,0.08)' : 'transparent',
+        cursor: isActive && !aside ? 'crosshair' : 'default',
+        background: !showFrozen && isActive && !aside ? CATCH : 'transparent',
       }}
       onPointerDown={handleMouseDown}
       onPointerMove={handleMouseMove}
@@ -556,46 +596,25 @@ export default function Overlay() {
       onPointerCancel={handlePointerCancel}
     >
       {FrozenBgLayer}
-      <style>{`
-        @keyframes scroll-region-border-pulse {
-          0%, 100% { border-color: rgba(56, 189, 248, 0.8); box-shadow: 0 0 0 9999px rgba(0,0,0,0.18); }
-          50% { border-color: rgba(56, 189, 248, 0.4); box-shadow: 0 0 0 9999px rgba(0,0,0,0.18), 0 0 12px 2px rgba(56, 189, 248, 0.3); }
-        }
-        .scroll-region-pulse { animation: scroll-region-border-pulse 1.5s ease-in-out infinite; }
-      `}</style>
 
-      {isActive && (mode === 'region' || mode === 'video-region') && (
-        <ModeBar mode={mode} intent={intent} icon={icon} hint={hint} />
-      )}
-      {isActive && mode === 'scroll-region' && (
-        <HintCard icon={icon}>{hint}</HintCard>
-      )}
-
-      {rect && rect.width > 0 && rect.height > 0 && (
+      {rect && rect.width > 0 && rect.height > 0 && !aside && (
         <>
           <div
-            className={`absolute pointer-events-none${mode === 'scroll-region' ? ' scroll-region-pulse' : ''}`}
+            className="absolute pointer-events-none"
             style={{
               left: rect.x, top: rect.y, width: rect.width, height: rect.height,
-              background: 'transparent',
-              boxShadow: '0 0 0 9999px rgba(0,0,0,0.18)',
-              border: mode === 'scroll-region'
-                ? '2px solid rgba(56, 189, 248, 0.8)'
-                : `2px dashed ${accent.border}`,
-              borderRadius: 4,
+              border: `1px solid ${KIND_COLOR[intent]}`,
+              boxShadow: `0 0 0 9999px ${DIM}`,
             }}
           />
-          <div
-            className="absolute glass-refractive text-xs text-white px-3 py-1.5 rounded-full pointer-events-none font-mono"
-            style={{
-              left: rect.x + rect.width / 2,
-              top: rect.y + rect.height + 10,
-              transform: 'translateX(-50%)',
-              fontFamily: 'Manrope, sans-serif',
-            }}
-          >
-            {Math.round(rect.width)} × {Math.round(rect.height)}
-          </div>
+          <SizeLabel rect={rect} />
+        </>
+      )}
+
+      {isActive && (
+        <>
+          <ModeBar mode={mode} intent={intent} session={session} top={barTop} />
+          <TooltipLayer />
         </>
       )}
     </div>

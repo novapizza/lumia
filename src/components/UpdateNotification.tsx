@@ -1,114 +1,88 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect } from 'react'
 
-type TransientStatus = 'checking' | 'not-available' | 'downloading' | 'error'
+import { ToastBox, ToastSlot, useLeaving, TOAST_ACTION } from './Toast'
+import { cleanError } from '../lib/toast'
+import { useBadges, setUpdate, setLatest, getUpdate, installUpdate } from '../lib/app-badges'
 
-interface TransientState {
-  status: TransientStatus
-  version?: string
-  error?: string
-}
-
+/** Update progress lives in the shared badge store (lib/app-badges), which
+ *  Settings › About and the dots read too. Lumia checks by itself (launch,
+ *  every 4h; there's no manual check since 2026-11-22), and nothing
+ *  downloads or installs without the user: a found version shows Update in
+ *  Settings, Update downloads it, Restart installs it. Unless the user
+ *  opted into "Auto-update Lumia", where main downloads on its own.
+ *  This toast offers Restart once downloaded, and reports a failed
+ *  download. Rendered inside ToastHost (App), above the other toasts.
+ *  Ready stays until closed: it offers Restart (2.5s like other toasts was
+ *  tried and dropped, 2026-11-24). A failed download goes after 4s. */
 export function UpdateNotification() {
-  const [downloadedVersion, setDownloadedVersion] = useState<string | null>(null)
-  const [transient, setTransient] = useState<TransientState | null>(null)
-  const manualRef = useRef(false)
+  const { update } = useBadges()
+  const [dismissed, setDismissed] = useState<string | null>(null)
+  const downloadedVersion = update?.phase === 'ready' && dismissed !== update.version ? update.version : null
+  const [downloadError, setDownloadError] = useState<string | null>(null)
 
   useEffect(() => {
     window.electronAPI?.onUpdateDownloaded((v) => {
-      manualRef.current = false
-      setTransient(null)
-      setDownloadedVersion(v)
+      setDownloadError(null)
+      setUpdate({ phase: 'ready', version: v })
     })
 
     window.electronAPI?.onUpdateStatus?.((s) => {
-      if (s.status === 'downloaded') return // handled by onUpdateDownloaded
-      if (!manualRef.current) return // ignore background-check chatter
-
-      if (s.status === 'available') {
-        setTransient({ status: 'downloading', version: s.version })
-        return
+      const current = getUpdate()
+      if (s.status === 'available' && s.version) {
+        // Found by a check: Settings offers Update.
+        if (current?.phase !== 'downloading' && current?.phase !== 'ready') {
+          setUpdate({ phase: 'available', version: s.version })
+        }
+      } else if (s.status === 'downloading' && current && current.phase === 'available') {
+        setUpdate({ ...current, phase: 'downloading' })
+      } else if (s.status === 'error' && current?.phase === 'downloading') {
+        // A failed download: back to Update, and say why.
+        setUpdate({ ...current, phase: 'available' })
+        setDownloadError(s.error ?? '')
+      } else if (s.status === 'not-available') {
+        // Settings' version row says "Latest version"; no toast.
+        setLatest(true)
       }
-      if (s.status === 'downloading') return // suppress progress flicker for now
-
-      setTransient({ status: s.status, version: s.version, error: s.error })
-      if (s.status === 'not-available' || s.status === 'error') {
-        manualRef.current = false
-      }
+      // Check errors stay quiet: a check is only a ping.
     })
-
-    const onCheck = () => {
-      manualRef.current = true
-      setTransient({ status: 'checking' })
-      window.electronAPI?.checkForUpdates?.()
-    }
-    window.addEventListener('app:check-update', onCheck)
 
     return () => {
       window.electronAPI?.removeAllListeners('update:downloaded')
       window.electronAPI?.removeAllListeners('update:status')
-      window.removeEventListener('app:check-update', onCheck)
     }
   }, [])
 
-  // Auto-dismiss terminal transient states
   useEffect(() => {
-    if (!transient) return
-    if (transient.status === 'checking' || transient.status === 'downloading') return
-    const t = setTimeout(() => setTransient(null), 4000)
+    if (downloadError === null) return
+    const t = setTimeout(() => setDownloadError(null), 4000)
     return () => clearTimeout(t)
-  }, [transient])
+  }, [downloadError])
 
-  if (downloadedVersion) {
+  // What the toast shows, kept on screen while it leaves (useLeaving).
+  const current: { key: string; error?: string } | null = downloadedVersion
+    ? { key: `ready-${downloadedVersion}` }
+    : downloadError !== null ? { key: 'error', error: downloadError } : null
+  const { shown, leaving } = useLeaving(current, c => c.key)
+  if (!shown) return null
+
+  if (shown.error === undefined) {
+    const version = shown.key.slice('ready-'.length)
     return (
-      <div className="fixed bottom-4 right-4 z-[80] flex items-center gap-2 bg-[var(--color-primary)]/15 border border-[var(--color-primary)]/30 rounded-full px-3 py-1.5 animate-slide-up backdrop-blur-md shadow-lg">
-        <span className="material-symbols-outlined text-[var(--color-primary)] text-base">system_update</span>
-        <span className="text-xs text-[var(--color-on-surface)]">Update v{downloadedVersion} ready</span>
-        <button
-          onClick={() => window.electronAPI?.installUpdate()}
-          className="px-2.5 py-0.5 text-xs font-semibold rounded-full
-                     bg-[var(--color-primary)] text-[var(--color-surface)]
-                     hover:brightness-110 transition-all cursor-pointer"
-        >
-          Restart
-        </button>
-        <button
-          onClick={() => setDownloadedVersion(null)}
-          className="text-[var(--color-on-surface-variant)] hover:text-[var(--color-on-surface)] transition-colors cursor-pointer"
-        >
-          <span className="material-symbols-outlined text-sm">close</span>
-        </button>
-      </div>
+      <ToastSlot key={shown.key} leaving={leaving}>
+        <ToastBox
+          kind="info"
+          icon="system_update"
+          message="New update downloaded"
+          action={<button onClick={installUpdate} className={TOAST_ACTION}>Restart</button>}
+          onClose={() => setDismissed(version)}
+        />
+      </ToastSlot>
     )
   }
 
-  if (!transient) return null
-
-  const labels: Record<TransientStatus, string> = {
-    checking: 'Checking for updates…',
-    'not-available': "You're on the latest version",
-    downloading: transient.version ? `Update v${transient.version} downloading…` : 'Downloading update…',
-    error: transient.error ? `Update check failed: ${transient.error}` : 'Update check failed',
-  }
-  const icons: Record<TransientStatus, string> = {
-    checking: 'progress_activity',
-    'not-available': 'check_circle',
-    downloading: 'cloud_download',
-    error: 'error',
-  }
-  const spinning = transient.status === 'checking'
-
   return (
-    <div className="fixed bottom-4 right-4 z-[80] flex items-center gap-2 bg-[var(--color-primary)]/15 border border-[var(--color-primary)]/30 rounded-full px-3 py-1.5 animate-slide-up backdrop-blur-md shadow-lg">
-      <span className={`material-symbols-outlined text-[var(--color-primary)] text-base ${spinning ? 'animate-spin' : ''}`}>
-        {icons[transient.status]}
-      </span>
-      <span className="text-xs text-[var(--color-on-surface)]">{labels[transient.status]}</span>
-      <button
-        onClick={() => setTransient(null)}
-        className="text-[var(--color-on-surface-variant)] hover:text-[var(--color-on-surface)] transition-colors cursor-pointer"
-      >
-        <span className="material-symbols-outlined text-sm">close</span>
-      </button>
-    </div>
+    <ToastSlot key={shown.key} leaving={leaving}>
+      <ToastBox kind="error" icon="error" message="Couldn't download update" detail={cleanError(shown.error)} onClose={() => setDownloadError(null)} />
+    </ToastSlot>
   )
 }

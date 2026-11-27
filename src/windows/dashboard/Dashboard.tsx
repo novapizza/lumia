@@ -1,13 +1,26 @@
 import { useState, useEffect, useMemo, useCallback, useRef, type MouseEvent as ReactMouseEvent } from 'react'
 import { useNavigate } from 'react-router-dom'
 import type { HistoryItem } from '../../types'
-import ScrollCaptureDialog from '../../components/ScrollCaptureDialog'
+import { durationParts, formatDimensions, recordingLengthMs, fileTipText } from '../../utils/captureLabels'
+import { useSelectGestures } from './useSelectGestures'
+import { ClipActionButton } from '../../components/ClipActionButton'
+import { ICON_BUTTON_FRAME } from '../../components/button-classes'
+import { OnStrip } from '../../components/OnStrip'
 import BrowserPickerDialog from '../../components/BrowserPickerDialog'
 import { DaySections } from '../../components/DaySections'
 import { useDayHistory } from './useDayHistory'
-import { HistoryListRow } from '../../components/HistoryListRow'
-import { copyHistoryItem, shareHistoryItem, shareHistoryGoogleDrive } from '../../lib/history-actions'
+import { noteOpenedClip } from '../../lib/dashboard-place'
+import { reportFileGone } from '../../lib/strip-worker'
+import { refreshRecordingThumbnails } from '../../lib/refresh-thumbnails'
+import { HistoryListRow, clipSource, SourceText } from '../../components/HistoryListRow'
+import { copyHistoryItem, shareHistoryItem, shareHistoryGoogleDrive, editorStateFor } from '../../lib/history-actions'
 
+import { Icon } from '../../components/Icon'
+import { AppBarControls } from '../../components/AppBarSlot'
+import { UploadMenu } from '../../components/UploadMenu'
+import { uploadLinksOf, uploadRows, type UploadRow } from '../../lib/upload-choice'
+import { Segmented } from '../../components/Segmented'
+import { toast, toastError, dismissToast } from '../../lib/toast'
 type CaptureMode = 'region' | 'window' | 'all-screen' | 'screen'
 type VideoMode = 'region' | 'window' | 'screen'
 type MediaKind = 'image' | 'video' | 'scroll'
@@ -25,7 +38,7 @@ const CHROME_WEB_STORE_URL = import.meta.env.RENDERER_VITE_CHROME_WEB_STORE_URL 
 const MODE_ACTION: Record<CaptureMode, string> = {
   region: 'RectangleRegion',
   window: 'ActiveWindow',
-  'all-screen': 'PrintScreen',
+ 'all-screen': 'PrintScreen',
   screen: 'ActiveMonitor',
 }
 
@@ -62,8 +75,7 @@ function KeyCombo({ keys }: { keys: string[] }) {
       {keys.map((k, i) => (
         <kbd
           key={i}
-          className="min-w-[20px] h-5 inline-flex items-center justify-center text-[10px] text-slate-400 font-medium bg-white/[0.06] border border-white/[0.08] rounded px-1 leading-none"
-          style={{ fontFamily: 'Inter, sans-serif' }}
+          className="min-w-[20px] h-5 inline-flex items-center justify-center text-[10px] text-fg-secondary font-medium bg-fill border border-line rounded px-1 leading-none"
         >
           {k}
         </kbd>
@@ -82,8 +94,12 @@ function getGreeting(): string {
 
 export default function Dashboard() {
   const navigate = useNavigate()
-  const [showScrollCapture, setShowScrollCapture] = useState(false)
-  const [filter, setFilter] = useState<FilterType>('all')
+  // Remembered like the view mode (2026-11-22), so leaving the Dashboard
+  // (Settings, the editor) and coming back keeps the type filter.
+  const [filter, setFilter] = useState<FilterType>(() => {
+    const saved = localStorage.getItem('lumia:history-filter')
+    return saved === 'screenshot' || saved === 'recording' ? saved : 'all'
+  })
   const [hotkeys, setHotkeys] = useState<Record<string, string>>({})
   const [mediaKind, setMediaKind] = useState<MediaKind>('image')
   const [captureSelf, setCaptureSelf] = useState(false)
@@ -103,37 +119,45 @@ export default function Dashboard() {
   const [sharingId, setSharingId] = useState<string | null>(null)
   const [sharingGdriveId, setSharingGdriveId] = useState<string | null>(null)
   const [gdriveReady, setGdriveReady] = useState(false)
-  const [toast, setToast] = useState<{ message: string; icon: string; type: 'success' | 'error' } | null>(null)
-  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const showToast = useCallback((message: string, icon: string, type: 'success' | 'error' = 'success') => {
-    if (toastTimerRef.current) clearTimeout(toastTimerRef.current)
-    setToast({ message, icon, type })
-    toastTimerRef.current = setTimeout(() => setToast(null), 2500)
+  // Share uploads to R2; a build without R2 credentials shows it disabled.
+  const [shareReady, setShareReady] = useState(true)
+
+  // Cmd (Ctrl on Windows) held: clips show the pointing hand, a click
+  // reveals the file (useSelectGestures). Read from every key and pointer
+  // event, so a key let go outside the window doesn't stick.
+  useEffect(() => {
+    const mac = document.documentElement.classList.contains('mac')
+    const set = (on: boolean) => document.documentElement.classList.toggle('reveal-key', on)
+    const fromEvent = (e: KeyboardEvent | PointerEvent) => set(mac ? e.metaKey : e.ctrlKey)
+    const off = () => set(false)
+    window.addEventListener('keydown', fromEvent, true)
+    window.addEventListener('keyup', fromEvent, true)
+    window.addEventListener('pointermove', fromEvent, true)
+    window.addEventListener('blur', off)
+    return () => {
+      window.removeEventListener('keydown', fromEvent, true)
+      window.removeEventListener('keyup', fromEvent, true)
+      window.removeEventListener('pointermove', fromEvent, true)
+      window.removeEventListener('blur', off)
+      off()
+    }
   }, [])
 
   useEffect(() => {
-    window.electronAPI?.getHotkeys().then(h => { if (h) setHotkeys(h) })
+    // One-time: larger thumbnails for recordings made before the size change.
+    refreshRecordingThumbnails()
+    window.electronAPI?.r2IsConfigured?.().then(ok => setShareReady(!!ok))
     const refreshGdriveReady = () => {
       window.electronAPI?.getSettings().then(s => {
         setGdriveReady(!!(s?.googleDriveConnected && s?.googleDriveFolderId))
       })
     }
-    window.electronAPI?.getSettings().then(s => {
-      // Scroll is never remembered as the active kind (it's a deliberate
-      // capture), so only restore the Image / Video tab across launches.
-      if (s?.lastCaptureKind === 'video' || s?.lastCaptureKind === 'image') {
-        setMediaKind(s.lastCaptureKind)
-      }
-      if (s?.scrollCaptureMethod === 'extension' || s?.scrollCaptureMethod === 'screen') {
-        setScrollMethod(s.scrollCaptureMethod)
-      }
-      setCaptureSelf(!!s?.captureSelfWindow)
-      setGdriveReady(!!(s?.googleDriveConnected && s?.googleDriveFolderId))
-    })
-    // Extension-bridge status for the Scroll tab: initial pull + live push
-    // whenever the browser extension attaches or drops off.
-    window.electronAPI?.getScrollExtensionStatus?.().then(st => { if (st) setExtStatus(st) })
-    window.electronAPI?.onScrollExtensionStatus?.(st => setExtStatus(st))
+    refreshGdriveReady()
+    // The removed launcher's loading (its hotkeys, last kind, "include
+    // Lumia's own window" and the extension's status, each kept in state
+    // nothing reads) went on 2026-11-27: the status listener re-rendered the
+    // whole Dashboard on every extension change. It's written down with the
+    // launcher in design/DASHBOARD-TOP-SECTION.md, to come back with it.
     // Main asks for the browser picker when an extension capture starts with
     // several browsers connected (Dashboard card, hotkey, or New Capture).
     window.electronAPI?.onScrollExtensionPick?.(() => setShowBrowserPicker(true))
@@ -147,24 +171,12 @@ export default function Dashboard() {
     }
     window.addEventListener('focus', onWindowFocus)
 
-    window.electronAPI?.onCaptureReady(({ dataUrl, source }) => {
-      navigate('/editor', { state: { dataUrl, source } })
-    })
-
-    // Record Screen hotkey → launch new overlay-based video flow (region mode default).
-    window.electronAPI?.onRecorderOpen(() => window.electronAPI?.startVideoCapture?.('region'))
-    window.electronAPI?.onScrollCaptureOpen(() => setShowScrollCapture(true))
-
     return () => {
-      window.electronAPI?.removeAllListeners('capture:ready')
-      window.electronAPI?.removeAllListeners('recorder:open')
-      window.electronAPI?.removeAllListeners('scroll-capture:open')
-      window.electronAPI?.removeAllListeners('scroll-extension:status')
       window.electronAPI?.removeAllListeners('scroll-extension:pick')
       window.electronAPI?.removeAllListeners('gdrive:connected')
       window.removeEventListener('focus', onWindowFocus)
     }
-  }, [navigate])
+  }, [])
 
   const selectMediaKind = (kind: MediaKind) => {
     setMediaKind(kind)
@@ -174,10 +186,8 @@ export default function Dashboard() {
   }
 
   const handleCapture = async (mode: CaptureMode) => {
-    // Send every selection; the remember policy lives in main's settings:set
-    // handler (isRememberedMode): only Region / Window update the replay mode
-    // that "New Capture" / PrtSc re-run — screen / all-screen are one-shots
-    // that just flip the kind back to image.
+    // Every tool is remembered for New capture / PrintScreen (main's
+    // settings:set checks the value: isImageMode in settings.ts).
     window.electronAPI?.setSetting('lastCaptureKind', 'image')
     window.electronAPI?.setSetting('lastImageMode', mode)
     // Main drives navigation via `sendCaptureToEditor` (sends a `navigate`
@@ -201,9 +211,7 @@ export default function Dashboard() {
   const handleScroll = async (method: ScrollMethod) => {
     setScrollMethod(method)
     // Deliberately do NOT persist lastCaptureKind='scroll' — scroll must not
-    // become the mode that "New Capture" / PrtSc replays. Only the chosen
-    // method is remembered (for the next explicit scroll capture).
-    window.electronAPI?.setSetting('scrollCaptureMethod', method)
+    // become the mode that "New Capture" / PrtSc replays.
     const r = await window.electronAPI?.launchScrollCapture?.(method)
     // Explicit extension request with no extension attached → open setup help
     // instead of silently falling back.
@@ -212,18 +220,13 @@ export default function Dashboard() {
     }
   }
 
-  // Totals come from history_stat.json, not from the loaded rows.
-  const counts = {
-    all: stats?.total ?? 0,
-    screenshot: stats?.screenshot ?? 0,
-    recording: stats?.recording ?? 0,
-  }
-  // Rows of the loaded days only (missing-file count and cleanup).
-  const loadedItems = useMemo(() => [...rows.values()].flat(), [rows])
-  // Days holding selected rows are never dropped while selecting.
+  // Days holding selected rows are never dropped while selecting. Not after
+  // Cmd+A (the selection is still that same Set): every day would get
+  // pinned and scrolling would keep all of history in memory.
+  const selectAllSetRef = useRef<Set<string> | null>(null)
   const pinnedDays = useMemo(() => {
     const out = new Set<string>()
-    if (selectedIds.size === 0) return out
+    if (selectedIds.size === 0 || selectedIds === selectAllSetRef.current) return out
     for (const [day, items] of rows) if (items.some(i => selectedIds.has(i.id))) out.add(day)
     return out
   }, [rows, selectedIds])
@@ -243,12 +246,28 @@ export default function Dashboard() {
       // concurrent read-modify-writes that clobbered each other — deleted rows
       // resurrected as "Missing" orphans on the next refetch.
       await window.electronAPI?.deleteHistoryItems(ids)
+      // Stay in selection mode with nothing selected, so the next batch can
+      // be picked right away; the button (now Select in purple, tooltip
+      // "Cancel") or Esc leaves it.
       setSelectedIds(new Set())
-      setIsSelecting(false)
     } finally {
       setIsBulkDeleting(false)
     }
   }
+
+  // Select mode: clicking a day's label adds all of that day's captures, or,
+  // when they're all selected already, deselects them.
+  const selectDay = useCallback((items: HistoryItem[]) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev)
+      const allSelected = items.every(i => prev.has(i.id))
+      for (const i of items) {
+        if (allSelected) next.delete(i.id)
+        else next.add(i.id)
+      }
+      return next
+    })
+  }, [])
 
   const toggleSelect = useCallback((id: string) => {
     setSelectedIds(prev => {
@@ -259,10 +278,24 @@ export default function Dashboard() {
     })
   }, [])
 
-  const exitSelection = () => {
+  const exitSelection = useCallback(() => {
     setIsSelecting(false)
     setSelectedIds(new Set())
-  }
+  }, [])
+  const enterSelection = useCallback(() => setIsSelecting(true), [])
+
+  const selectGestures = useSelectGestures({
+    enabled: isSelecting,
+    busy: isBulkDeleting,
+    selectedIds,
+    setSelectedIds,
+    // A click on the background leaves select mode (and clears the
+    // selection), 2026-11-22. From 2026-11-21 it only cleared the selection
+    // and stayed in select mode, like Finder.
+    onBackgroundClick: exitSelection,
+    onDragEnter: enterSelection,
+    onDragCancel: exitSelection,
+  })
 
   // Reload the loaded days — used after a race where a file disappears
   // between the fs.access probe and the user's click, so the UI flips from
@@ -271,30 +304,97 @@ export default function Dashboard() {
     await refresh()
   }, [refresh])
 
+  // Open a clip in the editor. One whose file is gone but which was
+  // uploaded is first downloaded back into place (history:restoreFromCloud:
+  // the uploaded copy, edits and trim baked in), then opened (2026-11-21).
+  const restoringRef = useRef<string | null>(null)
   const openItem = async (item: HistoryItem) => {
+    if (item.fileMissing && item.uploads?.some(u => u.success)) {
+      if (restoringRef.current) return
+      restoringRef.current = item.id
+      // The X cancels the download (2026-11-24): the toast goes at once, and
+      // "Download canceled" shows when main confirms.
+      const id = item.id
+      toast('Downloading…', {
+        kind: 'progress',
+        onClose: () => { dismissToast(); void window.electronAPI?.cancelRestore(id) },
+        closeLabel: 'Cancel',
+        closeAria: 'Cancel download',
+      })
+      try {
+        const r = await window.electronAPI?.restoreFromCloud(item.id)
+        if (r?.error === 'cancelled') { toast('Download canceled', { kind: 'warning', icon: 'close' }); return }
+        if (!r?.ok || !r.item) { toastError("Couldn't download", r?.error); return }
+        dismissToast()
+        await refreshHistory()
+        item = r.item
+      } finally {
+        restoringRef.current = null
+      }
+    }
     if (item.fileMissing) return
-    if (item.type === 'recording') {
-      navigate('/editor', { state: { kind: 'video', filePath: item.filePath, trimmedFilePath: item.annotatedFilePath, trim: item.trim, name: item.name, historyId: item.id, annotations: item.annotations } })
+    const state = await editorStateFor(item)
+    // Unreadable file (gone since the last probe): refresh into the orphan state.
+    if (!state) { if (item.type !== 'recording') await refreshHistory(); return }
+    // Coming back, this clip sits where it was clicked (DaySections).
+    noteOpenedClip(item.id)
+    navigate('/editor', { state })
+  }
+
+  // Cloud-only clips (uploaded, file gone): save the uploaded copy to
+  // Downloads (from R2, or Drive through its API).
+  // One upload button (2026-11-21; was Share for R2 + Drive): an uploaded
+  // clip copies its link (the first successful upload's); otherwise it
+  // uploads, to R2 when the build has it, else to Google Drive. Which
+  // service, and whether to offer both, is to be worked out later.
+  // Upload (2026-11-23): one place to go acts at once; with R2 and Google
+  // Drive both there, a menu picks (lib/upload-choice.ts). A row with a
+  // link copies it; one without uploads there. Locked while uploading.
+  const gdriveAvail = gdriveReady
+  const [uploadMenu, setUploadMenu] = useState<{ item: HistoryItem; anchor: DOMRect; anchorEl: HTMLElement; rows: UploadRow[] } | null>(null)
+  const closeUploadMenu = useCallback(() => setUploadMenu(null), [])
+  const rowsFor = (item: HistoryItem) => uploadRows({
+    r2Ready: shareReady,
+    gdriveReady: gdriveAvail,
+    links: uploadLinksOf(item.uploads),
+    canUpload: !item.fileMissing && !!item.filePath,
+  })
+  const uploadTo = async (item: HistoryItem, row: UploadRow) => {
+    if (row.link) {
+      await window.electronAPI?.writeClipboardText(row.link)
+      toast('Link copied', { icon: 'link' })
       return
     }
-    // Load the ORIGINAL file — annotations ride along as vector data and
-    // Canvas replays each one as its own commit so Undo walks back through
-    // them one at a time.
-    let dataUrl: string | null | undefined = item.dataUrl
-    if (!dataUrl && item.filePath) {
-      dataUrl = await window.electronAPI?.readHistoryFile(item.filePath) ?? null
-      if (dataUrl === null) { await refreshHistory(); return }
-    }
-    if (!dataUrl) return
-    navigate('/editor', { state: { kind: 'image', dataUrl, source: 'history', historyId: item.id, annotations: item.annotations } })
+    if (row.dest === 'r2') return shareItem(item)
+    return shareGdriveItem(item)
+  }
+  // The button's icon (2026-11-23): Upload while any place still needs an
+  // upload, the link once every place has one.
+  const allLinked = (item: HistoryItem) => {
+    const rows = rowsFor(item)
+    return rows.length > 0 && rows.every(r => r.link)
+  }
+  const onUploadClick = (item: HistoryItem, el: HTMLElement) => {
+    // A second click on the same button closes its menu.
+    if (uploadMenu?.item.id === item.id) { setUploadMenu(null); return }
+    const rows = rowsFor(item)
+    if (rows.length === 0) return
+    if (rows.length === 1) { void uploadTo(item, rows[0]); return }
+    setUploadMenu({ item, anchor: el.getBoundingClientRect(), anchorEl: el, rows })
+  }
+
+  const downloadItem = async (item: HistoryItem) => {
+    const r = await window.electronAPI?.downloadFromCloud(item.id)
+    if (r?.ok) toast('Saved to Downloads', { icon: 'download' })
+    else toastError("Couldn't download", r?.error)
   }
 
   const copyItem = async (item: HistoryItem) => {
     const r = await copyHistoryItem(item, refreshHistory)
     if (r.ok) {
-      showToast(item.type === 'recording' ? 'Video copied' : 'Copied to clipboard', 'content_copy')
+      toast(item.type === 'recording' ? 'Video copied' : 'Image copied', { icon: 'content_copy' })
     } else {
-      showToast(r.error ?? 'Copy failed', 'error', 'error')
+      toastError("Couldn't copy", r.error)
     }
   }
 
@@ -303,8 +403,8 @@ export default function Dashboard() {
     setSharingId(item.id)
     try {
       const r = await shareHistoryItem(item, refreshHistory)
-      if (r.ok) showToast('Uploaded — link copied', 'check_circle')
-      else      showToast(r.error ?? 'Upload failed', 'error', 'error')
+      if (r.ok) toast('Uploaded, link copied')
+      else      toastError("Couldn't upload", r.error)
     } finally {
       setSharingId(null)
     }
@@ -316,472 +416,384 @@ export default function Dashboard() {
     setSharingGdriveId(item.id)
     try {
       const r = await shareHistoryGoogleDrive(item, refreshHistory)
-      if (r.ok) showToast(alreadyUploaded ? 'Drive link copied' : 'Uploaded to Drive — link copied', 'add_to_drive')
-      else      showToast(r.error ?? 'Drive upload failed', 'error', 'error')
+      if (r.ok) toast(alreadyUploaded ? 'Drive link copied' : 'Uploaded to Drive, link copied', { icon: alreadyUploaded ? 'link' : 'check_circle' })
+      else      toastError("Couldn't upload to Drive", r.error)
     } finally {
       setSharingGdriveId(null)
     }
   }
 
-  // Missing files among the loaded days only; cleanup removes those.
-  const missingIds = useMemo(() => loadedItems.filter(i => i.fileMissing).map(i => i.id), [loadedItems])
+  // Missing files across all of history (history:missingIds), not just the
+  // loaded days, so the button stays while scrolling and Clear removes every
+  // one (2026-11-21). Missing and not uploaded: an uploaded clip whose file
+  // is gone is cloud only, keeps its row (the link) and isn't counted or
+  // cleared. Asked again on open, after every history write and when the
+  // window gets focus (files deleted in Finder meanwhile); a newer ask wins
+  // over a slower older one.
+  const [missingIds, setMissingIds] = useState<string[]>([])
+  useEffect(() => {
+    let seq = 0
+    const check = async () => {
+      const mine = ++seq
+      const ids = await window.electronAPI?.getMissingHistoryIds()
+      if (ids && mine === seq) setMissingIds(ids)
+    }
+    check()
+    const off = window.electronAPI?.onHistoryChanged(() => { check() })
+    window.addEventListener('focus', check)
+    return () => { seq = -1; off?.(); window.removeEventListener('focus', check) }
+  }, [])
   const missingCount = missingIds.length
   const handleCleanupMissing = useCallback(async () => {
     await window.electronAPI?.cleanupMissingHistory(missingIds)
   }, [missingIds])
 
-  // Persist view mode
+  // Persist view mode and type filter
   useEffect(() => {
     localStorage.setItem('lumia:history-view', viewMode)
   }, [viewMode])
+  useEffect(() => {
+    localStorage.setItem('lumia:history-filter', filter)
+  }, [filter])
 
-  // Escape leaves selection mode. (No Cmd+A select-all: only some days are
-  // loaded at a time.)
+  // Escape leaves selection mode. Delete / Backspace (also with Cmd, like
+  // Finder) deletes the selected clips, same as the red Delete button; not
+  // while typing or with a dialog open.
+  const bulkDeleteRef = useRef(handleBulkDelete)
+  bulkDeleteRef.current = handleBulkDelete
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && isSelecting) {
+      if (!isSelecting) return
+      if (e.key === 'Escape') {
         setIsSelecting(false)
         setSelectedIds(new Set())
+        return
       }
+      if (e.key !== 'Delete' && e.key !== 'Backspace') return
+      if (selectedIds.size === 0 || showBrowserPicker || e.ctrlKey || e.altKey || e.repeat) return
+      const t = e.target
+      if (t instanceof HTMLElement && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return
+      e.preventDefault()
+      void bulkDeleteRef.current()
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [isSelecting])
+  }, [isSelecting, selectedIds, showBrowserPicker])
+
+  // Cmd+A (Ctrl+A) selects all of history under the type filter, loaded
+  // days or not (ids from main), and turns select mode on. Not while typing
+  // or with a dialog open.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key.toLowerCase() !== 'a' || !(e.metaKey || e.ctrlKey) || e.shiftKey || e.altKey) return
+      if (showBrowserPicker) return
+      const t = e.target
+      if (t instanceof HTMLElement && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return
+      e.preventDefault()
+      if (e.repeat) return
+      void window.electronAPI?.getAllHistoryIds(filter === 'all' ? undefined : filter).then(ids => {
+        if (!ids?.length) return
+        const all = new Set(ids)
+        selectAllSetRef.current = all
+        setSelectedIds(all)
+        setIsSelecting(true)
+      })
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [filter, showBrowserPicker])
+
+  // Keyboard scrolling without focusing the clip area (it's no Tab stop):
+  // arrows, Page Up / Down, Home / End scroll it from anywhere on the page
+  // except text fields and open dialogs; arrows glide frame by frame and
+  // speed up while held. After the
+  // arrows were used, Tab jumps to the first clip in view (Shift+Tab to the
+  // last) instead of the next control in page order; from there Tab walks
+  // the clips as usual. A click or a Tab ends that mode. Scrolling by keys
+  // takes the focus off a clip.
+  const scrolledByKeys = useRef(false)
+  useEffect(() => {
+    const isTyping = (t: EventTarget | null) =>
+      t instanceof HTMLElement && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))
+    const onKey = (e: KeyboardEvent) => {
+      if (showBrowserPicker || e.metaKey || e.ctrlKey || e.altKey || isTyping(e.target)) return
+      const area = document.querySelector<HTMLElement>('[data-scroll-area]')
+      if (!area) return
+      if (e.key === 'Tab') {
+        if (!scrolledByKeys.current) return
+        scrolledByKeys.current = false
+        const box = area.getBoundingClientRect()
+        const top = box.top + 46 // below the sticky day label
+        // In view = more than half of it showing (between the day label and
+        // the bottom), so a clip mostly scrolled away never counts as first.
+        const inView = [...area.querySelectorAll<HTMLElement>('[data-clip]')].filter(c => {
+          const r = c.getBoundingClientRect()
+          return Math.min(r.bottom, box.bottom) - Math.max(r.top, top) > r.height / 2
+        })
+        const target = e.shiftKey ? inView[inView.length - 1] : inView[0]
+        if (!target) return
+        e.preventDefault()
+        target.focus()
+        return
+      }
+      const page = area.clientHeight * 0.9
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        // Key repeats only keep the glide going; it runs on frames.
+        if (!e.repeat) startGlide(area, e.key, e.key === 'ArrowDown' ? 1 : -1)
+      }
+      else if (e.key === 'PageDown') area.scrollBy({ top: page })
+      else if (e.key === 'PageUp') area.scrollBy({ top: -page })
+      else if (e.key === 'Home') area.scrollTo({ top: 0 })
+      else if (e.key === 'End') area.scrollTo({ top: area.scrollHeight })
+      else return
+      e.preventDefault()
+      scrolledByKeys.current = true
+      // Scrolling by keys leaves the clips: a focused one loses its focus,
+      // and the next Tab starts again at the first clip in view.
+      const focused = document.activeElement
+      if (focused instanceof HTMLElement && focused.hasAttribute('data-clip')) focused.blur()
+    }
+
+    // Arrow glide: moves the list a little every frame while the arrow is
+    // held (key repeats come only ~30 times a second, so jumping on each
+    // one stuttered). Starts at 1200px/s (the old 40px per repeat) and
+    // speeds up by 600px/s each second, reaching its cap of 2400px/s (80px
+    // per repeat) after 2s. A tap still moves at least 20px.
+    const START = 1200, ACCEL = 600, MAX = 2400, TAP = 20
+    let glide: { area: HTMLElement; key: string; dir: number; t0: number; last: number; pos: number; moved: number; released: boolean; raf: number } | null = null
+    const stopGlide = () => { if (glide) cancelAnimationFrame(glide.raf); glide = null }
+    const frame = (now: number) => {
+      const g = glide
+      if (!g) return
+      const speed = Math.min(START + ACCEL * (now - g.t0) / 1000, MAX)
+      let dist = speed * (now - g.last) / 1000
+      if (g.released) dist = Math.min(dist, TAP - g.moved)
+      g.last = now
+      if (dist > 0) {
+        g.pos += g.dir * dist
+        g.moved += dist
+        g.area.scrollTop = g.pos
+      }
+      if (g.released && g.moved >= TAP) { stopGlide(); return }
+      g.raf = requestAnimationFrame(frame)
+    }
+    function startGlide(area: HTMLElement, key: string, dir: number) {
+      stopGlide()
+      const now = performance.now()
+      glide = { area, key, dir, t0: now, last: now, pos: area.scrollTop, moved: 0, released: false, raf: requestAnimationFrame(frame) }
+    }
+    const onKeyUp = (e: KeyboardEvent) => { if (glide && e.key === glide.key) glide.released = true }
+
+    const onPointer = () => { scrolledByKeys.current = false; stopGlide() }
+    window.addEventListener('keydown', onKey)
+    window.addEventListener('keyup', onKeyUp)
+    window.addEventListener('pointerdown', onPointer)
+    window.addEventListener('blur', stopGlide)
+    return () => {
+      stopGlide()
+      window.removeEventListener('keydown', onKey)
+      window.removeEventListener('keyup', onKeyUp)
+      window.removeEventListener('pointerdown', onPointer)
+      window.removeEventListener('blur', stopGlide)
+    }
+  }, [showBrowserPicker])
 
   return (
     <div className="h-full flex flex-col">
       {/* ── Toast ── */}
-      {toast && (
-        <div className={`fixed top-12 left-1/2 -translate-x-1/2 z-[80] flex items-center gap-2 px-4 py-2 backdrop-blur-xl border rounded-xl shadow-lg animate-slide-up ${
-          toast.type === 'error' ? 'bg-red-500/20 border-red-500/30' : 'bg-emerald-500/20 border-emerald-500/30'
-        }`}>
-          <span className={`material-symbols-outlined text-sm ${toast.type === 'error' ? 'text-red-400' : 'text-emerald-400'}`}>{toast.icon}</span>
-          <span className="text-xs font-semibold text-white" style={{ fontFamily: 'Manrope, sans-serif' }}>{toast.message}</span>
-        </div>
-      )}
 
-      <div className="px-8 pt-8 space-y-8 flex-shrink-0">
-
-      {/* ── Media kind toggle + Greeting ── */}
-      <header className="flex items-center justify-between gap-4 flex-wrap">
-        <MediaKindToggle value={mediaKind} onChange={selectMediaKind} />
-        <div className="text-right">
-          <h1
-            className="text-3xl font-extrabold tracking-tight text-white"
-            style={{ fontFamily: 'Manrope, sans-serif' }}
-          >
-            {getGreeting()}
-          </h1>
-          <p className="text-sm text-slate-500 mt-1.5" style={{ fontFamily: 'Manrope, sans-serif' }}>
-            {counts.all === 0
-              ? 'Start your first capture to get going'
-              : `${counts.screenshot} screenshot${counts.screenshot !== 1 ? 's' : ''} · ${counts.recording} recording${counts.recording !== 1 ? 's' : ''}`}
-          </p>
-        </div>
-      </header>
-
-      {/* ── Capture Actions ── */}
-      <section>
-        {mediaKind === 'image' ? (
-          <div className="space-y-3">
-            <div className="flex flex-wrap gap-2">
-              {CAPTURE_MODES.map(({ mode, icon, label }) => {
-                const accel = hotkeys[MODE_ACTION[mode]]
-                const keys = accel ? parseShortcut(accel) : []
-                return (
-                  <button
-                    key={mode}
-                    onClick={() => handleCapture(mode)}
-                    className="group w-44 flex items-center gap-3 px-3 py-3 rounded-xl
-                               bg-white/[0.03] border border-white/[0.05]
-                               hover:bg-primary/[0.08] hover:border-primary/20
-                               active:scale-[0.98] transition-all duration-200 cursor-pointer"
-                  >
-                    <div className="w-9 h-9 rounded-lg bg-primary/10 flex items-center justify-center flex-shrink-0
-                                    group-hover:bg-primary/20 transition-colors duration-200">
-                      <span className="material-symbols-outlined text-primary text-lg">{icon}</span>
-                    </div>
-                    <div className="text-left min-w-0">
-                      <span
-                        className="block text-xs font-semibold text-slate-200 group-hover:text-white transition-colors truncate"
-                        style={{ fontFamily: 'Manrope, sans-serif' }}
-                      >
-                        {label}
-                      </span>
-                      {keys.length > 0 && <KeyCombo keys={keys} />}
-                    </div>
-                  </button>
-                )
-              })}
-            </div>
-
-            <CaptureSelfToggle checked={captureSelf} onChange={handleCaptureSelfChange} />
-          </div>
-        ) : mediaKind === 'video' ? (
-          <div className="space-y-3">
-            <div className="flex flex-wrap gap-2">
-              {VIDEO_MODES.map(({ mode, icon, label }) => {
-                const hotkey = hotkeys[VIDEO_MODE_ACTION[mode]]
-                return (
-                  <button
-                    key={mode}
-                    onClick={() => handleVideo(mode)}
-                    className="group w-44 flex items-center gap-3 px-3 py-3 rounded-xl
-                               bg-white/[0.03] border border-white/[0.05]
-                               hover:bg-tertiary/[0.08] hover:border-tertiary/20
-                               active:scale-[0.98] transition-all duration-200 cursor-pointer"
-                  >
-                    <div className="w-9 h-9 rounded-lg bg-tertiary/10 flex items-center justify-center flex-shrink-0
-                                    group-hover:bg-tertiary/20 transition-colors duration-200">
-                      <span className="material-symbols-outlined text-tertiary text-lg">{icon}</span>
-                    </div>
-                    <div className="text-left min-w-0">
-                      <span
-                        className="block text-xs font-semibold text-slate-200 group-hover:text-white transition-colors truncate"
-                        style={{ fontFamily: 'Manrope, sans-serif' }}
-                      >
-                        {label}
-                      </span>
-                      {hotkey && <KeyCombo keys={parseShortcut(hotkey)} />}
-                    </div>
-                  </button>
-                )
-              })}
-            </div>
-            <CaptureSelfToggle checked={captureSelf} onChange={handleCaptureSelfChange} />
-          </div>
-        ) : (
-          <div className="space-y-3">
-            <div className="flex flex-wrap gap-2">
-              {/* Browser Extension — exact DOM offsets, no stitch guessing */}
-              <button
-                onClick={() => handleScroll('extension')}
-                className="group w-64 flex items-center gap-3 px-3 py-3 rounded-xl
-                           bg-white/[0.03] border border-white/[0.05]
-                           hover:bg-secondary/[0.08] hover:border-secondary/20
-                           active:scale-[0.98] transition-all duration-200 cursor-pointer"
-              >
-                <div className="w-9 h-9 rounded-lg bg-secondary/10 flex items-center justify-center flex-shrink-0
-                                group-hover:bg-secondary/20 transition-colors duration-200">
-                  <span className="material-symbols-outlined text-secondary text-lg">extension</span>
-                </div>
-                <div className="text-left min-w-0 flex-1">
-                  <span
-                    className="block text-xs font-semibold text-slate-200 group-hover:text-white transition-colors truncate"
-                    style={{ fontFamily: 'Manrope, sans-serif' }}
-                  >
-                    Browser Extension
-                  </span>
-                  <span className="flex items-center gap-1.5 mt-1">
-                    <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${extStatus.connected ? (extStatus.outdated?.length ? 'bg-amber-400' : 'bg-emerald-400') : 'bg-slate-600'}`} />
-                    <span className={`text-[10px] font-medium truncate ${extStatus.connected ? (extStatus.outdated?.length ? 'text-amber-400' : 'text-emerald-400') : 'text-slate-500'}`}>
-                      {extStatus.connected
-                        ? extStatus.outdated?.length
-                          ? 'Connected · extension update available'
-                          : `Connected · ${extStatus.browsers.length > 1
-                              ? `${extStatus.browsers.length} browsers`
-                              : extStatus.browsers[0] ?? 'browser'}`
-                        : 'Not connected — click to set up'}
-                    </span>
-                  </span>
-                </div>
-              </button>
-
-              {/* Classic screen scroll — synthetic wheel + stitch, any app */}
-              <button
-                onClick={() => handleScroll('screen')}
-                className="group w-64 flex items-center gap-3 px-3 py-3 rounded-xl
-                           bg-white/[0.03] border border-white/[0.05]
-                           hover:bg-secondary/[0.08] hover:border-secondary/20
-                           active:scale-[0.98] transition-all duration-200 cursor-pointer"
-              >
-                <div className="w-9 h-9 rounded-lg bg-secondary/10 flex items-center justify-center flex-shrink-0
-                                group-hover:bg-secondary/20 transition-colors duration-200">
-                  <span className="material-symbols-outlined text-secondary text-lg">swipe_down</span>
-                </div>
-                <div className="text-left min-w-0 flex-1">
-                  <span
-                    className="block text-xs font-semibold text-slate-200 group-hover:text-white transition-colors truncate"
-                    style={{ fontFamily: 'Manrope, sans-serif' }}
-                  >
-                    Screen Scroll
-                  </span>
-                  <span className="block text-[10px] font-medium text-slate-500 mt-1 truncate">
-                    Works with any app or window
-                  </span>
-                </div>
-              </button>
-            </div>
-
-            {/* Always-available entry to the install guide — so you can add the
-                 extension to another browser or profile even when one is
-                 already connected. */}
-            <button
-              onClick={() => setShowExtSetup(v => !v)}
-              className="inline-flex items-center gap-1.5 text-[11px] font-medium text-slate-500 hover:text-secondary transition-colors"
-              style={{ fontFamily: 'Manrope, sans-serif' }}
-            >
-              <span className="material-symbols-outlined text-sm">{showExtSetup ? 'expand_less' : 'add'}</span>
-              {extStatus.connected ? 'Install on another browser or profile' : 'How to install the extension'}
-            </button>
-
-            {showExtSetup && (
-              <div className="max-w-xl p-4 rounded-xl bg-secondary/[0.06] border border-secondary/15 space-y-3">
-                <div className="flex items-center justify-between">
-                  <p className="text-xs font-bold text-white" style={{ fontFamily: 'Manrope, sans-serif' }}>
-                    Install the browser extension
-                  </p>
-                  <button onClick={() => setShowExtSetup(false)} className="text-slate-500 hover:text-white transition-colors">
-                    <span className="material-symbols-outlined text-sm">close</span>
-                  </button>
-                </div>
-                <p className="text-[11px] text-slate-400 leading-relaxed">
-                  Capture scrolling screenshots straight from your browser. Install it in each browser or
-                  profile you want to use — Lumia connects automatically and the dot turns green.
-                  To start captures from <span className="text-slate-300">this app</span> (instead of the
-                  extension's own menu), click the extension icon once and press{' '}
-                  <span className="text-slate-300">"Allow captures from the app"</span>.
-                </p>
-
-                {/* Primary: one-click Chrome Web Store install (Chromium browsers) */}
-                {CHROME_WEB_STORE_URL ? (
-                  <div className="space-y-1.5">
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <button
-                        onClick={() => window.electronAPI?.openExternal?.(CHROME_WEB_STORE_URL)}
-                        className="inline-flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs font-bold primary-gradient text-slate-900 hover:opacity-90 active:scale-[0.98] transition-all"
-                        style={{ fontFamily: 'Manrope, sans-serif' }}
-                      >
-                        <span className="material-symbols-outlined text-sm">extension</span>
-                        Add to Chrome
-                      </button>
-                      <button
-                        onClick={async () => {
-                          await window.electronAPI?.writeClipboardText?.(CHROME_WEB_STORE_URL)
-                          setStoreUrlCopied(true)
-                          setTimeout(() => setStoreUrlCopied(false), 1600)
-                        }}
-                        className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold bg-white/[0.06] border border-white/10 text-slate-200 hover:bg-white/10 active:scale-[0.98] transition-all"
-                        style={{ fontFamily: 'Manrope, sans-serif' }}
-                      >
-                        <span className="material-symbols-outlined text-sm">{storeUrlCopied ? 'check' : 'content_copy'}</span>
-                        {storeUrlCopied ? 'Copied' : 'Copy link'}
-                      </button>
-                    </div>
-                    <p className="text-[10px] text-slate-500">
-                      Opens in your default browser — if that isn't Chrome, copy the link and paste it into the
-                      browser you want. Works in Edge, Brave, Opera, and other Chromium browsers.
-                    </p>
-                  </div>
-                ) : (
-                  <p className="text-[10px] text-slate-500 italic">A one-click Chrome Web Store install is on the way. For now, load it manually:</p>
-                )}
-
-                {/* Secondary: manual load-unpacked, collapsed once the store link exists */}
-                <details open={!CHROME_WEB_STORE_URL} className="group">
-                  <summary className="cursor-pointer select-none text-[11px] font-semibold text-slate-300 hover:text-white transition-colors">
-                    Install manually (developer mode)
-                  </summary>
-                  <ol className="mt-2 text-[11px] text-slate-400 space-y-1 list-decimal list-inside">
-                    <li>Open the extension folder below.</li>
-                    <li>Go to <span className="text-slate-300 font-mono">chrome://extensions</span> and enable <span className="text-slate-300">Developer mode</span>.</li>
-                    <li>Click <span className="text-slate-300">Load unpacked</span> and select the folder.</li>
-                    <li>Keep Lumia running — the status dot turns green within a few seconds.</li>
-                  </ol>
-                  <button
-                    onClick={() => window.electronAPI?.openScrollExtensionFolder?.()}
-                    className="mt-2 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-semibold bg-secondary/15 text-secondary hover:bg-secondary/25 transition-all"
-                    style={{ fontFamily: 'Manrope, sans-serif' }}
-                  >
-                    <span className="material-symbols-outlined text-sm">folder_open</span>
-                    Open Extension Folder
-                  </button>
-                </details>
-
-                {/* Live connection status */}
-                {extStatus.connected && !!extStatus.outdated?.length && (
-                  <div className="flex items-start gap-1.5 pt-0.5">
-                    <span className="w-1.5 h-1.5 rounded-full bg-amber-400 flex-shrink-0 mt-1" />
-                    <span className="text-[10px] text-amber-400 leading-relaxed">
-                      The extension in {extStatus.outdated.join(', ')} is older than the copy this app ships
-                      {extStatus.bundledVersion ? ` (v${extStatus.bundledVersion})` : ''} — captures still work, but
-                      without the latest fixes. Update it from the Web Store, or for a manually loaded extension
-                      press Reload on <span className="font-mono text-amber-300">chrome://extensions</span>.
-                    </span>
-                  </div>
-                )}
-                {extStatus.connected ? (
-                  <div className="flex items-center gap-1.5 pt-0.5">
-                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 flex-shrink-0" />
-                    <span className="text-[10px] text-emerald-400">
-                      Connected{extStatus.browsers.length
-                        ? ` · ${extStatus.browsers.length > 1 ? `${extStatus.browsers.length} browsers` : extStatus.browsers[0]}`
-                        : ''} — install it in another browser or profile above to add it there too.
-                    </span>
-                  </div>
-                ) : (
-                  <div className="flex items-center gap-1.5 pt-0.5">
-                    <span className="w-1.5 h-1.5 rounded-full bg-slate-600 animate-pulse flex-shrink-0" />
-                    <span className="text-[10px] text-slate-500">Waiting for the extension to connect…</span>
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
-        )}
-      </section>
-
-      </div>
+      {/* The top section (kind toggle, greeting, capture tiles, scroll setup,
+          "include Lumia's own window") is removed for now; see
+          design/DASHBOARD-TOP-SECTION.md. Its helpers (MediaKindToggle,
+          CAPTURE_MODES, VIDEO_MODES, extension status) are still in this file. */}
 
       {/* ── Recent / History ── */}
-      <section className="flex-1 min-h-0 flex flex-col px-8 pt-8 pb-8">
-        <div className="flex items-center justify-between mb-4 flex-shrink-0 gap-3 flex-wrap">
-          <div className="flex items-center gap-3 flex-wrap">
-            <h2
-              className="text-lg font-bold text-white"
-              style={{ fontFamily: 'Manrope, sans-serif' }}
-            >
-              Recent
-            </h2>
+      <section className="flex-1 min-h-0 flex flex-col">
+        {/* No visible title (2026-11-20: the Dashboard is the only list of
+            captures, so "Captures" told nobody anything); kept for screen
+            readers. */}
+        <h2 className="sr-only">Captures</h2>
 
-            {/* Filter tabs */}
-            <div className="flex items-center gap-1.5">
-              {([
-                { key: 'all' as const, label: `All (${counts.all})` },
-                { key: 'screenshot' as const, label: `Screenshots (${counts.screenshot})` },
-                { key: 'recording' as const, label: `Recordings (${counts.recording})` },
-              ]).map(({ key, label }) => (
-                <button
-                  key={key}
-                  onClick={() => setFilter(key)}
-                  className={`px-3 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider transition-all ${
-                    filter === key
-                      ? 'primary-gradient text-slate-900'
-                      : 'bg-white/5 text-slate-500 hover:text-white border border-white/5'
-                  }`}
-                  style={{ fontFamily: 'Manrope, sans-serif' }}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {/* Right controls share the filter-pill visual language so heights
-               and paddings line up across the whole toolbar. */}
-          <div className="flex items-center gap-1.5">
-            {/* View toggle — segmented button group so the two options read
-                 as one control instead of separate pills. */}
-            <div className="h-[25px] inline-flex items-center rounded-full bg-white/5 border border-white/5 overflow-hidden">
-              {([
-                { key: 'grid' as const, icon: 'view_module', label: 'Grid' },
-                { key: 'list' as const, icon: 'list', label: 'List' },
-              ]).map(({ key, icon, label }) => (
-                <button
-                  key={key}
-                  onClick={() => setViewMode(key)}
-                  className={`h-full inline-flex items-center gap-1 px-3 text-[10px] font-bold uppercase tracking-wider leading-none transition-all ${
-                    viewMode === key
-                      ? 'primary-gradient text-slate-900'
-                      : 'text-slate-500 hover:text-white hover:bg-white/5'
-                  }`}
-                  style={{ fontFamily: 'Manrope, sans-serif' }}
-                  title={label}
-                >
-                  <span className="material-symbols-outlined text-[8px]">{icon}</span>
-                  {label}
-                </button>
-              ))}
-            </div>
-
-            {/* Cleanup missing — only visible when orphans exist. Amber tone
-                 to flag it as destructive-ish, same pill size as siblings. */}
+        {/* The filters (the missing-files button when files are gone, the
+            type filter, the view switch, Select) sit in the AppBar's slot
+            (2026-11-20): a toolbar row of their own wasted 56px with only its
+            left side used. One control style (Segmented), 12px medium
+            labels, the selected option in the accent purple. */}
+        <AppBarControls>
+          <div className="flex items-center gap-3">
+            {/* Rows whose file is gone: one 32px toolbar button (Lucide
+                FileXCorner in the warning colour on the plain elevated fill,
+                styled like Select's trash since 2026-11-21; was on
+                warning-subtle; the count as a badge) that
+                clears them from history. First in the group, before Select
+                (2026-11-20; was "trash + N missing files" text). */}
             {missingCount > 0 && (
               <button
                 onClick={handleCleanupMissing}
-                className="h-[25px] inline-flex items-center gap-1 px-3 rounded-full text-[10px] font-bold uppercase tracking-wider leading-none bg-amber-500/10 text-amber-400 hover:bg-amber-500/20 border border-amber-500/20 transition-all"
-                style={{ fontFamily: 'Manrope, sans-serif' }}
-                title="Remove history entries whose files no longer exist"
+                data-tip="Clear"
+                aria-label={`Clear ${missingCount} missing ${missingCount === 1 ? 'file' : 'files'} from History`}
+                // Windows (2026-11-23): last in the group (the bar is
+                // mirrored there: type, view, Select, missing).
+                className={`${ICON_BUTTON_FRAME} group/miss relative text-warning-text hover:bg-elevated-hover hover:text-warning-text-hover ${window.electronAPI?.platform === 'darwin' ? '' : 'order-last'}`}
               >
-                <span className="material-symbols-outlined text-[8px]">cleaning_services</span>
-                Clean {missingCount}
+                <Icon name="file_x_corner" className="text-[16px]" />
+                {/* How many, as a badge like Select's trash badge, in the
+                    warning pair inverted (warning-text fill, warning-subtle
+                    number), so it matches the icon. On the button's
+                    top-right corner, not over the icon (2026-11-21; was top
+                    left inside): -top-1 -right-1.5, with a 2px ring in the
+                    AppBar's colour so it cuts out of the button's edge. The
+                    number is 8px system mono, semibold, nudged down half a
+                    pixel (pt-px): SF Mono's digits sit high in their line
+                    box. */}
+                <span className="absolute z-10 -top-1 -right-1.5 min-w-3.5 h-3.5 px-0.75 pt-px flex items-center justify-center rounded-full ring-2 ring-toolbar bg-warning-text group-hover/miss:bg-warning-text-hover text-warning-subtle text-[8px] font-mono font-semibold leading-none">{missingCount}</span>
               </button>
             )}
-
-            {/* Select toggle */}
-            <button
-              onClick={() => isSelecting ? exitSelection() : setIsSelecting(true)}
-              className={`h-[25px] inline-flex items-center gap-1 px-3 rounded-full text-[10px] font-bold uppercase tracking-wider leading-none transition-all ${
-                isSelecting
-                  ? 'primary-gradient text-slate-900'
-                  : 'bg-white/5 text-slate-500 hover:text-white border border-white/5'
-              }`}
-              style={{ fontFamily: 'Manrope, sans-serif' }}
-            >
-              <span className="material-symbols-outlined text-[8px]">checklist</span>
-              Select
-            </button>
+            {/* Type filter: All, then icons (Lucide's Images and our matching
+                VideoStack), named by their tooltips. */}
+            <Segmented
+              value={filter}
+              onChange={setFilter}
+              options={[
+                { key: 'all', label: 'All', square: true },
+                { key: 'screenshot', icon: 'collections', title: 'Images' },
+                { key: 'recording', icon: 'video_library', title: 'Videos' },
+              ]}
+            />
+            <Segmented
+              value={viewMode}
+              onChange={setViewMode}
+              options={[
+                { key: 'grid', icon: 'view_module', title: 'Grid' },
+                { key: 'list', icon: 'list', title: 'List' },
+              ]}
+            />
+            {/* Last, right of the filters (2026-11-22; second, after the
+                missing-files button, from 2026-11-20). One
+                button, three states (2026-11-21): Select (CircleCheck,
+                fg-secondary); in select mode with nothing selected the
+                very same icon and colour (2026-11-22: only the strip says
+                on; it was the accent, then fg, then a filled circle),
+                tooltip "Cancel", which
+                leaves select mode; with clips selected the red trash with
+                the count as a badge, which deletes them (a delete keeps
+                select mode). In both select-mode states a 3px accent strip
+                runs along the button's bottom edge (see below), so the mode
+                reads as on. Same frame in all three. Tried and dropped: a
+                neutral × (no link to the mode being on), an accent × and
+                CircleX, a bg-accent fill (looked off beside the segmented
+                filters), a separate Delete button, a purple strip over the
+                clip area. Esc also leaves. The badge sits on the button's
+                top-right corner like the missing-files one. */}
+            {(() => {
+              const deleting = isSelecting && selectedIds.size > 0
+              return (
+                <button
+                  onClick={deleting ? handleBulkDelete : isSelecting ? exitSelection : () => setIsSelecting(true)}
+                  disabled={isBulkDeleting}
+                  data-tip={deleting ? 'Delete' : isSelecting ? 'Cancel' : 'Select'}
+                  aria-label={deleting ? `Delete ${selectedIds.size} selected` : isSelecting ? 'Leave select mode' : 'Select'}
+                  aria-pressed={isSelecting}
+                  // Hover: fill step + icon step (grey → fg, red →
+                  // danger-text-hover). The trash is red at rest, one of the
+                  // three exceptions to "delete buttons are grey at rest"
+                  // (STYLEGUIDE › Buttons and controls, 2026-11-27).
+                  className={`${ICON_BUTTON_FRAME} group/sel group/on relative hover:bg-elevated-hover ${
+                    deleting ? 'text-danger-text hover:text-danger-text-hover' : 'text-fg-secondary hover:text-fg'
+                  }`}
+                >
+                  {/* No spinner while deleting (2026-11-24): the delete is
+                      quick, a spinner only flashed. The button is disabled
+                      meanwhile. */}
+                  <Icon
+                    name={deleting || isBulkDeleting ? 'delete' : 'check_circle'}
+                    className="text-[16px]"
+                  />
+                  {/* Select-mode strip, in every select-mode state (also on
+                      the red trash, 2026-11-21): straight, 3px (picked on a
+                      1 to 7px slider), on the bottom edge inside the frame,
+                      across its full width,
+                      masked by a wrapper with the frame's inner shape
+                      (inset-0 = inside the border, rounded-[7px] = 8px
+                      minus the 1px border, overflow-hidden) so its ends
+                      never cover the border at the corners. Tried: an
+                      inset box-shadow (its top edge curved too), 8px in
+                      from each side (too short), unmasked (over the
+                      border's curve). */}
+                  {isSelecting && (
+                    <OnStrip />
+                  )}
+                  {/* How many are selected: the icon's colour (danger-text)
+                      with the pair inverted, so badge and trash match. */}
+                  {deleting && (
+                    <span className="absolute z-10 -top-1 -right-1.5 min-w-3.5 h-3.5 px-0.75 pt-px flex items-center justify-center rounded-full ring-2 ring-toolbar bg-danger-text group-hover/sel:bg-danger-text-hover text-danger-subtle text-[8px] font-mono font-semibold leading-none">{selectedIds.size}</span>
+                  )}
+                </button>
+              )
+            })()}
           </div>
-        </div>
-
-        {/* Selection toolbar — always visible while selecting so the count
-             (and exit button) never disappear even with nothing selected. */}
-        {isSelecting && (
-          <div className="flex items-center justify-between px-4 py-2 mb-3 bg-primary/5 border border-primary/10 rounded-xl flex-shrink-0">
-            <span className="text-xs font-semibold text-primary" style={{ fontFamily: 'Manrope, sans-serif' }}>
-              {selectedIds.size} selected
-            </span>
-            <div className="flex items-center gap-2">
-              <button
-                onClick={handleBulkDelete}
-                disabled={selectedIds.size === 0 || isBulkDeleting}
-                className="flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-semibold bg-red-500/10 text-red-400 hover:bg-red-500/20 transition-all disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-red-500/10"
-                style={{ fontFamily: 'Manrope, sans-serif' }}
-              >
-                {isBulkDeleting ? (
-                  <div className="w-3 h-3 rounded-full border-2 border-red-400 border-t-transparent animate-spin" />
-                ) : (
-                  <span className="material-symbols-outlined text-sm">delete</span>
-                )}
-                {isBulkDeleting ? 'Deleting…' : 'Delete'}
-              </button>
-              <button
-                onClick={exitSelection}
-                disabled={isBulkDeleting}
-                className="px-3 py-1 rounded-lg text-xs font-semibold text-slate-400 hover:text-white bg-white/5 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
-                style={{ fontFamily: 'Manrope, sans-serif' }}
-              >
-                Cancel
-              </button>
-            </div>
-          </div>
+        </AppBarControls>
+        {uploadMenu && (
+          <UploadMenu
+            anchor={uploadMenu.anchor}
+            anchorEl={uploadMenu.anchorEl}
+            rows={uploadMenu.rows}
+            onClose={closeUploadMenu}
+            onPick={row => { const it = uploadMenu.item; setUploadMenu(null); void uploadTo(it, row) }}
+          />
         )}
 
+        {/* The clips' area, layer L3 (bg-content). */}
+        {/* Padding on the scroll area itself (px-5), so the system scroll
+            bar sits at the window's edge and the clips scroll to its bottom
+            edge: no padding on this wrapper, which would leave a fixed strip
+            nothing scrolls into. The space after the last clip is the last
+            day's own pb-8. The scroll area is never focused (no Tab
+            stop, no ring); the arrow keys scroll it anyway (see the keydown
+            effect). scroll-pt-12 keeps a clip Tab brings into view clear of
+            the sticky day label (12px + 26px label + 8px). */}
+        {/* isolate: the cards' own layers (z-10 to z-30) and the day labels
+            (z-30) stack inside the clip area only, so the AppBar's and the
+            bottom bar's light-mode shadows (z-10) paint over all of it. */}
+        {/* Select-mode mouse gestures live on this wrapper
+            (useSelectGestures): drag a rectangle to select, Shift-click for
+            a range, click the background to leave select mode. A drag also
+            works outside select mode: it turns select mode on, and off again
+            if it selects nothing. select-none so a drag or Shift-click never
+            selects text. */}
+        <div
+          className="isolate flex-1 min-h-0 flex flex-col bg-content select-none"
+          {...selectGestures.wrapperProps}
+        >
         <DaySections
-          className="flex-1 min-h-0 overflow-y-auto pr-1 -mr-1"
+          className="flex-1 min-h-0 overflow-y-auto pt-3 px-5 scroll-pt-12 outline-none"
           days={days}
           rows={rows}
           filter={filter}
           view={viewMode}
-          gridClassName={viewMode === 'grid' ? 'grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-3' : 'flex flex-col gap-1'}
+          gridClassName={viewMode === 'grid' ? 'grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-3' : 'flex flex-col gap-2'}
           loadDays={loadDays}
           dropDays={dropDays}
           pinnedDays={pinnedDays}
-          renderItem={(item) => viewMode === 'grid' ? (
+          onDayClick={isSelecting ? selectDay : undefined}
+          selectedIds={selectedIds}
+          renderItem={(item) => {
+            return viewMode === 'grid' ? (
               <HistoryCard
                 key={item.id}
                 item={item}
                 isSelecting={isSelecting}
                 isSelected={selectedIds.has(item.id)}
-                isSharing={sharingId === item.id}
-                isSharingGdrive={sharingGdriveId === item.id}
-                gdriveReady={gdriveReady}
+                isUploading={sharingId === item.id || sharingGdriveId === item.id}
+                uploadReady={shareReady || gdriveAvail}
+                uploadLinked={allLinked(item)}
+                menuOpen={uploadMenu?.item.id === item.id}
                 onToggleSelect={() => toggleSelect(item.id)}
                 onOpen={() => openItem(item)}
                 onDelete={() => handleDelete(item.id)}
                 onCopy={() => copyItem(item)}
-                onShare={() => shareItem(item)}
-                onShareGdrive={() => shareGdriveItem(item)}
+                onUpload={el => onUploadClick(item, el)}
+                onDownload={() => downloadItem(item)}
               />
             ) : (
                 <HistoryListRow
@@ -789,28 +801,41 @@ export default function Dashboard() {
                   item={item}
                   isSelecting={isSelecting}
                   isSelected={selectedIds.has(item.id)}
-                  isSharing={sharingId === item.id}
-                  isSharingGdrive={sharingGdriveId === item.id}
-                  gdriveReady={gdriveReady}
+                  isUploading={sharingId === item.id || sharingGdriveId === item.id}
+                  uploadReady={shareReady || gdriveAvail}
+                  uploadLinked={allLinked(item)}
+                  menuOpen={uploadMenu?.item.id === item.id}
                   onToggleSelect={() => toggleSelect(item.id)}
                   onOpen={() => openItem(item)}
                   onDelete={() => handleDelete(item.id)}
                   onCopy={() => copyItem(item)}
-                  onShare={() => shareItem(item)}
-                  onShareGdrive={() => shareGdriveItem(item)}
+                  onUpload={el => onUploadClick(item, el)}
+                  onDownload={() => downloadItem(item)}
                 />
-            )}
+            )
+          }}
             emptyState={stats ? <EmptyState filter={filter} /> : null}
           />
+        </div>
       </section>
 
-      {showScrollCapture && <ScrollCaptureDialog onClose={() => setShowScrollCapture(false)} />}
+      {/* Drag-to-select rectangle (screen coordinates, already clipped to
+          the clip area). Accent, so it stands out over any thumbnail: a
+          solid accent edge and an accent fill at 15%. The fill has to be
+          see-through so the clips stay visible under it, the one place an
+          opacity modifier stands in for a role (2026-11-21; neutral line +
+          fill roles tried, too quiet). */}
+      {selectGestures.marquee && (
+        <div
+          className="fixed z-40 rounded-sm border border-accent bg-accent/15 pointer-events-none"
+          style={selectGestures.marquee}
+        />
+      )}
+
       {showBrowserPicker && <BrowserPickerDialog onClose={() => setShowBrowserPicker(false)} />}
     </div>
   )
 }
-
-/* ── Media Kind Toggle ── */
 
 function MediaKindToggle({ value, onChange }: { value: MediaKind; onChange: (v: MediaKind) => void }) {
   const options: { kind: MediaKind; icon: string; label: string; activeBg: string; activeBorder: string; activeIcon: string }[] = [
@@ -818,53 +843,49 @@ function MediaKindToggle({ value, onChange }: { value: MediaKind; onChange: (v: 
       kind: 'image',
       icon: 'photo_camera',
       label: 'Image',
-      activeBg: 'bg-primary/15',
-      activeBorder: 'border-primary/25',
-      activeIcon: 'text-primary',
+      activeBg: 'bg-accent-subtle',
+      activeBorder: 'border-transparent',
+      activeIcon: 'text-accent-text',
     },
     {
       kind: 'video',
       icon: 'videocam',
       label: 'Video',
-      activeBg: 'bg-tertiary/15',
-      activeBorder: 'border-tertiary/25',
-      activeIcon: 'text-tertiary',
+      activeBg: 'bg-accent-subtle',
+      activeBorder: 'border-transparent',
+      activeIcon: 'text-accent-text',
     },
     {
       kind: 'scroll',
       icon: 'swipe_down',
       label: 'Scroll',
-      activeBg: 'bg-secondary/15',
-      activeBorder: 'border-secondary/25',
-      activeIcon: 'text-secondary',
+      activeBg: 'bg-accent-subtle',
+      activeBorder: 'border-transparent',
+      activeIcon: 'text-accent-text',
     },
   ]
   return (
-    <div className="inline-flex items-center gap-1 p-1 rounded-xl bg-white/[0.03] border border-white/10">
+    <div className="inline-flex items-center gap-1 p-1 rounded-xl bg-control border border-line">
       {options.map(({ kind, icon, label, activeBg, activeBorder, activeIcon }) => {
         const active = value === kind
         return (
           <button
             key={kind}
             onClick={() => onChange(kind)}
-            className={`group flex items-center gap-2 px-3.5 py-1.5 rounded-lg transition-all duration-200 cursor-pointer border ${
+            className={`group flex items-center gap-2 px-3.5 py-1.5 rounded-lg   border ${
               active
-                ? `${activeBg} ${activeBorder} shadow-[0_0_16px_rgba(0,0,0,0.2)]`
-                : 'border-transparent hover:bg-white/[0.06] hover:border-white/20'
+                ? `${activeBg} ${activeBorder}`
+                : 'border-transparent '
             }`}
           >
+            <Icon name={icon} className={`text-[16px]  ${
+                active ? activeIcon : 'text-fg-tertiary '
+              }`} />
             <span
-              className={`material-symbols-outlined text-[16px] transition-colors ${
-                active ? activeIcon : 'text-slate-500 group-hover:text-slate-300'
+              className={`text-xs font-semibold  ${
+                active ? 'text-fg' : 'text-fg-secondary '
               }`}
-            >
-              {icon}
-            </span>
-            <span
-              className={`text-xs font-semibold transition-colors ${
-                active ? 'text-white' : 'text-slate-400 group-hover:text-slate-200'
-              }`}
-              style={{ fontFamily: 'Manrope, sans-serif' }}
+             
             >
               {label}
             </span>
@@ -881,22 +902,22 @@ function MediaKindToggle({ value, onChange }: { value: MediaKind; onChange: (v: 
  *  capture/recording starts; this keeps it visible so Lumia's own window can
  *  be part of the shot (and picked in Window mode). Shown under the mode
  *  buttons on both the Image and Video tabs; backed by the persisted
- *  `captureSelfWindow` setting so hotkey captures honor it too. */
+ * `captureSelfWindow` setting so hotkey captures honor it too. */
 function CaptureSelfToggle({ checked, onChange }: { checked: boolean; onChange: (v: boolean) => void }) {
   return (
     <label
-      className="group inline-flex items-center gap-2 cursor-pointer select-none"
+      className="group inline-flex items-center gap-2 select-none"
       title="Keep Lumia visible while capturing or recording, so the app's own window appears in the result and can be picked in Window mode"
     >
       <input
         type="checkbox"
         checked={checked}
         onChange={e => onChange(e.target.checked)}
-        className="w-3.5 h-3.5 accent-primary cursor-pointer flex-shrink-0"
+        className="w-3.5 h-3.5 accent-accent flex-shrink-0"
       />
       <span
-        className="text-[11px] font-medium text-slate-500 group-hover:text-slate-300 transition-colors"
-        style={{ fontFamily: 'Manrope, sans-serif' }}
+        className="text-[11px] font-medium text-fg-tertiary"
+       
       >
         Include Lumia's own window in captures
       </span>
@@ -907,17 +928,27 @@ function CaptureSelfToggle({ checked, onChange }: { checked: boolean; onChange: 
 /* ── Empty State ── */
 
 function EmptyState({ filter }: { filter: FilterType }) {
-  const icon = filter === 'recording' ? 'videocam_off' : filter === 'screenshot' ? 'hide_image' : 'history'
+  // Image: ImageOff, Video: PlayOff, All: both (2026-11-22).
+  const icons = filter === 'screenshot' ? ['hide_image']
+    : filter === 'recording' ? ['play_off']
+    : ['hide_image', 'play_off']
   const message = filter !== 'all'
-    ? `No ${filter === 'screenshot' ? 'screenshots' : 'recordings'} yet`
-    : 'No captures yet'
+    // Nouns are Image / Video; screenshot / record are the verbs (2026-11-22).
+    ? `No ${filter === 'screenshot' ? 'images' : 'videos'} yet`
+    : 'No files yet'
 
   return (
-    <div className="flex flex-col items-center justify-center py-20">
-      <div className="p-5 rounded-2xl bg-white/5 mb-5">
-        <span className="material-symbols-outlined text-4xl text-slate-600">{icon}</span>
+    // Centred in the clip area (2026-11-22, it sat 80px from the top):
+    // fills the scroller's full height, -mt-3 + 12px cancelling its pt-3.
+    <div className="flex flex-col items-center justify-center -mt-3 h-[calc(100%+12px)]">
+      {/* Bare icon, no box (2026-11-22: the bg-fill box was an old fill
+          role and looked heavy over the 12px line). */}
+      <div className="flex gap-2 mb-2">
+        {icons.map(n => <Icon key={n} name={n} className="text-[24px] text-fg-tertiary" />)}
       </div>
-      <p className="text-sm font-semibold text-slate-400" style={{ fontFamily: 'Manrope, sans-serif' }}>
+      {/* Caption rank: 12px medium fg-secondary (14px semibold before,
+          2026-11-22, off the type scale). */}
+      <p className="text-xs font-medium text-fg-secondary">
         {message}
       </p>
     </div>
@@ -927,169 +958,239 @@ function EmptyState({ filter }: { filter: FilterType }) {
 /* ── History Card (Grid View) ── */
 
 function HistoryCard({
-  item, isSelecting, isSelected, isSharing, isSharingGdrive, gdriveReady,
-  onToggleSelect, onOpen, onDelete, onCopy, onShare, onShareGdrive,
+  item, isSelecting, isSelected, isUploading, uploadReady, uploadLinked, menuOpen,
+  onToggleSelect, onOpen, onDelete, onCopy, onUpload, onDownload,
 }: {
   item: HistoryItem
   isSelecting: boolean
   isSelected: boolean
-  isSharing: boolean
-  isSharingGdrive: boolean
-  gdriveReady: boolean
+  isUploading: boolean
+  uploadReady: boolean
+  /** Every place it can go has its link: Upload shows as Copy link. */
+  uploadLinked: boolean
+  /** Its Upload menu is open: the hover buttons stay up. */
+  menuOpen: boolean
   onToggleSelect: () => void
   onOpen: () => void
   onDelete: () => void
   onCopy: () => void
-  onShare: () => void
-  onShareGdrive: () => void
+  /** Gets the Upload button, for the menu's place. */
+  onUpload: (el: HTMLElement) => void
+  onDownload: () => void
 }) {
-  const date = new Date(item.timestamp).toLocaleString('en-US', {
-    month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
-  })
-  const isUploaded = item.uploads?.some(u => u.success)
-  const hasDriveUpload = item.uploads?.some(u => u.destination === 'google-drive' && u.success)
-  const missing = item.fileMissing
+  const isUploaded = !!item.uploads?.some(u => u.success)
+  // fileGone: the local file isn't on disk (nothing that needs it can run).
+  // An uploaded clip without its file is cloud only: its Missing tag and
+  // Uploaded mark, but no cover or warning edge (its upload is safe); a
+  // click restores it from the upload; its hover buttons are Download (in
+  // Copy's place), Upload as Copy link, and Delete (2026-11-21).
+  const fileGone = !!item.fileMissing
+  const cloudOnly = fileGone && isUploaded
+  const missing = fileGone && !isUploaded
+  const showUploaded = isUploaded
+  // A missing file shows no length either, as an image shows no size
+  // (2026-11-27).
+  const lengthMs = item.type === 'recording' && !fileGone ? recordingLengthMs(item) : undefined
+  // Status bar, left: a recording's length, an image's pixel size.
+  // Units sit 1px after their numbers (ml-px), not a space character.
+  const leftText = item.type === 'recording'
+    ? (lengthMs != null ? durationParts(lengthMs).map((p, i) => <span key={i}>{i > 0 && ' '}{p.value}<span className="ml-px">{p.unit}</span></span>) : null)
+    : formatDimensions(item)
+  const timeText = new Date(item.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }) // 24-hour clock only
 
   const stop = (fn: () => void) => (e: ReactMouseEvent) => { e.stopPropagation(); fn() }
 
   return (
+    // Control role like the toolbar's controls. overflow-hidden clips the
+    // thumbnail to the card's inner corner, so it needs no radius of its own.
+    // A Tab stop (data-clip: the Dashboard's Tab-after-arrows starts at the
+    // first one in view). Enter / Space do what a click does. Its focus
+    // ring is the overlay at the end (the card's own outline would sit
+    // under the thumbnail and status bar).
     <div
-      className={`group glass-card rounded-lg transition-all duration-300 relative ${
-        missing && !isSelecting ? 'opacity-50' : ''
-      } ${
-        missing ? 'cursor-default' : 'cursor-pointer'
-      } ${
-        isSelected ? 'ring-2 ring-primary/50' : ''
-      }`}
-      onClick={isSelecting ? onToggleSelect : (missing ? undefined : onOpen)}
-      title={missing ? 'File no longer exists on disk' : undefined}
+      // isolate: the card's own z layers (10 to 30) stack inside it, never
+      // over the sticky day labels (z-30).
+      className="group relative isolate overflow-hidden rounded-lg bg-toolbar outline-none"
+      tabIndex={0}
+      data-clip
+      data-id={item.id}
+      onClick={isSelecting ? onToggleSelect : (fileGone && !cloudOnly ? undefined : onOpen)}
+      onKeyDown={e => {
+        if (e.target !== e.currentTarget || (e.key !== 'Enter' && e.key !== ' ')) return
+        e.preventDefault()
+        if (isSelecting) onToggleSelect()
+        else if (!fileGone || cloudOnly) onOpen()
+      }}
+      // The file's name with its extension, while Cmd is held (2026-11-27;
+      // the native title "File no longer exists on disk" went: the Missing
+      // tag says it). The hover buttons' own tips win, being nearer.
+      data-tip={fileTipText(item)}
+      data-tip-follow
+      data-tip-key
     >
-      {/* Thumbnail */}
-      <div className="aspect-video bg-slate-950 relative overflow-hidden rounded-t-lg">
+      {/* Thumbnail with the status bar and hover buttons over it. A
+          missing file covers all of it (see the cover below). */}
+      <div className="aspect-[4/3] bg-content relative overflow-hidden">
         {(item.thumbnailUrl ?? item.dataUrl) ? (
-          <img src={item.thumbnailUrl ?? item.dataUrl} loading="lazy" decoding="async" className="w-full h-full object-cover group-hover:scale-[1.03] transition-transform duration-500 opacity-90 group-hover:opacity-100" />
+          // A missing file's thumbnail in greyscale, under its cover (2026-11-21).
+          <img
+            src={item.thumbnailUrl ?? item.dataUrl}
+            loading="lazy"
+            decoding="async"
+            // A preview deleted outside Lumia: main checks and has it made again.
+            onError={item.thumbnailUrl ? () => { void reportFileGone(item.id, 'thumbnail') } : undefined}
+            className={`w-full h-full object-cover select-none ${missing ? 'grayscale' : ''}`}
+          />
         ) : (
           <div className="w-full h-full flex items-center justify-center">
-            <span className="material-symbols-outlined text-slate-700 text-4xl">{item.type === 'recording' ? 'videocam' : 'image'}</span>
+            <Icon name={item.type === 'recording' ? 'videocam' : 'image'} className="text-fg-tertiary text-[24px]" />
           </div>
         )}
 
-        {/* Selection checkbox */}
+        {/* Selection checkbox: a small circle with an accent edge, so it reads
+            apart from the white-edged play button. z-20: above a missing
+            file's cover (z-10), which stays in select mode. */}
         {isSelecting && (
-          <div className="absolute top-2 left-2 z-10">
+          <div className="absolute top-2 left-2 z-20">
             <button
               onClick={stop(onToggleSelect)}
-              className={`w-6 h-6 rounded-lg flex items-center justify-center transition-all border ${
-                isSelected
-                  ? 'bg-primary border-primary text-slate-900'
-                  : 'bg-black/40 border-white/20 backdrop-blur-md hover:border-primary/40'
+              aria-label={isSelected ? 'Deselect' : 'Select'}
+              className={`w-5 h-5 rounded-full flex items-center justify-center border border-accent ${
+                isSelected ? 'bg-accent text-on-accent' : 'bg-elevated'
               }`}
             >
-              {isSelected && <span className="material-symbols-outlined text-xs">check</span>}
+              {isSelected && <Icon name="check" className="text-[14px]" />}
             </button>
           </div>
         )}
 
-        {/* Video badge. Hardcoded pink so light theme doesn't render dark purple. */}
-        {item.type === 'recording' && !isSelecting && (
-          <span
-            className="absolute top-2 left-2 z-10 text-[9px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-md border backdrop-blur-sm"
-            style={{
-              color: '#ec4899',
-              backgroundColor: 'color-mix(in oklab, #ec4899 20%, transparent)',
-              borderColor: 'color-mix(in oklab, #ec4899 35%, transparent)',
-            }}
-          >
-            Video
-          </span>
-        )}
-
-        {/* Synced badge */}
-        {isUploaded && !isSelecting && !missing && (
-          <span
-            className="absolute top-2 right-2 z-10 text-[9px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-md border backdrop-blur-sm"
-            style={{
-              color: 'var(--color-secondary)',
-              backgroundColor: 'color-mix(in oklab, var(--color-secondary) 18%, transparent)',
-              borderColor: 'color-mix(in oklab, var(--color-secondary) 30%, transparent)',
-            }}
-          >
-            Synced
-          </span>
-        )}
-
-        {/* Missing file badge */}
-        {missing && !isSelecting && (
-          <span className="absolute top-2 right-2 z-10 text-[9px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-md border backdrop-blur-sm text-amber-300 bg-amber-500/20 border-amber-400/30">
-            Missing
-          </span>
-        )}
-
-        {/* Play button overlay for recordings */}
-        {item.type === 'recording' && !isSelecting && (
-          <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">
-            <div className="w-12 h-12 rounded-full bg-white/10 backdrop-blur-md flex items-center justify-center border border-white/20">
-              <span className="material-symbols-outlined text-white/90 text-2xl ml-0.5">play_arrow</span>
-            </div>
-          </div>
-        )}
-
-        {/* Hover overlay — unified action set for image + video. Orphan
-             cards collapse to Delete only so users prune without chasing
-             dead links. */}
-        {!isSelecting && (
-          <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-black/20 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300 flex items-end justify-center pb-3 gap-2 z-10">
-            {!missing && (
-              <>
-                <OvlBtn icon="edit" label="Edit" tint="blue" onClick={stop(onOpen)} />
-                <OvlBtn icon="content_copy" label="Copy" tint="emerald" onClick={stop(onCopy)} />
-                <OvlBtn icon={isSharing ? 'sync' : 'share'} label={isSharing ? 'Sharing…' : 'Share'} tint="sky" onClick={stop(onShare)} spinning={isSharing} />
-                {gdriveReady && (
-                  <OvlBtn
-                    icon={isSharingGdrive ? 'sync' : 'add_to_drive'}
-                    label={isSharingGdrive ? 'Uploading…' : (hasDriveUpload ? 'Copy Drive link' : 'Upload to Drive & copy link')}
-                    tint="amber"
-                    onClick={stop(onShareGdrive)}
-                    spinning={isSharingGdrive}
-                  />
-                )}
-              </>
+        {/* Status bar along the bottom of the picture (2026-11-20).
+            Left: the type icon (Video `smart_display` in pink kind-video,
+            Image `image` in blue kind-image; moved here from the right
+            2026-11-21), a recording's length or an image's pixel size, then
+            the capture time (from the row's timestamp, never the name, which
+            the user can change). Length before time: read left to right,
+            "3h 32m" is plainly a length, so the clock time after it can't
+            be mistaken for one. No file name. The type stays in select
+            mode: it tells what the card is, not what a click does. Right:
+            the status tags, bare (no box or fill, so the last one's edge
+            lines up with the 8px on the left): Missing (warning-coloured
+            text; the whole card is covered as well), then Uploaded (14px
+            green `radio`).
+            Solid toolbar fill (bg-toolbar), like the day labels and hover
+            buttons. */}
+        <div className="absolute inset-x-0 bottom-0 z-10 h-6 px-2 flex items-center justify-between gap-2 border-t border-line bg-toolbar text-fg-secondary">
+          {/* the source after the time and a
+              dot (without the dot tried, also with the time in fg and an
+              8px gap, 2026-11-24) ("App / Window title", "Region",
+              "Screen", as in the list),
+              cut off with an ellipsis; it runs to the bar's right edge when
+              there are no tags (the tags group is left out then), else to
+              8px before them. */}
+          <div className="flex-1 min-w-0 flex items-center gap-1 text-[10px] font-medium tabular-nums whitespace-nowrap">
+            {/* Type: Video or Image, the icon in its kind colour (line
+                only, no fill), first on the left (2026-11-21). mr-0.5 on
+                top of the row's gap-1: 6px to the text, a little more than
+                between the words. */}
+            {item.type === 'recording' ? (
+              <span data-tip="Video" aria-label="Video" className="flex mr-0.5 text-kind-video">
+                <Icon name="smart_display" className="text-[14px]" />
+              </span>
+            ) : (
+              <span data-tip="Image" aria-label="Image" className="flex mr-0.5 text-kind-image">
+                <Icon name="image" className="text-[14px]" />
+              </span>
             )}
-            <OvlBtn icon="delete" label="Delete" tint="red" onClick={stop(onDelete)} />
+            {/* a recording's length or an
+                image's pixel size (3072×1754 is wide) shows only while the
+                card is hovered, in the source's place after the time, so
+                nothing before it moves; the source steps aside then. */}
+            <span className="shrink-0">{timeText}</span>
+            {leftText && <><span className="shrink-0 hidden group-hover:inline">·</span><span className="shrink-0 hidden group-hover:inline">{leftText}</span></>}
+            {(() => {
+              const src = clipSource(item)
+              if (src.mode !== 'region' && src.mode !== 'screen' && src.parts.length === 0) return null
+              const hide = leftText ? 'group-hover:hidden' : ''
+              return <><span className={`shrink-0 ${hide}`}>·</span><span className={`min-w-0 truncate ${hide}`}><SourceText {...src} /></span></>
+            })()}
+          </div>
+          {(missing || cloudOnly || showUploaded) && <div className="shrink-0 flex items-center gap-1">
+            {/* Final 2026-11-23: the list view's icons, bare (no
+                pill), in place of the MISSING text tag. */}
+            {(missing || cloudOnly) && <span data-tip="Missing" aria-label="Missing" className="flex text-warning-text"><Icon name="file_x_corner" className="text-[14px]" /></span>}
+            {showUploaded && <span data-tip="Uploaded" aria-label="Uploaded" className="flex text-success-text"><Icon name="radio" className="text-[14px]" /></span>}
+          </div>}
+        </div>
+
+        {/* A missing file (2026-11-21, as in the list view; on top of the
+            Missing tag): the card is covered by its own fill at 40% (dark in
+            dark mode, light in light mode) and a warning-subtle wash at 35% on
+            top (2026-11-21, the list's values; 60% / 25% before),
+            both 1px inside the edge (inset-px, radius 7px), and the edge
+            turns warning (below). Before the hover buttons in the DOM, so
+            Delete paints above it at full strength. Stays in select mode, with
+            the edge and the Missing tag (2026-11-21), so missing clips can be
+            told apart while picking; the selection circle sits above it. */}
+        {missing && <>
+          <div className="absolute inset-px z-10 rounded-[7px] bg-toolbar/40 pointer-events-none" />
+          <div className="absolute inset-px z-10 rounded-[7px] bg-warning-subtle/35 pointer-events-none" />
+        </>}
+
+        {/* Actions on hover, same set for image + video; shown at once, no
+            fade. No Edit: clicking the card opens it. Orphan cards collapse
+            to Delete only so users prune without chasing dead links. An
+            action that can't run is left out, not shown disabled (Upload
+            without R2 or Drive set up). In a row at the picture's top
+            right, 8px in (p-2; picked 2026-11-21 over centred and the other
+            corners/edges). The layer stops above the status bar (top-0
+            bottom-6), so it never covers the bar's tags (their tooltips need
+            the pointer). While the card uploads or its Upload menu is open,
+            the row stays up without the pointer (2026-11-23). */}
+        {!isSelecting && (
+          <div className={`absolute inset-x-0 top-0 bottom-6 p-2 ${isUploading || menuOpen ? 'flex' : 'hidden group-hover:flex'} items-start justify-end gap-2 z-10`}>
+            {cloudOnly && <ClipActionButton icon="download" label="Download" onClick={stop(onDownload)} />}
+            {!fileGone && <ClipActionButton icon="content_copy" label="Copy" onClick={stop(onCopy)} />}
+            {/* Upload: the Drive icon until the clip is uploaded, then a
+                link icon that copies its link (works without the file). */}
+            {uploadReady && (isUploaded || !fileGone) && (
+              <ClipActionButton
+                icon={isUploading ? 'sync' : uploadLinked ? 'link' : 'add_to_drive'}
+                label={isUploading ? 'Uploading…' : uploadLinked ? 'Copy link' : 'Upload'}
+                onClick={e => { e.stopPropagation(); onUpload(e.currentTarget as HTMLElement) }}
+                spinning={isUploading}
+                noTip={menuOpen}
+              />
+            )}
+            <ClipActionButton danger icon="delete" label="Delete" onClick={stop(onDelete)} />
           </div>
         )}
       </div>
 
-      {/* Info */}
-      <div className="p-3">
-        <p className="text-xs font-bold text-white truncate mb-1" style={{ fontFamily: 'Manrope, sans-serif' }}>{item.name}</p>
-        <p className="text-[10px] text-slate-500 font-medium">{date}</p>
-      </div>
+      {/* Edge line so a white capture on the white page (or a black one on
+          the dark page) still shows its edge: the theme's line colour, dark
+          in light mode and light in dark mode. Inset on a layer above the
+          thumbnail like the selected outline below, which covers it. A
+          missing file's edge is warning-line (index.css), as in the list
+          view. */}
+      {/* under the pointer the edge steps
+          up to line-strong (not on a missing card); the hover buttons that
+          appear carry the rest. Tried: a solid line-strong, a 2px edge, the
+          list rows' overlay (lost over light / dark thumbnails), an outer
+          edge on the card itself. */}
+      <div className={`absolute inset-0 z-10 rounded-lg ring-1 ring-inset pointer-events-none ${missing ? 'ring-warning-line' : 'ring-line group-hover:ring-line-strong'}`} />
+
+      {/* Keyboard focus ring for the card, over everything on it (z-30). */}
+      <div className="absolute inset-0 z-30 hidden group-focus-visible:block rounded-lg ring-2 ring-inset ring-focus pointer-events-none" />
+
+      {/* Accent outline when selected. An inset ring on a layer above the
+          thumbnail: an outer ring is cut off by the scroll area at the grid's
+          left edge, and one on the card itself sits under the image. */}
+      {isSelected && <div className="absolute inset-0 z-20 rounded-lg ring-(length:--selection-ring) ring-inset ring-accent pointer-events-none" />}
+
     </div>
   )
 }
 
-// Pre-enumerated so Tailwind's JIT picks up each class combination at build
-// time — constructing class names via template strings gets purged.
-const OVL_TINTS: Record<OvlTint, string> = {
-  blue:    'bg-white/10 text-white/70 hover:bg-blue-500/30 hover:text-blue-300',
-  emerald: 'bg-white/10 text-white/70 hover:bg-emerald-500/30 hover:text-emerald-300',
-  sky:     'bg-white/10 text-white/70 hover:bg-sky-500/30 hover:text-sky-300',
-  amber:   'bg-white/10 text-white/70 hover:bg-amber-500/30 hover:text-amber-300',
-  red:     'bg-white/10 text-white/70 hover:bg-red-500/30 hover:text-red-300',
-}
-type OvlTint = 'blue' | 'emerald' | 'sky' | 'amber' | 'red'
 
-function OvlBtn({ icon, label, onClick, tint, spinning }: { icon: string; label: string; onClick: (e: ReactMouseEvent) => void; tint: OvlTint; spinning?: boolean }) {
-  return (
-    <button
-      onClick={onClick}
-      disabled={spinning}
-      className={`w-8 h-8 rounded-full flex items-center justify-center backdrop-blur-sm transition-all duration-200 disabled:opacity-60 ${OVL_TINTS[tint]}`}
-      title={label}
-    >
-      <span className={`material-symbols-outlined text-[16px] ${spinning ? 'animate-spin' : ''}`}>{icon}</span>
-    </button>
-  )
-}
+
 

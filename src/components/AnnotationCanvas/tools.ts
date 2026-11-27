@@ -2,7 +2,9 @@
  *  annotator. Keep this file free of React imports so it can be consumed by
  *  pure render helpers too. */
 
-export type Tool = 'none' | 'pen' | 'rect' | 'ellipse' | 'arrow' | 'text' | 'blur' | 'sticker'
+import { DEFAULT_ANNOTATION_COLOR } from '../../../shared/annotation'
+
+export type Tool = 'none' | 'pen' | 'highlighter' | 'rect' | 'ellipse' | 'arrow' | 'text' | 'blur' | 'sticker'
 
 export interface ToolDef {
   id: Tool
@@ -25,30 +27,38 @@ export const SELECT_TOOLS: ToolDef[] = [
 ]
 
 export const DRAW_TOOLS: ToolDef[] = [
-  { id: 'pen',     icon: 'draw',              label: 'Pen',       shortcut: 'P' },
+  { id: 'pen',     icon: 'draw',              label: 'Brush',     shortcut: 'B' },
+  // From the recording's live drawing (2026-11-24): a freehand stroke drawn
+  // HIGHLIGHTER_WIDTH x as wide at HIGHLIGHTER_OPACITY.
+  { id: 'highlighter', icon: 'highlight',     label: 'Highlighter', shortcut: 'H' },
   { id: 'arrow',   icon: 'arrow_forward',     label: 'Arrow',     shortcut: 'A' },
   { id: 'rect',    icon: 'crop_square',       label: 'Rectangle', shortcut: 'R' },
   { id: 'ellipse', icon: 'circle',            label: 'Ellipse',   shortcut: 'E' },
 ]
 
+// Text before Blur (2026-11-23; Blur came first). Sticker isn't a tool
+// since 2026-11-26: a toggle button beside the tools opens its panel, like
+// History ('sticker' stays in `Tool` as a shape kind).
 export const EXTRA_TOOLS: ToolDef[] = [
-  { id: 'blur',    icon: 'blur_on',           label: 'Blur',      shortcut: 'B' },
   { id: 'text',    icon: 'title',             label: 'Text',      shortcut: 'T' },
-  { id: 'sticker', icon: 'add_reaction',      label: 'Sticker',   shortcut: 'S' },
+  { id: 'blur',    icon: 'blur_on',           label: 'Blur',      shortcut: 'U' },
 ]
 
-/** All tools in a single lookup — used for keyboard shortcut handling. */
-export const ALL_TOOLS: ToolDef[] = [...SELECT_TOOLS, ...DRAW_TOOLS, ...EXTRA_TOOLS]
+/** Highlighter strokes: this many times the picked width, at this opacity. */
+export const HIGHLIGHTER_WIDTH = 4
+export const HIGHLIGHTER_OPACITY = 0.35
+
+/** Freehand tools: a trail of points (Pen, Highlighter). */
+export const isFreehand = (t: string | undefined) => t === 'pen' || t === 'highlighter'
 
 /** Canonical color palette. Keep order stable — users learn positions. */
 export const COLORS = [
-  '#f87171', // red
-  '#fb923c', // orange
-  '#fbbf24', // amber
-  '#34d399', // emerald
-  '#60a5fa', // blue
-  '#a78bfa', // violet
-  '#f472b6', // pink
+  DEFAULT_ANNOTATION_COLOR, // red (#ee3533), the colour a drawing starts in
+  '#fe860f', // orange
+  '#fbda1b', // yellow
+  '#40d872', // green
+  '#2896f5', // blue
+  '#822dda', // purple
   '#ffffff', // white
   '#000000', // black
 ] as const
@@ -56,8 +66,6 @@ export const COLORS = [
 /** Stroke-width quick picks shown alongside the slider. */
 export const STROKE_PRESETS = [2, 4, 8] as const
 
-/** Return tool id for a keyboard key (case-insensitive). Null = no match. */
-export function matchToolShortcut(key: string): Tool | null {
-  const upper = key.toUpperCase()
-  return ALL_TOOLS.find(t => t.shortcut === upper)?.id ?? null
-}
+// Tool keys (and every other editor key) are in src/lib/editor-keys.ts
+// since 2026-11-24, when they became changeable; `shortcut` above is only
+// the default there.

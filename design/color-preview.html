@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lumia color roles preview</title>
+<style>
+  :root, [data-theme="dark"] {
+    --background: #050810;
+    --surface: #090e19;
+    --surface-raised: #111723;
+    --canvas: #050810;
+    --fill: rgba(232, 230, 240, 0.068);
+    --fill-hover: rgba(232, 230, 240, 0.1);
+    --fill-active: rgba(232, 230, 240, 0.134);
+    --line-subtle: rgba(232, 230, 240, 0.07);
+    --line: rgba(232, 230, 240, 0.12);
+    --line-strong: rgba(232, 230, 240, 0.22);
+    --fg: #e8e6f0;
+    --fg-secondary: #aeb4c1;
+    --fg-tertiary: #818895;
+    --fg-disabled: #4b5362;
+    --accent: #b6a0ff;
+    --accent-hover: #c1b1ff;
+    --accent-subtle: #211939;
+    --accent-text: #cdc0ff;
+    --focus: #b6a0ff;
+    --danger: #db232f;
+    --danger-hover: #c91927;
+    --danger-subtle: #371210;
+    --danger-text: #ff958d;
+    --warning-subtle: #2d1b00;
+    --warning-text: #ffc673;
+    --success-subtle: #002712;
+    --success-text: #6dd797;
+    --on-accent: #050810;
+    --on-danger: #ffffff;
+    --brand-end: #00e3fd;
+    --scrim: rgba(5, 8, 16, 0.72);
+    --glow-accent: rgba(182, 160, 255, 0.07);
+    --glow-cyan: rgba(0, 227, 253, 0.04);
+    --capture-frame: #b6a0ff;
+    --capture-frame-outline: rgba(5, 8, 16, 0.55);
+    --capture-highlight: rgba(182, 160, 255, 0.10);
+    --capture-dim: rgba(0, 0, 0, 0.18);
+    --recording-frame: #db232f;
+    --glass-docked: 0.6;
+    --glass-floating: 0.8;
+  }
+  [data-theme="light"] {
+    --background: #fafcff;
+    --surface: #f5f7fb;
+    --surface-raised: #ebeef5;
+    --canvas: #ebeef5;
+    --fill: rgba(24, 29, 39, 0.058);
+    --fill-hover: rgba(24, 29, 39, 0.095);
+    --fill-active: rgba(24, 29, 39, 0.129);
+    --line-subtle: rgba(24, 29, 39, 0.1);
+    --line: rgba(24, 29, 39, 0.14);
+    --line-strong: rgba(24, 29, 39, 0.22);
+    --fg: #181d27;
+    --fg-secondary: #515762;
+    --fg-tertiary: #656a75;
+    --fg-disabled: #abb1bd;
+    --accent: #7440d5;
+    --accent-hover: #6931c8;
+    --accent-subtle: #f1efff;
+    --accent-text: #6534bd;
+    --focus: #7440d5;
+    --danger: #d41828;
+    --danger-hover: #c3001f;
+    --danger-subtle: #ffecea;
+    --danger-text: #c21725;
+    --warning-subtle: #ffeed9;
+    --warning-text: #8d5e00;
+    --success-subtle: #e0f9e7;
+    --success-text: #007742;
+    --on-accent: #ffffff;
+    --on-danger: #ffffff;
+    --brand-end: #007d8c;
+    --scrim: rgba(24, 29, 39, 0.45);
+    --glow-accent: rgba(182, 160, 255, 0);
+    --glow-cyan: rgba(0, 227, 253, 0);
+    --capture-frame: #b6a0ff;
+    --capture-frame-outline: rgba(5, 8, 16, 0.55);
+    --capture-highlight: rgba(182, 160, 255, 0.10);
+    --capture-dim: rgba(0, 0, 0, 0.18);
+    --recording-frame: #db232f;
+    --glass-docked: 0.75;
+    --glass-floating: 0.88;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/20px Inter, system-ui, sans-serif; color: var(--fg);
+    background: radial-gradient(circle at top right, var(--glow-accent), transparent 55%), radial-gradient(circle at bottom left, var(--glow-cyan), transparent 55%), var(--background); min-height: 100vh; }
+  header { display: flex; align-items: center; justify-content: space-between; padding: 16px 24px; border-bottom: 1px solid var(--line-subtle); }
+  h1 { margin: 0; font: 800 20px/28px Manrope, system-ui, sans-serif; }
+  h2 { margin: 0 0 12px; font: 700 12px/16px Manrope, system-ui, sans-serif; text-transform: uppercase; letter-spacing: .1em; color: var(--fg-secondary); }
+  main { display: grid; grid-template-columns: 256px 1fr; min-height: calc(100vh - 61px); }
+  .side { padding: 20px 24px; display: flex; flex-direction: column; gap: 4px; background: color-mix(in srgb, var(--surface) calc(var(--glass-docked) * 100%), transparent); border-right: 1px solid var(--line-subtle); backdrop-filter: blur(40px); }
+  .nav { display: flex; align-items: center; gap: 12px; padding: 10px 14px; border-radius: 12px; color: var(--fg-secondary); font: 500 14px/20px Manrope, system-ui, sans-serif; text-decoration: none; }
+  .nav:hover { background: var(--fill-hover); color: var(--fg); }
+  .nav.on { background: var(--accent-subtle); color: var(--accent-text); }
+  .cta { margin-top: auto; border: 0; border-radius: 16px; padding: 14px; font: 800 13px/20px Manrope, system-ui, sans-serif; text-transform: uppercase; letter-spacing: .05em; color: var(--on-accent);
+    background: linear-gradient(135deg, var(--accent), var(--brand-end)); cursor: pointer; }
+  .content { padding: 24px; display: flex; flex-direction: column; gap: 28px; min-width: 0; }
+  .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+  .card { background: color-mix(in srgb, var(--surface-raised) calc(var(--glass-floating) * 100%), transparent); border: 1px solid var(--line-subtle); border-radius: 16px; padding: 16px; backdrop-filter: blur(24px); }
+  button.b { font: 700 12px/16px Manrope, system-ui, sans-serif; border-radius: 10px; padding: 9px 14px; border: 1px solid transparent; cursor: pointer; }
+  .b.acc { background: var(--accent); color: var(--on-accent); } .b.acc:hover { background: var(--accent-hover); }
+  .b.neu { background: var(--fill); color: var(--fg); border-color: var(--line); } .b.neu:hover { background: var(--fill-hover); border-color: var(--line-strong); }
+  .b.dan { background: var(--danger); color: var(--on-danger); } .b.dan:hover { background: var(--danger-hover); }
+  .b:disabled { color: var(--fg-disabled); background: var(--fill); cursor: default; }
+  .b:focus-visible, .nav:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+  .pill { font: 700 10px/1 Manrope, system-ui, sans-serif; text-transform: uppercase; letter-spacing: .05em; padding: 7px 12px; border-radius: 999px; background: var(--fill); color: var(--fg-secondary); border: 1px solid var(--line-subtle); }
+  .pill.on { background: var(--accent); color: var(--on-accent); border-color: transparent; }
+  .seg { display: inline-flex; gap: 4px; padding: 4px; border-radius: 14px; background: var(--fill); border: 1px solid var(--line-subtle); }
+  .seg span { padding: 6px 14px; border-radius: 10px; font: 600 12px/16px Manrope, system-ui, sans-serif; color: var(--fg-secondary); }
+  .seg .on { background: var(--accent-subtle); color: var(--accent-text); }
+  .status { display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; border-radius: 10px; font-weight: 600; font-size: 12px; }
+  .s-d { background: var(--danger-subtle); color: var(--danger-text); } .s-w { background: var(--warning-subtle); color: var(--warning-text); } .s-g { background: var(--success-subtle); color: var(--success-text); }
+  .t2 { color: var(--fg-secondary); } .t3 { color: var(--fg-tertiary); font-size: 12px; } a { color: var(--accent-text); }
+  .recpill { display: inline-flex; align-items: center; gap: 10px; padding: 8px 14px; border-radius: 999px; background: color-mix(in srgb, var(--surface-raised) calc(var(--glass-floating) * 100%), transparent); border: 1px solid var(--line-subtle); box-shadow: 0 8px 32px rgba(0,0,0,.35); font: 900 14px/20px Manrope, system-ui, sans-serif; font-variant-numeric: tabular-nums; }
+  .dot { width: 10px; height: 10px; border-radius: 99px; background: var(--danger); }
+  .screen { position: relative; height: 170px; border-radius: 12px; overflow: hidden; background: linear-gradient(90deg, #ffffff 0 50%, #111111 50% 100%); }
+  .frame { position: absolute; top: 30px; height: 100px; border: 2px dashed var(--capture-frame); outline: 1px solid var(--capture-frame-outline); outline-offset: 0; box-shadow: 0 0 0 9999px var(--capture-dim); }
+  .frame.rec { border-color: var(--recording-frame); box-shadow: none; }
+  .workspace { height: 120px; border-radius: 12px; background: var(--canvas); display: flex; align-items: center; justify-content: center; border: 1px solid var(--line-subtle); }
+  .workspace div { width: 180px; height: 80px; background: #ffffff; border-radius: 4px; box-shadow: 0 12px 32px rgba(0,0,0,.3); }
+  .sw { display: inline-block; width: 22px; height: 22px; border-radius: 99px; margin-right: 6px; border: 1px solid var(--line); }
+  .ramp { display: grid; grid-template-columns: 80px 1fr; gap: 8px; align-items: center; margin-bottom: 6px; }
+  .ramp b { font-size: 12px; color: var(--fg-secondary); }
+  .cells { display: grid; grid-template-columns: repeat(12, 1fr); gap: 2px; }
+  .cell { height: 34px; border-radius: 4px; display: flex; align-items: flex-end; padding: 3px; font-size: 10px; }
+  .cell span { background: rgba(0,0,0,.45); color: #fff; padding: 0 3px; border-radius: 3px; }
+  .roles { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 8px; }
+  .role { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+  .role i { width: 28px; height: 28px; border-radius: 6px; border: 1px solid var(--line-subtle); flex: none; }
+  .toggle { font: 600 12px/16px Manrope, system-ui, sans-serif; }
+  @media (max-width: 760px) { main { grid-template-columns: 1fr; } .side { border-right: 0; border-bottom: 1px solid var(--line-subtle); } }
+</style>
+</head>
+<body>
+<header><h1>Lumia color roles</h1><button class="b neu toggle" id="toggle">Switch to light</button></header>
+<main>
+  <aside class="side">
+    <a class="nav on" href="#">Dashboard</a>
+    <a class="nav" href="#">Wallpapers</a>
+    <a class="nav" href="#">Settings</a>
+    <button class="cta">New Capture</button>
+  </aside>
+  <div class="content">
+    <section><h2>Controls</h2>
+      <div class="row">
+        <button class="b acc">Connect Google Drive</button>
+        <button class="b neu">Cancel</button>
+        <button class="b dan">Delete recording</button>
+        <button class="b neu" disabled>Disabled</button>
+        <span class="seg"><span class="on">Image</span><span>Video</span><span>Scroll</span></span>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <span class="pill on">All (24)</span><span class="pill">Screenshots (18)</span><span class="pill">Recordings (6)</span>
+      </div>
+    </section>
+    <section class="card"><h2>Text on surface-raised</h2>
+      <div style="font:800 24px/32px Manrope,system-ui,sans-serif">Good evening</div>
+      <p class="t2" style="margin:6px 0">18 screenshots · 6 recordings. Captures save to Pictures/Lumia. <a href="#">Open folder</a></p>
+      <div class="t3">Saved 2 minutes ago</div>
+    </section>
+    <section><h2>Status</h2>
+      <div class="row">
+        <span class="status s-d">Upload failed</span><span class="status s-w">Clean 3 missing files</span><span class="status s-g">Saved</span>
+        <span class="recpill"><span class="dot"></span>00:42</span>
+      </div>
+    </section>
+    <section><h2>Capture chrome (fixed, on a white and a black screen)</h2>
+      <div class="screen"><div class="frame" style="left:20%;width:40%"></div><div class="frame rec" style="left:66%;width:26%"></div></div>
+    </section>
+    <section><h2>Editor canvas</h2><div class="workspace"><div></div></div></section>
+    <section><h2>Annotation palette (fixed)</h2><i class="sw" style="background:#ee3533" title="red #ee3533"></i><i class="sw" style="background:#fe860f" title="orange #fe860f"></i><i class="sw" style="background:#fbda1b" title="yellow #fbda1b"></i><i class="sw" style="background:#40d872" title="green #40d872"></i><i class="sw" style="background:#2896f5" title="blue #2896f5"></i><i class="sw" style="background:#822dda" title="purple #822dda"></i><i class="sw" style="background:#ffffff" title="white #ffffff"></i><i class="sw" style="background:#000000" title="black #000000"></i></section>
+    <section><h2>Roles</h2><div class="roles">
+<div class="role"><i style="background:var(--background)"></i><code>background</code></div>
+<div class="role"><i style="background:var(--surface)"></i><code>surface</code></div>
+<div class="role"><i style="background:var(--surface-raised)"></i><code>surface-raised</code></div>
+<div class="role"><i style="background:var(--canvas)"></i><code>canvas</code></div>
+<div class="role"><i style="background:var(--fill)"></i><code>fill</code></div>
+<div class="role"><i style="background:var(--fill-hover)"></i><code>fill-hover</code></div>
+<div class="role"><i style="background:var(--fill-active)"></i><code>fill-active</code></div>
+<div class="role"><i style="background:var(--line-subtle)"></i><code>line-subtle</code></div>
+<div class="role"><i style="background:var(--line)"></i><code>line</code></div>
+<div class="role"><i style="background:var(--line-strong)"></i><code>line-strong</code></div>
+<div class="role"><i style="background:var(--fg)"></i><code>fg</code></div>
+<div class="role"><i style="background:var(--fg-secondary)"></i><code>fg-secondary</code></div>
+<div class="role"><i style="background:var(--fg-tertiary)"></i><code>fg-tertiary</code></div>
+<div class="role"><i style="background:var(--fg-disabled)"></i><code>fg-disabled</code></div>
+<div class="role"><i style="background:var(--accent)"></i><code>accent</code></div>
+<div class="role"><i style="background:var(--accent-hover)"></i><code>accent-hover</code></div>
+<div class="role"><i style="background:var(--accent-subtle)"></i><code>accent-subtle</code></div>
+<div class="role"><i style="background:var(--accent-text)"></i><code>accent-text</code></div>
+<div class="role"><i style="background:var(--focus)"></i><code>focus</code></div>
+<div class="role"><i style="background:var(--danger)"></i><code>danger</code></div>
+<div class="role"><i style="background:var(--danger-hover)"></i><code>danger-hover</code></div>
+<div class="role"><i style="background:var(--danger-subtle)"></i><code>danger-subtle</code></div>
+<div class="role"><i style="background:var(--danger-text)"></i><code>danger-text</code></div>
+<div class="role"><i style="background:var(--warning-subtle)"></i><code>warning-subtle</code></div>
+<div class="role"><i style="background:var(--warning-text)"></i><code>warning-text</code></div>
+<div class="role"><i style="background:var(--success-subtle)"></i><code>success-subtle</code></div>
+<div class="role"><i style="background:var(--success-text)"></i><code>success-text</code></div>
+<div class="role"><i style="background:var(--on-accent)"></i><code>on-accent</code></div>
+<div class="role"><i style="background:var(--on-danger)"></i><code>on-danger</code></div>
+<div class="role"><i style="background:var(--brand-end)"></i><code>brand-end</code></div>
+<div class="role"><i style="background:var(--scrim)"></i><code>scrim</code></div>
+<div class="role"><i style="background:var(--glow-accent)"></i><code>glow-accent</code></div>
+<div class="role"><i style="background:var(--glow-cyan)"></i><code>glow-cyan</code></div>
+    </div></section>
+    <section><h2>Ramps (this theme)</h2>
+      <div data-ramps="dark"><div class="ramp"><b>Neutral</b><div class="cells"><div class="cell" style="background:#050810" title="N1 #050810"><span>1</span></div><div class="cell" style="background:#090e19" title="N2 #090e19"><span>2</span></div><div class="cell" style="background:#111723" title="N3 #111723"><span>3</span></div><div class="cell" style="background:#171e2b" title="N4 #171e2b"><span>4</span></div><div class="cell" style="background:#1e2534" title="N5 #1e2534"><span>5</span></div><div class="cell" style="background:#262e3d" title="N6 #262e3d"><span>6</span></div><div class="cell" style="background:#343c4c" title="N7 #343c4c"><span>7</span></div><div class="cell" style="background:#4b5362" title="N8 #4b5362"><span>8</span></div><div class="cell" style="background:#626977" title="N9 #626977"><span>9</span></div><div class="cell" style="background:#818895" title="N10 #818895"><span>10</span></div><div class="cell" style="background:#aeb4c1" title="N11 #aeb4c1"><span>11</span></div><div class="cell" style="background:#e8e6f0" title="N12 #e8e6f0"><span>12</span></div></div></div>
+<div class="ramp"><b>Accent</b><div class="cells"><div class="cell" style="background:#0b0a13" title="A1 #0b0a13"><span>1</span></div><div class="cell" style="background:#120f1e" title="A2 #120f1e"><span>2</span></div><div class="cell" style="background:#211939" title="A3 #211939"><span>3</span></div><div class="cell" style="background:#2a1e4a" title="A4 #2a1e4a"><span>4</span></div><div class="cell" style="background:#332559" title="A5 #332559"><span>5</span></div><div class="cell" style="background:#3f3068" title="A6 #3f3068"><span>6</span></div><div class="cell" style="background:#514080" title="A7 #514080"><span>7</span></div><div class="cell" style="background:#6b55a6" title="A8 #6b55a6"><span>8</span></div><div class="cell" style="background:#b6a0ff" title="A9 #b6a0ff"><span>9</span></div><div class="cell" style="background:#c1b1ff" title="A10 #c1b1ff"><span>10</span></div><div class="cell" style="background:#cdc0ff" title="A11 #cdc0ff"><span>11</span></div><div class="cell" style="background:#e8e4ff" title="A12 #e8e4ff"><span>12</span></div></div></div>
+<div class="ramp"><b>Red</b><div class="cells"><div class="cell" style="background:#130807" title="R1 #130807"><span>1</span></div><div class="cell" style="background:#1d0c0b" title="R2 #1d0c0b"><span>2</span></div><div class="cell" style="background:#371210" title="R3 #371210"><span>3</span></div><div class="cell" style="background:#471312" title="R4 #471312"><span>4</span></div><div class="cell" style="background:#551918" title="R5 #551918"><span>5</span></div><div class="cell" style="background:#642321" title="R6 #642321"><span>6</span></div><div class="cell" style="background:#7c322f" title="R7 #7c322f"><span>7</span></div><div class="cell" style="background:#a14440" title="R8 #a14440"><span>8</span></div><div class="cell" style="background:#db232f" title="R9 #db232f"><span>9</span></div><div class="cell" style="background:#c91927" title="R10 #c91927"><span>10</span></div><div class="cell" style="background:#ff958d" title="R11 #ff958d"><span>11</span></div><div class="cell" style="background:#ffdbd7" title="R12 #ffdbd7"><span>12</span></div></div></div>
+<div class="ramp"><b>Amber</b><div class="cells"><div class="cell" style="background:#100a03" title="Y1 #100a03"><span>1</span></div><div class="cell" style="background:#190f03" title="Y2 #190f03"><span>2</span></div><div class="cell" style="background:#2d1b00" title="Y3 #2d1b00"><span>3</span></div><div class="cell" style="background:#382300" title="Y4 #382300"><span>4</span></div><div class="cell" style="background:#432b00" title="Y5 #432b00"><span>5</span></div><div class="cell" style="background:#523500" title="Y6 #523500"><span>6</span></div><div class="cell" style="background:#694500" title="Y7 #694500"><span>7</span></div><div class="cell" style="background:#895b00" title="Y8 #895b00"><span>8</span></div><div class="cell" style="background:#ffb848" title="Y9 #ffb848"><span>9</span></div><div class="cell" style="background:#ffca7f" title="Y10 #ffca7f"><span>10</span></div><div class="cell" style="background:#ffc673" title="Y11 #ffc673"><span>11</span></div><div class="cell" style="background:#ffe7c8" title="Y12 #ffe7c8"><span>12</span></div></div></div>
+<div class="ramp"><b>Green</b><div class="cells"><div class="cell" style="background:#050e08" title="G1 #050e08"><span>1</span></div><div class="cell" style="background:#06150c" title="G2 #06150c"><span>2</span></div><div class="cell" style="background:#002712" title="G3 #002712"><span>3</span></div><div class="cell" style="background:#003118" title="G4 #003118"><span>4</span></div><div class="cell" style="background:#003b1e" title="G5 #003b1e"><span>5</span></div><div class="cell" style="background:#004926" title="G6 #004926"><span>6</span></div><div class="cell" style="background:#005d33" title="G7 #005d33"><span>7</span></div><div class="cell" style="background:#047a45" title="G8 #047a45"><span>8</span></div><div class="cell" style="background:#10ae65" title="G9 #10ae65"><span>9</span></div><div class="cell" style="background:#2bbb71" title="G10 #2bbb71"><span>10</span></div><div class="cell" style="background:#6dd797" title="G11 #6dd797"><span>11</span></div><div class="cell" style="background:#cbf4d8" title="G12 #cbf4d8"><span>12</span></div></div></div></div>
+      <div data-ramps="light" hidden><div class="ramp"><b>Neutral</b><div class="cells"><div class="cell" style="background:#fafcff" title="N1 #fafcff"><span>1</span></div><div class="cell" style="background:#f5f7fb" title="N2 #f5f7fb"><span>2</span></div><div class="cell" style="background:#ebeef5" title="N3 #ebeef5"><span>3</span></div><div class="cell" style="background:#e2e6ee" title="N4 #e2e6ee"><span>4</span></div><div class="cell" style="background:#dadee7" title="N5 #dadee7"><span>5</span></div><div class="cell" style="background:#cfd4de" title="N6 #cfd4de"><span>6</span></div><div class="cell" style="background:#c2c7d3" title="N7 #c2c7d3"><span>7</span></div><div class="cell" style="background:#abb1bd" title="N8 #abb1bd"><span>8</span></div><div class="cell" style="background:#878c97" title="N9 #878c97"><span>9</span></div><div class="cell" style="background:#656a75" title="N10 #656a75"><span>10</span></div><div class="cell" style="background:#515762" title="N11 #515762"><span>11</span></div><div class="cell" style="background:#181d27" title="N12 #181d27"><span>12</span></div></div></div>
+<div class="ramp"><b>Accent</b><div class="cells"><div class="cell" style="background:#fdfcff" title="A1 #fdfcff"><span>1</span></div><div class="cell" style="background:#f9f8ff" title="A2 #f9f8ff"><span>2</span></div><div class="cell" style="background:#f1efff" title="A3 #f1efff"><span>3</span></div><div class="cell" style="background:#e9e5ff" title="A4 #e9e5ff"><span>4</span></div><div class="cell" style="background:#e1daff" title="A5 #e1daff"><span>5</span></div><div class="cell" style="background:#d6ccff" title="A6 #d6ccff"><span>6</span></div><div class="cell" style="background:#c7b8ff" title="A7 #c7b8ff"><span>7</span></div><div class="cell" style="background:#af9af5" title="A8 #af9af5"><span>8</span></div><div class="cell" style="background:#7440d5" title="A9 #7440d5"><span>9</span></div><div class="cell" style="background:#6931c8" title="A10 #6931c8"><span>10</span></div><div class="cell" style="background:#6534bd" title="A11 #6534bd"><span>11</span></div><div class="cell" style="background:#331b62" title="A12 #331b62"><span>12</span></div></div></div>
+<div class="ramp"><b>Red</b><div class="cells"><div class="cell" style="background:#fffcfc" title="R1 #fffcfc"><span>1</span></div><div class="cell" style="background:#fff7f6" title="R2 #fff7f6"><span>2</span></div><div class="cell" style="background:#ffecea" title="R3 #ffecea"><span>3</span></div><div class="cell" style="background:#ffe0dd" title="R4 #ffe0dd"><span>4</span></div><div class="cell" style="background:#ffd4cf" title="R5 #ffd4cf"><span>5</span></div><div class="cell" style="background:#ffc3bd" title="R6 #ffc3bd"><span>6</span></div><div class="cell" style="background:#ffaba3" title="R7 #ffaba3"><span>7</span></div><div class="cell" style="background:#f28881" title="R8 #f28881"><span>8</span></div><div class="cell" style="background:#d41828" title="R9 #d41828"><span>9</span></div><div class="cell" style="background:#c3001f" title="R10 #c3001f"><span>10</span></div><div class="cell" style="background:#c21725" title="R11 #c21725"><span>11</span></div><div class="cell" style="background:#610d11" title="R12 #610d11"><span>12</span></div></div></div>
+<div class="ramp"><b>Amber</b><div class="cells"><div class="cell" style="background:#fffcf9" title="Y1 #fffcf9"><span>1</span></div><div class="cell" style="background:#fff8ef" title="Y2 #fff8ef"><span>2</span></div><div class="cell" style="background:#ffeed9" title="Y3 #ffeed9"><span>3</span></div><div class="cell" style="background:#ffe4c0" title="Y4 #ffe4c0"><span>4</span></div><div class="cell" style="background:#fcdaac" title="Y5 #fcdaac"><span>5</span></div><div class="cell" style="background:#f5cd95" title="Y6 #f5cd95"><span>6</span></div><div class="cell" style="background:#eabb79" title="Y7 #eabb79"><span>7</span></div><div class="cell" style="background:#da9e3f" title="Y8 #da9e3f"><span>8</span></div><div class="cell" style="background:#fbac16" title="Y9 #fbac16"><span>9</span></div><div class="cell" style="background:#eba000" title="Y10 #eba000"><span>10</span></div><div class="cell" style="background:#8d5e00" title="Y11 #8d5e00"><span>11</span></div><div class="cell" style="background:#4a2f00" title="Y12 #4a2f00"><span>12</span></div></div></div>
+<div class="ramp"><b>Green</b><div class="cells"><div class="cell" style="background:#fafefb" title="G1 #fafefb"><span>1</span></div><div class="cell" style="background:#f2fcf5" title="G2 #f2fcf5"><span>2</span></div><div class="cell" style="background:#e0f9e7" title="G3 #e0f9e7"><span>3</span></div><div class="cell" style="background:#cdf4d9" title="G4 #cdf4d9"><span>4</span></div><div class="cell" style="background:#bceecc" title="G5 #bceecc"><span>5</span></div><div class="cell" style="background:#a8e5bc" title="G6 #a8e5bc"><span>6</span></div><div class="cell" style="background:#8ed8a8" title="G7 #8ed8a8"><span>7</span></div><div class="cell" style="background:#5ec386" title="G8 #5ec386"><span>8</span></div><div class="cell" style="background:#008b4f" title="G9 #008b4f"><span>9</span></div><div class="cell" style="background:#007e46" title="G10 #007e46"><span>10</span></div><div class="cell" style="background:#007742" title="G11 #007742"><span>11</span></div><div class="cell" style="background:#003b1e" title="G12 #003b1e"><span>12</span></div></div></div></div>
+    </section>
+  </div>
+</main>
+<script>
+  const root = document.documentElement, btn = document.getElementById('toggle');
+  btn.addEventListener('click', () => {
+    const next = root.dataset.theme === 'dark' ? 'light' : 'dark';
+    root.dataset.theme = next;
+    btn.textContent = next === 'dark' ? 'Switch to light' : 'Switch to dark';
+    document.querySelectorAll('[data-ramps]').forEach(el => el.hidden = el.dataset.ramps !== next);
+  });
+</script>
+</body>
+</html>

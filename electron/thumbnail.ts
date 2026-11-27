@@ -1,7 +1,7 @@
 import { app, nativeImage } from 'electron'
 import { join } from 'path'
 import { randomUUID } from 'crypto'
-import { mkdirSync, writeFileSync, unlinkSync } from 'fs'
+import { mkdirSync, writeFileSync, unlinkSync, renameSync } from 'fs'
 import type { HistoryItem } from './types'
 
 // History previews live as small JPEG files under userData/thumbnails/ and
@@ -11,8 +11,10 @@ import type { HistoryItem } from './types'
 // front by Chromium (data: images are exempt from loading="lazy"). As files
 // the JSON stays small and only thumbnails scrolled into view get fetched.
 
-const THUMB_MAX_WIDTH = 300
-const THUMB_JPEG_QUALITY = 60
+// 960 px: sharp on Retina for the largest Dashboard card, which shows a
+// 4:3 crop of a 16:9 capture (matches THUMBNAIL_WIDTH in src/lib/video-frame.ts).
+export const THUMB_MAX_WIDTH = 960
+const THUMB_JPEG_QUALITY = 80
 
 let dir: string | null = null
 function thumbnailDir(): string {
@@ -28,22 +30,47 @@ export function thumbnailPathFor(file: string): string {
 }
 
 /** URL the renderer can put straight into <img src>; served by the
- *  lumia-media protocol handler in index.ts (homedir-sandboxed). */
-export function thumbnailUrlFor(file: string): string {
-  return `lumia-media://stream/?path=${encodeURIComponent(thumbnailPathFor(file))}`
+ *  lumia-media protocol handler in index.ts (home directory and save
+ *  folders only, isAllowedPath). `v` is when the file was written, from the
+ *  row (`thumbnailStamp` / `stripStamp`, row-stamps.ts): a rewritten
+ *  thumbnail gets a new URL, so the renderer reloads it instead of showing
+ *  its cached copy. No file access here (2026-11-27; it used to stat the
+ *  file for its modified time, for every row of every day read). A row
+ *  from before the stamps has none and gets 0 until its file is next
+ *  written. */
+export function thumbnailUrlFor(file: string, stamp?: number): string {
+  return `lumia-media://stream/?path=${encodeURIComponent(thumbnailPathFor(file))}&v=${stamp ?? 0}`
 }
 
-// File names embed the row id plus a write stamp: rewriting a thumbnail (an
-// annotation save) yields a new URL, so the renderer never shows a stale
-// cached image; the caller passes the previous name as `replace` so it gets
-// unlinked once the new file is safely written.
+// When each file was written this session, for the row's stamp: the row is
+// saved right after the write, and HistoryStore puts the time on it then.
+const written = new Map<string, number>()
+/** When `file` was last written this session (undefined: not since launch). */
+export function writtenAt(file: string): number | undefined {
+  return written.get(file)
+}
+
+// One file per row, `<id>.<ext>`, overwritten on every rewrite (an
+// annotation save after each edit, 2026-11-23). It used to get a new name
+// per write (id + a stamp) with the old file deleted, so any view still
+// holding the old address showed a broken image (the editor's Recent
+// list); now the address stays valid and the URL's `v` busts the cache.
+// Rows still on a stamped name move to the fixed one on their next write
+// (`replace` is unlinked then).
 function fileNameFor(id: string | undefined, ext: string): string {
-  return `${id || randomUUID()}-${Date.now().toString(36)}.${ext}`
+  return id ? `${id}.${ext}` : `${randomUUID()}.${ext}`
 }
 
 function commit(file: string, bytes: Buffer, replace?: string): string | undefined {
   try {
-    writeFileSync(thumbnailPathFor(file), bytes)
+    // Written beside it, then swapped in: a reader never gets half a file.
+    const target = thumbnailPathFor(file)
+    const tmp = `${target}.tmp`
+    writeFileSync(tmp, bytes)
+    renameSync(tmp, target)
+    // Always later than the last one, so two writes in one millisecond
+    // still give two addresses.
+    written.set(file, Math.max(Date.now(), (written.get(file) ?? 0) + 1))
   } catch (err) {
     console.error('[thumbnail] write failed', err)
     return undefined
@@ -88,10 +115,45 @@ export function writeThumbnailBytesFromDataUrl(id: string, dataUrl: string): str
   return commit(fileNameFor(id, ext), Buffer.from(dataUrl.slice(m[0].length), 'base64'))
 }
 
+// A recording's filmstrip for the video editor's trim bar (2026-11-27): one
+// small WebP beside the thumbnail, `<id>-strip.webp`, 20 tiles of 214x120
+// side by side (src/lib/filmstrip.ts), about 15 KB. The recorder sends it
+// with the thumbnail; older recordings get theirs from a renderer
+// (`filmstrip:save`). Written as it comes, no decode here.
+/** Largest strip accepted: ten times a real one. */
+const STRIP_MAX_BYTES = 1024 * 1024
+
+/** Save a strip a renderer made. Returns the file name for
+ *  `HistoryItem.stripFile`, or undefined when it isn't a WebP data URL, is
+ *  too big, or can't be written. */
+export function writeStripFromDataUrl(id: string, dataUrl: string | undefined): string | undefined {
+  const head = 'data:image/webp;base64,'
+  if (!dataUrl || !dataUrl.startsWith(head)) return undefined
+  // base64: 4 characters per 3 bytes
+  if ((dataUrl.length - head.length) * 3 / 4 > STRIP_MAX_BYTES) return undefined
+  const bytes = Buffer.from(dataUrl.slice(head.length), 'base64')
+  // RIFF....WEBP
+  if (bytes.length < 16 || bytes.toString('latin1', 0, 4) !== 'RIFF' || bytes.toString('latin1', 8, 12) !== 'WEBP') return undefined
+  return commit(`${id}-strip.webp`, bytes)
+}
+
+/** The strip's address for the renderer, or undefined when the row has
+ *  none. By the row, not the disk: a file deleted outside Lumia is found
+ *  when the window fails to load it (`history:fileGone`). */
+export function stripUrlFor(item: HistoryItem): string | undefined {
+  return item.stripFile ? thumbnailUrlFor(item.stripFile, item.stripStamp) : undefined
+}
+
+/** Whether a row has a card preview (or it's a legacy row with the
+ *  picture inline). By the row, like the strip. */
+export function hasThumbnail(item: HistoryItem): boolean {
+  return !!item.thumbnailFile || !!item.thumbnailUrl?.startsWith('data:')
+}
+
 /** Renderer view of a row: derive `thumbnailUrl` from `thumbnailFile`. Rows
  *  that still carry a legacy inline data URL pass through unchanged. */
 export function resolveThumbnailUrl<T extends HistoryItem>(item: T): T {
-  return item.thumbnailFile ? { ...item, thumbnailUrl: thumbnailUrlFor(item.thumbnailFile) } : item
+  return item.thumbnailFile ? { ...item, thumbnailUrl: thumbnailUrlFor(item.thumbnailFile, item.thumbnailStamp) } : item
 }
 
 /** Toast hero-image source for a row — the file when we have one, else the

@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { chmodSync, mkdirSync, mkdtempSync, existsSync, readFileSync, readdirSync, renameSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, mkdtempSync, existsSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { DayHistory, dayKey, writeJsonAtomic } from '../electron/history-days.ts'
@@ -273,4 +273,92 @@ test('M2: valid JSON with the wrong shape is set aside, not overwritten', () => 
   const aside = readdirSync(join(root, 'history')).filter(f => f.startsWith('2026-11-18.corrupt-'))
   assert.equal(aside.length, 1)
   assert.equal(readFileSync(join(root, 'history', aside[0]), 'utf8'), '{"items":"x"}')
+})
+
+test('deleting some rows updates totals and per-type counts on disk', () => {
+  const root = tmp()
+  const h = new DayHistory(root)
+  const keep = row(at(2026, 11, 18, 8))
+  const gone1 = row(at(2026, 11, 18, 9), 'recording')
+  const gone2 = row(at(2026, 11, 17, 9), 'recording')
+  const keep2 = row(at(2026, 11, 17, 10))
+  for (const r of [keep, gone1, gone2, keep2]) h.add(r)
+  h.deleteMany([gone1.id, gone2.id])
+  const onDisk = JSON.parse(readFileSync(join(root, 'history_stat.json'), 'utf8'))
+  assert.deepEqual(onDisk, {
+    version: 1, cleanupVersion: 0, total: 2, screenshot: 2, recording: 0,
+    days: [
+      { day: '2026-11-18', total: 1, screenshot: 1, recording: 0 },
+      { day: '2026-11-17', total: 1, screenshot: 1, recording: 0 },
+    ],
+  })
+  assert.deepEqual(new DayHistory(root).getStats(), onDisk)
+})
+
+test('updateMany gives the same files as one update per row', () => {
+  const days = [at(2026, 11, 18, 10), at(2026, 11, 18, 11), at(2026, 11, 17, 9), at(2026, 11, 16, 8)]
+  const rows = days.map(t => row(t))
+  const patches = rows.map((r, i) => ({ id: r.id, patch: { fileKey: `1:${i}:99`, name: `renamed-${i}` } as Partial<HistoryItem> }))
+  const one = tmp(), many = tmp()
+  const a = new DayHistory(one), b = new DayHistory(many)
+  for (const r of rows) { a.add(r); b.add(r) }
+  for (const p of patches) a.update(p.id, p.patch)
+  const written = b.updateMany(patches)
+  assert.deepEqual([...written].sort(), ['2026-11-16', '2026-11-17', '2026-11-18'])
+  for (const day of written) {
+    assert.deepEqual(JSON.parse(readFileSync(dayFile(many, day), 'utf8')), JSON.parse(readFileSync(dayFile(one, day), 'utf8')))
+  }
+  assert.deepEqual(b.getStats(), a.getStats())
+  assert.equal(b.get(rows[0].id)?.fileKey, '1:0:99')
+  // Read back by a fresh instance: it's on disk, not only in the cache.
+  assert.equal(new DayHistory(many).get(rows[3].id)?.name, 'renamed-3')
+})
+
+test('updateMany skips unknown ids, keeps the timestamp and writes nothing when nothing matches', () => {
+  const root = tmp()
+  const h = new DayHistory(root)
+  const r = row(at(2026, 11, 18, 10))
+  h.add(r)
+  const before = readFileSync(dayFile(root, '2026-11-18'), 'utf8')
+  const mtime = () => readFileSync(dayFile(root, '2026-11-18'), 'utf8')
+  assert.deepEqual(h.updateMany([{ id: 'nope', patch: { name: 'x' } }]), [])
+  assert.deepEqual(h.updateMany([]), [])
+  assert.equal(mtime(), before)
+  assert.deepEqual(h.updateMany([{ id: 'nope', patch: { name: 'x' } }, { id: r.id, patch: { name: 'y', timestamp: 1 } }]), ['2026-11-18'])
+  assert.equal(h.get(r.id)?.name, 'y')
+  assert.equal(h.get(r.id)?.timestamp, r.timestamp)
+})
+
+test('an unknown id is looked up in the files once, then answered from the index', () => {
+  const root = tmp()
+  const h = new DayHistory(root)
+  // More days than the day cache holds (30), so some are out of the cache.
+  const rows = Array.from({ length: 35 }, (_, i) => row(at(2026, 10, 1 + (i % 28), 10) - (i >= 28 ? 40 * 86400000 : 0)))
+  for (const r of rows) h.add(r)
+  const fresh = new DayHistory(root)
+  assert.equal(fresh.get('nope'), null)
+  // Every day has been read now, and the newest ones have left the cache
+  // again (the scan ends on the oldest). Break the newest day's file: a
+  // second lookup that read the files again would move it aside as corrupt.
+  const newest = fresh.getStats().days[0].day
+  writeFileSync(dayFile(root, newest), '{ not json')
+  assert.equal(fresh.get('nope'), null)
+  assert.equal(readFileSync(dayFile(root, newest), 'utf8'), '{ not json')
+  assert.deepEqual(readdirSync(join(root, 'history')).filter(f => f.includes('corrupt')), [])
+  // Rows known before still resolve from the index.
+  assert.equal(fresh.get(rows[0].id)?.id, rows[0].id)
+})
+
+test('updateMany writes nothing when the rows already hold the values', () => {
+  const root = tmp()
+  const h = new DayHistory(root)
+  const r = row(at(2026, 11, 18, 10), 'screenshot', { fileKey: '1:2:3' })
+  h.add(r)
+  // A write would replace the file (tmp + rename): same inode means none.
+  const ino = () => statSync(dayFile(root, '2026-11-18')).ino
+  const before = ino()
+  assert.deepEqual(h.updateMany([{ id: r.id, patch: { fileKey: '1:2:3' } }]), [])
+  assert.equal(ino(), before)
+  assert.deepEqual(h.updateMany([{ id: r.id, patch: { fileKey: '1:2:4' } }]), ['2026-11-18'])
+  assert.notEqual(ino(), before)
 })

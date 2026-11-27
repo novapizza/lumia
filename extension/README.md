@@ -30,25 +30,32 @@ Works in Chrome, Edge, Brave, and other Chromium browsers (Chrome 116+).
 
 - **Toolbar icon** — click the extension's icon to open a menu with three
   modes:
-  - **Visible area** — just what's currently on screen (one frame).
-  - **Full page** — scroll and stitch the whole page (or the app's inner
+  - **Capture visible area** — just what's currently on screen (one frame).
+  - **Capture full page** — scroll and stitch the whole page (or the app's inner
     scroll pane / same-origin iframe), keeping header + sidebar chrome.
-  - **Select area** — hover to highlight the element under the cursor; the tip
-    shows what it is and a **green** outline means it scrolls (**cyan** =
-    static). A small **d-pad** (or the **↑ ↓ ← →** keys) refines the
-    selection along the DOM tree — **▲/↑** out a level (parent), **▼/↓** in a
-    level (child), **◀ ▶/← →** between same-level siblings — so you can land on
-    a scroll pane that's covered by its children. Elements inside **same-origin
+  - **Capture part of page** — hover to outline the part under the cursor. A
+    bar at the top shows where it sits in the page as a path (Page › Main ›
+    Article › List); **↑ / ↓** (or a click on a step) move the outline out and
+    in along it, **← / →** to the part before / after at the same level, whose
+    other parts are outlined faintly. The size label under the outline says
+    "2 of 5" and shows a SCROLLS tag when the part scrolls, so you can land on
+    a scroll pane that's covered by its children. Nested parts with the same
+    edges count as one step; empty overlay layers (whole-card links, fades) are
+    looked through. Details: `design/REGION-PICKER.md`. Elements inside **same-origin
     iframes** (e.g. the AWS console content frame) can be picked too. Click (or
     Enter) captures exactly that element: scroll-stitched if it's a scroll pane,
     otherwise a single frame — with no surrounding page chrome. **Esc**,
     right-click, or switching away cancels.
 
   A status dot on the icon shows connectivity: green when the Lumia app is
-  reachable, red when it isn't.
-- **From the Lumia app / hotkey** — full-page capture. With one browser
-  connected it starts immediately; with several, Lumia shows a picker with a
-  live preview of each browser's active tab.
+  reachable, orange when it isn't. The popup, the status toast during a
+  capture and the picker draw in the Lumia app's theme (sent by the app over
+  the connection and kept in `chrome.storage.local`).
+- **From the Lumia app / hotkey** — full-page capture. The scroll hotkey
+  captures the browser that's in front (Lumia asks each one); with no browser
+  in front it runs Lumia's screen scroll instead. Started from Lumia with
+  several browsers connected, Lumia shows a picker with a live preview of
+  each browser's active tab.
 
 During a capture the browser window is focused and page interaction is locked
 by an invisible full-screen blocker; a small status pill at the bottom shows
@@ -82,6 +89,11 @@ Chromium browsers, and auto-updates.
   extension origin, so web pages can't reach the bridge.
 - No data ever leaves your machine — frames go straight from the browser to
   the local Lumia process.
+- Lumia's scroll hotkey asks every connected browser whether its window is
+  the one in front (`focus` → `focus-result`, from `chrome.windows`
+  `focused`); a browser in front gets the page captured through the
+  extension, anything else gets Lumia's screen scroll. Older extensions don't
+  answer, so the hotkey falls back to the screen scroll.
 
 ## Permissions
 
@@ -90,7 +102,8 @@ Chromium browsers, and auto-updates.
 | `activeTab` | screenshot + scroll the tab you start a capture on from the toolbar popup (granted by the click itself — no broad access) |
 | `scripting` | scroll the page and neutralize sticky/fixed overlays during capture |
 | `alarms` | reconnect to Lumia if the connection drops |
-| `<all_urls>` *(optional)* | only needed for captures **started from the Lumia app** and for live tab previews in the multi-browser picker — granted with one click in the popup ("Allow captures from the app") |
+| `storage` | keep the Lumia app's theme colours between browser restarts |
+| `<all_urls>` *(optional)* | only needed for captures **started from the Lumia app** and for live tab previews in the multi-browser picker — granted with one click in the popup ("Allow site access", **Allow**). Arc can't show the permission prompt over its popup ("Could not find an active window"), so there the popup opens itself in a tab (`popup.html?tab`, only the header and the Allow message) and asks from there; the tab closes once allowed |
 
 Browser-internal pages (`chrome://…`, the Web Store, `about:…`) cannot be
 captured — use Lumia's classic Screen scroll mode for those.

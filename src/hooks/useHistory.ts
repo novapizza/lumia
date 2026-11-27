@@ -16,6 +16,9 @@ const MAX_HISTORY = 100
 export function useHistory<T>(initialState: T) {
   const history = useRef<T[]>([initialState])
   const cursor  = useRef(0)
+  /** How many of the oldest steps fell off the MAX_HISTORY end: the first
+   *  kept step is then no longer the original (History › Edits). */
+  const dropped = useRef(0)
   // tick is only used to trigger re-renders; real state lives in refs above
   const [, bump] = useState(0)
   const rerender = useCallback(() => bump(n => n + 1), [])
@@ -45,7 +48,7 @@ export function useHistory<T>(initialState: T) {
     } else {
       history.current.push(value)
       // Keep memory bounded
-      if (history.current.length > MAX_HISTORY) history.current.shift()
+      if (history.current.length > MAX_HISTORY) { history.current.shift(); dropped.current++ }
       cursor.current = history.current.length - 1
     }
     rerender()
@@ -60,6 +63,31 @@ export function useHistory<T>(initialState: T) {
   const redo = useCallback(() => {
     if (cursor.current >= history.current.length - 1) return
     cursor.current++
+    rerender()
+  }, [rerender])
+
+  /** Jump to any step (History › Edits, 2026-11-23): like several undos or
+   *  redos at once; the later steps stay until the next commit. */
+  const goTo = useCallback((index: number) => {
+    if (index < 0 || index >= history.current.length || index === cursor.current) return
+    cursor.current = index
+    rerender()
+  }, [rerender])
+
+  /** Replace the whole history with saved steps (reopening an image). */
+  const load = useCallback((steps: T[], at: number, droppedBefore = 0) => {
+    if (steps.length === 0) return
+    history.current = steps.slice(-MAX_HISTORY)
+    dropped.current = droppedBefore + Math.max(0, steps.length - MAX_HISTORY)
+    cursor.current = Math.max(0, Math.min(at - (steps.length - history.current.length), history.current.length - 1))
+    rerender()
+  }, [rerender])
+
+  /** Rewrite every step in place, adding none (2026-11-23: the Layers
+   *  tab's order and visibility live outside the undo steps, so a change
+   *  applies to all of them and an undo never brings the old one back). */
+  const mapAll = useCallback((fn: (step: T) => T) => {
+    history.current = history.current.map(fn)
     rerender()
   }, [rerender])
 
@@ -95,5 +123,11 @@ export function useHistory<T>(initialState: T) {
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [undo, redo])
 
-  return { state, set, undo, redo, canUndo, canRedo, clear }
+  return {
+    state, set, undo, redo, canUndo, canRedo, clear, goTo, load, mapAll,
+    /** Every kept step, oldest first, and the one shown. */
+    steps: history.current as readonly T[],
+    cursor: cursor.current,
+    dropped: dropped.current,
+  }
 }

@@ -3,7 +3,8 @@ import Store from 'electron-store'
 import { dispatchCapture, dispatchLastCapture } from './capture'
 import { getOverlayWindow, markQuitting } from './index'
 import { startVideoCapture, requestStop as requestVideoStop, isRecordingActive } from './video'
-import { setSetting, getSettings, isRememberedMode } from './settings'
+import { setSetting, getSettings } from './settings'
+import { launchScrollCapture } from './scroll-capture'
 import type { LastImageMode, LastVideoMode } from './settings'
 
 export interface HotkeyConfig {
@@ -15,43 +16,16 @@ export const defaultHotkeys: HotkeyConfig = {
   ActiveWindow:         'Ctrl+Shift+2',
   ActiveMonitor:        'Ctrl+Shift+3',
   PrintScreen:          'Ctrl+Shift+4',
+  // Back on 2026-11-25 (retired in schema v7 while the Dashboard launcher
+  // had a Scroll tile; that launcher is gone). New actions reach existing
+  // configs through the defaults merge in getHotkeys, no schema bump.
+  ScrollingCapture:     'Ctrl+Shift+5',
   // `ScreenRecorder` kept as the "Region" video entry for backwards compat
   // with saved configs from older releases.
   ScreenRecorder:       'Ctrl+Shift+6',
   ScreenRecorderWindow: 'Ctrl+Shift+7',
   ScreenRecorderScreen: 'Ctrl+Shift+8'
 }
-
-// All 75 action types from ShareX, user can assign any
-export const ALL_ACTIONS = [
-  // Upload
-  'FileUpload', 'FolderUpload', 'ClipboardUpload', 'ClipboardUploadWithContentViewer',
-  'UploadText', 'UploadURL', 'DragDropUpload', 'ShortenURL', 'StopUploads',
-  // Screen Capture
-  'PrintScreen', 'ActiveWindow', 'CustomWindow', 'ActiveMonitor',
-  'RectangleRegion', 'RectangleLight', 'RectangleTransparent',
-  'CustomRegion', 'LastRegion', 'AutoCapture',
-  'StartAutoCapture', 'StopAutoCapture',
-  // Screen Record
-  'ScreenRecorder', 'ScreenRecorderActiveWindow', 'ScreenRecorderCustomRegion',
-  'StartScreenRecorder', 'ScreenRecorderGIF', 'ScreenRecorderGIFActiveWindow',
-  'ScreenRecorderGIFCustomRegion', 'StartScreenRecorderGIF',
-  'StopScreenRecording', 'PauseScreenRecording', 'AbortScreenRecording',
-  // Tools
-  'ColorPicker', 'ScreenColorPicker', 'Ruler', 'PinToScreen',
-  'PinToScreenFromScreen', 'PinToScreenFromClipboard', 'PinToScreenFromFile',
-  'PinToScreenCloseAll', 'ImageEditor', 'ImageBeautifier', 'ImageEffects',
-  'ImageViewer', 'ImageCombiner', 'ImageSplitter', 'ImageThumbnailer',
-  'VideoConverter', 'VideoThumbnailer', 'AnalyzeImage', 'OCR',
-  'QRCode', 'QRCodeDecodeFromScreen', 'QRCodeScanRegion',
-  'HashCheck', 'Metadata', 'StripMetadata', 'IndexFolder',
-  'ClipboardViewer', 'BorderlessWindow', 'ActiveWindowBorderless',
-  'ActiveWindowTopMost', 'InspectWindow', 'MonitorTest',
-  // App
-  'DisableHotkeys', 'OpenScreenshotsFolder',
-  'OpenHistory', 'OpenImageHistory', 'ToggleActionsToolbar',
-  'ToggleTrayMenu', 'ExitLumia'
-]
 
 // Bump this whenever the default capture-mode bindings change in a way that
 // should retake control from users who never hand-customized. On load, if the
@@ -83,9 +57,9 @@ const PREVIOUS_CAPTURE_DEFAULTS: Record<string, readonly string[]> = {
 // saved config so stale bindings don't linger and accidentally block new keys
 // (e.g. S was `StopScreenRecording` and is now `ScreenRecorderScreen`).
 // `ExitShareAnywhere` was renamed to `ExitLumia` after the rebrand.
-// `ScrollingCapture` (Ctrl+Shift+5) was retired — scroll capture starts from
-// the Dashboard Scroll tab or the browser extension's toolbar, not a hotkey.
-const REMOVED_ACTIONS = ['StopScreenRecording', 'OpenMainWindow', 'WorkflowPicker', 'ExitShareAnywhere', 'ScrollingCapture'] as const
+// `ScrollingCapture` (Ctrl+Shift+5) was stripped by v7 and is back since
+// 2026-11-25, so it's no longer listed here.
+const REMOVED_ACTIONS = ['StopScreenRecording', 'OpenMainWindow', 'WorkflowPicker', 'ExitShareAnywhere'] as const
 
 const store = new Store<{ hotkeys: HotkeyConfig; schemaVersion?: number }>({
   name: 'hotkeys',
@@ -128,58 +102,62 @@ export function saveHotkeys(hotkeys: HotkeyConfig) {
   setupHotkeys()
 }
 
-export function resetHotkeys(): HotkeyConfig {
-  store.set('hotkeys', { ...defaultHotkeys })
-  store.set('schemaVersion', HOTKEY_SCHEMA_VERSION)
-  teardownHotkeys()
-  setupHotkeys()
-  return { ...defaultHotkeys }
+let isCapturing = false
+
+// Route capture hotkeys through the same `dispatchCapture` the Dashboard
+// buttons invoke, so the behavior (overlay pickers, multi-display
+// compositing, etc.) stays consistent across entry points. The lock guards
+// against re-entrancy when the user mashes the hotkey or clicks during a
+// running capture.
+const withLock = (fn: () => Promise<void>) => async () => {
+  if (isCapturing) return
+  if (getOverlayWindow()) return
+  isCapturing = true
+  // The capture paths restore the window and show their own message when
+  // they fail; this only keeps a stray rejection out of the log as
+  // "unhandled" (a global shortcut's handler has no caller to catch it).
+  try { await fn() } catch (err) { console.error('[hotkeys] capture failed', err) } finally { isCapturing = false }
+}
+
+// Persist what the user just triggered so New capture / New recording (the
+// menu bar, PrintScreen) replay it: every tool, see isImageMode in
+// settings.ts for the policy.
+const rememberImage = (mode: LastImageMode) => {
+  setSetting('lastCaptureKind', 'image')
+  setSetting('lastImageMode', mode)
+}
+const rememberVideo = (mode: LastVideoMode) => {
+  setSetting('lastCaptureKind', 'video')
+  setSetting('lastVideoMode', mode)
+}
+
+// The actions, shared by the hotkeys and the menu-bar icon's menu
+// (2026-11-27), so a menu item does exactly what its hotkey does.
+const handlers: Record<string, () => void> = {
+  RectangleRegion: withLock(async () => { rememberImage('region'); await dispatchCapture('region') }),
+  PrintScreen:     withLock(async () => { rememberImage('all-screen'); await dispatchCapture('all-screen') }),
+  ActiveWindow:    withLock(async () => { rememberImage('window'); await dispatchCapture('window') }),
+  ActiveMonitor:   withLock(async () => { rememberImage('screen'); await dispatchCapture('screen') }),
+  // Scroll: a browser in front with the extension connected captures its
+  // page through the extension, anything else gets the screen scroll overlay.
+  // Remembered like every tool (2026-11-27).
+  ScrollingCapture: withLock(async () => { rememberImage('scrolling'); await launchScrollCapture() }),
+  // All three video hotkeys toggle: pressing any of them while recording
+  // stops (matches Snipping Tool's UX), otherwise starts in that mode.
+  ScreenRecorder:       () => { if (isRecordingActive()) requestVideoStop(); else { rememberVideo('region'); void startVideoCapture('region') } },
+  ScreenRecorderWindow: () => { if (isRecordingActive()) requestVideoStop(); else { rememberVideo('window'); void startVideoCapture('window') } },
+  ScreenRecorderScreen: () => { if (isRecordingActive()) requestVideoStop(); else { rememberVideo('screen'); void startVideoCapture('screen') } },
+  ExitLumia: () => { markQuitting(); app.quit() }
+}
+
+/** Runs a capture action by its hotkey id (`RectangleRegion`,
+ *  `ScreenRecorderScreen`…), as its hotkey would. */
+export function runCaptureAction(action: string): void {
+  handlers[action]?.()
 }
 
 export function setupHotkeys() {
   const hotkeys = getHotkeys()
-
-  let isCapturing = false
-
-  // Route capture hotkeys through the same `dispatchCapture` the Dashboard
-  // buttons invoke, so the behavior (overlay pickers, multi-display
-  // compositing, etc.) stays consistent across entry points. The lock guards
-  // against re-entrancy when the user mashes the hotkey or clicks during a
-  // running capture.
-  const withLock = (fn: () => Promise<void>) => async () => {
-    if (isCapturing) return
-    if (getOverlayWindow()) return
-    isCapturing = true
-    try { await fn() } finally { isCapturing = false }
-  }
-
-  // Persist what the user just triggered so subsequent "New Capture" entry
-  // points (tray, sidebar, AppMenu, PrtSc) replay the same context. The kind
-  // always flips; the replay mode only updates for Region / Window picks —
-  // see isRememberedMode in settings.ts for the policy.
-  const rememberImage = (mode: LastImageMode) => {
-    setSetting('lastCaptureKind', 'image')
-    if (isRememberedMode(mode)) setSetting('lastImageMode', mode)
-  }
-  const rememberVideo = (mode: LastVideoMode) => {
-    setSetting('lastCaptureKind', 'video')
-    if (isRememberedMode(mode)) setSetting('lastVideoMode', mode)
-  }
-
-  const handlers: Record<string, () => void> = {
-    RectangleRegion: withLock(async () => { rememberImage('region'); await dispatchCapture('region') }),
-    PrintScreen:     withLock(async () => { rememberImage('all-screen'); await dispatchCapture('all-screen') }),
-    ActiveWindow:    withLock(async () => { rememberImage('window'); await dispatchCapture('window') }),
-    ActiveMonitor:   withLock(async () => { rememberImage('screen'); await dispatchCapture('screen') }),
-    // Scroll capture has no global hotkey — it starts from the Dashboard Scroll
-    // tab or the browser extension's toolbar.
-    // All three video hotkeys toggle: pressing any of them while recording
-    // stops (matches Snipping Tool's UX), otherwise starts in that mode.
-    ScreenRecorder:       () => { if (isRecordingActive()) requestVideoStop(); else { rememberVideo('region'); startVideoCapture('region') } },
-    ScreenRecorderWindow: () => { if (isRecordingActive()) requestVideoStop(); else { rememberVideo('window'); startVideoCapture('window') } },
-    ScreenRecorderScreen: () => { if (isRecordingActive()) requestVideoStop(); else { rememberVideo('screen'); startVideoCapture('screen') } },
-    ExitLumia: () => { markQuitting(); app.quit() }
-  }
 
   for (const [action, shortcut] of Object.entries(hotkeys)) {
     if (!shortcut) continue
@@ -198,8 +176,8 @@ export function setupHotkeys() {
 
   // Special PrintScreen → "New Capture" binding. Fixed key, toggle-only via
   // Settings; not part of the configurable hotkeys map (kept out of
-  // `defaultHotkeys` and `ALL_ACTIONS` deliberately so the hotkeys editor
-  // can't rebind or shadow it). On Windows the snipping-tool hijack is also
+  // `defaultHotkeys` deliberately so the hotkeys editor can't rebind or
+  // shadow it). On Windows the snipping-tool hijack is also
   // disabled via registry — that side of the toggle lives in
   // printscreen-key.ts and is invoked from the IPC handler / boot path.
   if (getSettings().printScreenAsCapture) {

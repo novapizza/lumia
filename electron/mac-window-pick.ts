@@ -10,13 +10,26 @@
  * If it dies, the next call respawns it.
  */
 
-import { spawn, ChildProcessWithoutNullStreams } from 'child_process'
+import { dockTrace } from './dock-trace'
+import { execFile, spawn, ChildProcessWithoutNullStreams } from 'child_process'
 import { app } from 'electron'
 import { existsSync } from 'fs'
 import { resolve, join } from 'path'
 import readline from 'readline'
 
-export interface WindowRect { x: number; y: number; width: number; height: number }
+export interface WindowRect {
+  x: number; y: number; width: number; height: number
+  /** The CGWindowID, for capturing the window on its own (screen-snap's
+   *  `window` command). Missing from an older helper binary. */
+  id?: number
+  /** list query only: the owning app's name and the window's title (empty
+   *  without Screen Recording permission). */
+  app?: string
+  title?: string
+  /** list query only: the window's layer, 0 for a normal window, more for
+   *  floating ones (3: e.g. Music's mini player), panels and the Dock. */
+  layer?: number
+}
 
 let proc: ChildProcessWithoutNullStreams | null = null
 
@@ -55,6 +68,7 @@ function startHelper(): boolean {
 
   try {
     proc = spawn(bin, [String(process.pid)], { stdio: ['pipe', 'pipe', 'pipe'] })
+    dockTrace(`helper spawned: window-at-point pid ${proc.pid}`)
   } catch (err) {
     console.error('[mac-window-pick] failed to spawn helper:', err)
     proc = null
@@ -113,6 +127,7 @@ function pump(): void {
         if (typeof obj.x === 'number' && typeof obj.y === 'number' &&
             typeof obj.width === 'number' && typeof obj.height === 'number') {
           rect = { x: obj.x, y: obj.y, width: obj.width, height: obj.height }
+          if (typeof obj.id === 'number' && obj.id > 0) rect.id = obj.id
         }
       } catch { /* swallow — malformed line, treat as null */ }
     }
@@ -201,4 +216,50 @@ export function listMacWindows(): Promise<WindowRect[]> {
       proc = null
     }
   })
+}
+
+/** Bundle id of the app that owns the frontmost normal window (Lumia
+ *  excluded), or '' when there's none or the helper can't say. The capture
+ *  overlay takes activation while it's up (so it owns the cursor) and hands
+ *  it back to this app afterwards. Same FIFO pairing as listMacWindows. */
+export function frontMacAppBundle(): Promise<string> {
+  return new Promise<string>(res => {
+    if (!startHelper() || !proc) { res(''); return }
+    lineQueue.push((line: string) => res(line === 'null' ? '' : line.trim()))
+    try {
+      proc.stdin.write('front\n')
+    } catch {
+      const handler = lineQueue.pop()
+      handler?.('null')
+      try { proc.kill() } catch { /* */ }
+      proc = null
+    }
+  })
+}
+
+/** True while Mission Control (or App Exposé / Launchpad) is showing, from
+ *  the helper's `mc` heuristic. The capture overlay steps aside for it. */
+export function missionControlActive(): Promise<boolean> {
+  return new Promise<boolean>(res => {
+    if (!startHelper() || !proc) { res(false); return }
+    lineQueue.push((line: string) => res(line.trim() === '1'))
+    try {
+      proc.stdin.write('mc\n')
+    } catch {
+      const handler = lineQueue.pop()
+      handler?.('0')
+      try { proc.kill() } catch { /* */ }
+      proc = null
+    }
+  })
+}
+
+/** Make an app the active one again by its bundle id (the app that was in
+ *  front before Lumia took activation for the overlay, the countdown or the
+ *  drawing layer). Best effort. Only a plain bundle id reaches the script
+ *  (no quotes, nothing to inject). */
+export function activateMacApp(bundle: string): void {
+  if (process.platform !== 'darwin' || !bundle || !/^[A-Za-z0-9.\-_]+$/.test(bundle)) return
+  dockTrace(`osascript: tell application id "${bundle}" to activate`)
+  execFile('osascript', ['-e', `tell application id "${bundle}" to activate`], () => { /* best effort */ })
 }

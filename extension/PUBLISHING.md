@@ -11,7 +11,7 @@ days; longer here because the extension requests `<all_urls>` + `scripting`).
    ```powershell
    Compress-Archive -Force -DestinationPath lumia-extension.zip -Path `
      extension/manifest.json, extension/background.js, `
-     extension/popup.html, extension/popup.js, `
+     extension/popup.html, extension/popup.js, extension/logo.svg, extension/fonts, `
      extension/icon16.png, extension/icon32.png, extension/icon48.png, extension/icon128.png
    ```
    (macOS/Linux: `cd extension && zip -r ../lumia-extension.zip . -x '*.md'`)
@@ -28,6 +28,8 @@ days; longer here because the extension requests `<all_urls>` + `scripting`).
    - `scripting` — scroll the page and neutralize sticky/fixed overlays during
      the capture.
    - `alarms` — reconnect to the local Lumia app if the socket drops.
+   - `storage` — keep the Lumia app's theme colours for the popup and the
+     in-page UI between browser restarts.
    - Data use: frames go only to the local Lumia app over `127.0.0.1`; nothing
      is sent to any server.
 5. **Submit for review.** Once approved, note the **Extension ID** (shown on the
@@ -71,6 +73,11 @@ version (untick *publish* to upload a reviewable draft without going live).
 - The version **must increase** every time — the tag drives it, so just bump the
   tag. `manifest.json` in the repo stays at a baseline `version` and is
   overwritten in CI only.
+- Raise that baseline when the app starts to expect something new from the
+  extension (1.6.0 on 2026-11-27: it answers `focus` and takes `theme`). The
+  app calls a connected extension older than the copy it ships outdated
+  (`isOutdated` in `electron/extension-bridge.ts`), so the first release
+  after such a change must be tagged at the baseline or above.
 - While a new version is in review, the currently-published version keeps
   working for existing users.
 

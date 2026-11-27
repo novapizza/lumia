@@ -271,7 +271,10 @@ export async function exchangeGoogleAuthCode(
   code: string,
   clientId: string,
   clientSecret: string,
-  redirectUri: string
+  redirectUri: string,
+  /** PKCE: the verifier whose SHA-256 went out as `code_challenge` with the
+   *  sign-in request. Google only hands the tokens to whoever holds it. */
+  codeVerifier?: string
 ): Promise<{ accessToken: string; refreshToken: string; expiresAt: number }> {
   const response = await fetch('https://oauth2.googleapis.com/token', {
     method: 'POST',
@@ -281,7 +284,8 @@ export async function exchangeGoogleAuthCode(
       client_id: clientId,
       client_secret: clientSecret,
       redirect_uri: redirectUri,
-      grant_type: 'authorization_code'
+      grant_type: 'authorization_code',
+      ...(codeVerifier ? { code_verifier: codeVerifier } : {})
     })
   })
 

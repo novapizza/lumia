@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { DayStat, HistoryItem, HistoryStats } from '../../types'
 import { DayGenerations } from '../../utils/dayHistory'
+import { keepHistory, takeHistory } from '../../lib/dashboard-place'
+import { offerRows } from '../../lib/strip-worker'
 
 export type HistoryFilter = 'all' | 'screenshot' | 'recording'
 
@@ -20,10 +22,17 @@ const RETRY_MS = 2000
  * is fetched again instead of shown.
  */
 export function useDayHistory(filter: HistoryFilter) {
-  const [stats, setStats] = useState<HistoryStats | null>(null)
-  const [rows, setRows] = useState<Map<string, HistoryItem[]>>(() => new Map())
+  // Back from the editor or Settings (2026-11-27): start from what the
+  // Dashboard held when it left, so its first frame is already drawn where
+  // it was (lib/dashboard-place.ts), then reload those days: changes made
+  // meanwhile came while nobody was listening.
+  const [kept] = useState(takeHistory)
+  const [stats, setStats] = useState<HistoryStats | null>(kept?.stats ?? null)
+  const [rows, setRows] = useState<Map<string, HistoryItem[]>>(() => kept?.rows ?? new Map())
   const rowsRef = useRef(rows)
   rowsRef.current = rows
+  const statsRef = useRef(stats)
+  statsRef.current = stats
   const inFlight = useRef(new Set<string>())
   const gens = useRef(new DayGenerations())
 
@@ -46,6 +55,8 @@ export function useDayHistory(filter: HistoryFilter) {
     let retry: string[] = []
     try {
       const res = await window.electronAPI?.getHistoryDays(want)
+      // Recordings that still need a card preview or a filmstrip.
+      if (res) offerRows(Object.values(res).flat())
       const stale = new Set(gens.current.stale(started))
       retry = want.filter(d => stale.has(d))
       setRows(prev => {
@@ -85,6 +96,7 @@ export function useDayHistory(filter: HistoryFilter) {
     let res: Record<string, HistoryItem[]> | undefined = {}
     try {
       if (targets.length) res = await window.electronAPI?.getHistoryDays(targets)
+      if (res) offerRows(Object.values(res).flat())
     } catch (err) {
       console.error('[history] refreshing days failed', targets, err)
       return
@@ -100,10 +112,14 @@ export function useDayHistory(filter: HistoryFilter) {
   }, [fetchStats])
 
   useEffect(() => {
-    fetchStats()
+    if (kept) void refresh()
+    else void fetchStats()
     const off = window.electronAPI?.onHistoryChanged(({ days }) => { refresh(days) })
-    return () => { off?.() }
-  }, [fetchStats, refresh])
+    return () => {
+      off?.()
+      keepHistory({ stats: statsRef.current, rows: rowsRef.current })
+    }
+  }, [fetchStats, refresh, kept])
 
   /** Days that have captures for the current filter, newest first. */
   const days: DayStat[] = useMemo(

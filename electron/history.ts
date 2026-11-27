@@ -1,10 +1,12 @@
 import { existsSync, readFileSync, unlinkSync } from 'fs'
+import { EditHistoryStore } from './edit-history'
 import { unlink } from 'fs/promises'
 import { join, resolve, normalize } from 'path'
-import { homedir } from 'os'
 import type { HistoryItem } from './types'
-import { thumbnailPathFor, writeThumbnailBytesFromDataUrl } from './thumbnail'
-import { DayHistory, dayKey, type HistoryStats } from './history-days'
+import { isAllowedPath } from './capture-folder'
+import { thumbnailPathFor, writeThumbnailBytesFromDataUrl, writtenAt } from './thumbnail'
+import { withStamps } from './row-stamps'
+import { dayHistoryFor, forgetDayHistory, dayKey, type DayHistory, type HistoryStats } from './history-days'
 
 /**
  * Capture history: one file per day plus history_stat.json (storage in
@@ -17,12 +19,76 @@ import { DayHistory, dayKey, type HistoryStats } from './history-days'
  * stale against another copy.
  */
 export class HistoryStore {
-  private readonly store: DayHistory
+  private store: DayHistory
   private readonly listeners: ((days: string[]) => void)[] = []
 
+  /** Saved image-editor edit steps, removed with their row (2026-11-23). */
+  readonly editHistory: EditHistoryStore
+
+  /** The folder the current history lives in (useRoot). */
+  private root: string
+  /** For a file saved into an earlier save folder (a recording that began
+   *  before the folder changed): that folder's history root, else null. */
+  private rootForFile: ((filePath: string) => string | null) | null = null
+
   constructor(userDataDir: string) {
-    this.store = new DayHistory(userDataDir)
+    this.root = userDataDir
+    this.store = dayHistoryFor(userDataDir)
+    this.editHistory = new EditHistoryStore(userDataDir)
     this.migrateLegacyFile(join(userDataDir, 'history.json'))
+  }
+
+  /** Read and write another history from here on: the save folder's
+   *  (folder-history.ts, Settings › General › Save to). A fresh one is
+   *  marked with the current cleanup version so the startup reset
+   *  (runStartupCleanup) never empties it. The caller tells the window. */
+  useRoot(root: string, stampVersion?: number): void {
+    // Opened and stamped before it's used: if its folder can't be written,
+    // this throws and the current history stays.
+    const next = dayHistoryFor(root)
+    try {
+      if (stampVersion != null) next.importLegacy([], stampVersion)
+    } catch (err) {
+      forgetDayHistory(root)
+      throw err
+    }
+    this.store = next
+    this.root = root
+  }
+
+  setRootForFile(fn: (filePath: string) => string | null): void {
+    this.rootForFile = fn
+  }
+
+  /** Add one row (moved from another folder's history); true once it's
+   *  stored, false when that id is here already. */
+  addRow(item: HistoryItem, cleanupVersion: number): boolean {
+    // Already here (a move stopped halfway before): not stored again, so the
+    // caller puts its files back.
+    if (this.store.get(item.id)) return false
+    try {
+      const { days } = this.store.importLegacy([withStamps(item, writtenAt)], cleanupVersion)
+      this.emit(days)
+    } catch (err) {
+      // Half written (the day file without the stats): take it out again, so
+      // the caller's rollback leaves no row pointing at moved-back files.
+      try { this.store.deleteMany([item.id]) } catch { /* nothing to undo */ }
+      throw err
+    }
+    return this.store.get(item.id) != null
+  }
+
+  /** Every row of the current history. */
+  allRows(): HistoryItem[] {
+    return Object.values(this.store.getDays(this.store.getStats().days.map(d => d.day))).flat()
+  }
+
+  /** Add rows found in or moved to the save folder; ids already there are
+   *  skipped. */
+  addMany(items: HistoryItem[], cleanupVersion: number): number {
+    const { added, days } = this.store.importLegacy(items.map(it => withStamps(it, writtenAt)), cleanupVersion)
+    this.emit(days)
+    return added
   }
 
   /** Called after every write with the day keys that changed. */
@@ -46,15 +112,32 @@ export class HistoryStore {
     return this.store.getRecent(limit, type)
   }
 
+  // Every write below puts the time a thumbnail or strip was written on its
+  // row (withStamps): that's the version in the file's address.
   add(item: HistoryItem): void {
+    item = withStamps(item, writtenAt)
+    // A file written to an earlier save folder belongs to that folder's
+    // history, not the one switched to while it was being made.
+    const other = item.filePath ? this.rootForFile?.(item.filePath) : null
+    if (other && other !== this.root) {
+      dayHistoryFor(other).add(item)
+      return
+    }
     this.emit([this.store.add(item)])
   }
 
   update(id: string, patch: Partial<HistoryItem>): HistoryItem | null {
-    const res = this.store.update(id, patch)
+    const res = this.store.update(id, withStamps(patch, writtenAt))
     if (!res) return null
     this.emit([res.day])
     return res.item
+  }
+
+  /** Save row changes the window doesn't need to hear about: the file
+   *  fingerprints and followed paths (file-relink.ts), read and sent along
+   *  in the same response. One write per day, however many rows. */
+  updateQuietMany(patches: { id: string; patch: Partial<HistoryItem> }[]): void {
+    if (patches.length > 0) this.store.updateMany(patches.map(p => ({ id: p.id, patch: withStamps(p.patch, writtenAt) })))
   }
 
   /** Explicit user delete: also removes the original capture file. */
@@ -69,6 +152,17 @@ export class HistoryStore {
     const { removed, days } = this.store.deleteMany(ids)
     this.emit(days)
     await Promise.all(removed.map(it => this.unlinkItemFiles(it, { originals: true })))
+    return removed.length
+  }
+
+  /** Drop rows whose original is gone (Clear missing), leaving their edited
+   *  or trimmed copy on disk: it can be the only file left of the user's
+   *  work (2026-11-27). */
+  async forgetMissing(ids: string[]): Promise<number> {
+    if (ids.length === 0) return 0
+    const { removed, days } = this.store.deleteMany(ids)
+    this.emit(days)
+    await Promise.all(removed.map(it => this.unlinkItemFiles(it, { originals: false, copies: false })))
     return removed.length
   }
 
@@ -122,23 +216,26 @@ export class HistoryStore {
     }
   }
 
-  // Shared file cleanup for delete + prune + startup. Bounded to the user's
-  // home directory so a tampered history entry can't coax us into unlinking
-  // system files; ENOENT is swallowed because the goal state (file gone) is
-  // already achieved. `originals` gates whether the user's original capture
-  // (filePath, under ~/Pictures/Lumia) is removed: only explicit user delete
-  // + retention prune opt in; startup cleanup does not.
-  private async unlinkItemFiles(item: HistoryItem, opts: { originals: boolean }): Promise<void> {
+  // Shared file cleanup for delete + prune + startup. Bounded to the home
+  // directory and the save folders (isAllowedPath) so a tampered history
+  // entry can't coax us into unlinking system files; ENOENT is swallowed
+  // because the goal state (file gone) is already achieved. `originals`
+  // gates whether the user's original capture (filePath, in the save folder)
+  // is removed: only explicit user delete + retention prune opt in; startup
+  // cleanup does not.
+  private async unlinkItemFiles(item: HistoryItem, opts: { originals: boolean; copies?: boolean }): Promise<void> {
     const paths = [
       opts.originals ? item.filePath : undefined,
-      item.annotatedFilePath,
+      opts.copies === false ? undefined : item.annotatedFilePath,
       // Thumbnails are app-managed artifacts — dropped in every mode.
       item.thumbnailFile ? thumbnailPathFor(item.thumbnailFile) : undefined,
+      item.stripFile ? thumbnailPathFor(item.stripFile) : undefined,
     ].filter((p): p is string => !!p)
+    await this.editHistory.remove(item.id)
     for (const p of paths) {
       try {
         const resolved = resolve(normalize(p))
-        if (resolved.startsWith(homedir())) await unlink(resolved)
+        if (isAllowedPath(resolved)) await unlink(resolved)
       } catch (err: unknown) {
         if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') {
           console.error('[history] failed to unlink', p, err)

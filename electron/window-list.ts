@@ -23,6 +23,8 @@ export interface PickTarget {
   physRect?: PickRect & { displayId: number }
   /** Win32 only: HWND for matching against the foreground snapshot. */
   hwnd?: unknown
+  /** macOS only: CGWindowID, to capture the window on its own. */
+  windowId?: number
 }
 
 /**
@@ -147,7 +149,13 @@ export async function listPickTargets(includeSelf = false): Promise<PickTarget[]
       .filter((t): t is PickTarget => t !== null)
   }
   if (process.platform === 'darwin') {
-    const wins = await listMacWindows()
+    // Normal windows first, so Enter (the frontmost target) never lands on
+    // a floating window such as a mini player; the order is stable, so each
+    // group keeps its front-to-back order.
+    const wins = (await listMacWindows())
+      .map((w, i) => ({ w, i, floating: (w.layer ?? 0) > 0 ? 1 : 0 }))
+      .sort((a, b) => a.floating - b.floating || a.i - b.i)
+      .map(e => e.w)
     return wins
       .map((r): PickTarget | null => {
         const display = screen.getDisplayMatching({
@@ -155,7 +163,7 @@ export async function listPickTargets(includeSelf = false): Promise<PickTarget[]
           width: Math.max(1, Math.round(r.width)), height: Math.max(1, Math.round(r.height)),
         })
         const rect = resolveMacPickRect(r, display)
-        return rect ? { displayId: display.id, rect } : null
+        return rect ? { displayId: display.id, rect, windowId: r.id } : null
       })
       .filter((t): t is PickTarget => t !== null)
   }

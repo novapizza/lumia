@@ -1,453 +1,219 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, type ReactNode } from 'react'
 import type { WorkflowTemplate, UploadDestination, AfterCaptureStep, AfterUploadStep } from '../../types'
 import { v4 as uuidv4 } from 'uuid'
 
-const STEP_META: Record<string, { icon: string; label: string; color: string }> = {
-  annotate:  { icon: 'draw',          label: 'Annotate',           color: 'primary' },
-  save:      { icon: 'save',          label: 'Save to Disk',       color: 'primary' },
-  clipboard: { icon: 'content_copy',  label: 'Copy to Clipboard',  color: 'primary' },
-  'google-drive': { icon: 'add_to_drive',  label: 'Google Drive',       color: 'secondary' },
-  r2:             { icon: 'share',         label: 'Lumia',              color: 'secondary' },
-  copyUrl:   { icon: 'link',          label: 'Copy URL',           color: 'tertiary' },
-  notify:    { icon: 'notifications', label: 'Notification',       color: 'tertiary' },
-  openUrl:   { icon: 'open_in_new',   label: 'Open URL',           color: 'tertiary' },
-  osShare:   { icon: 'share',         label: 'OS Share',           color: 'tertiary' },
+import { Icon } from '../../components/Icon'
+import { BUTTON, DANGER_BUTTON, ICON_BUTTON, DANGER_ICON_BUTTON } from '../../components/button-classes'
+import { Group, Row, Select } from '../../components/SettingsRows'
+import { toast, toastError } from '../../lib/toast'
+
+/* Workflow page, redone on the Settings layout (2026-11-25 page review):
+   the workflows in a nav column on the toolbar layer, the picked one on
+   content as flat groups of rows (Settings' row kit). Changes save as they
+   happen, like Settings; no Save button. The old page (glass cards, phase
+   numbers, hover-only row actions, dashed add chips) is in git history. */
+
+type Phase = 'afterCapture' | 'destinations' | 'afterUpload'
+type Step = AfterCaptureStep | UploadDestination | AfterUploadStep
+
+/** Row labels start with a verb, what the step does (Voice). */
+const STEP_LABEL: Record<Step['type'], string> = {
+  annotate: 'Open in editor',
+  save: 'Save to folder',
+  clipboard: 'Copy image',
+  'google-drive': 'Upload to Google Drive',
+  r2: 'Upload to Lumia',
+  copyUrl: 'Copy link',
+  notify: 'Show notification',
+  openUrl: 'Open link',
+  osShare: 'Share file',
 }
 
-const PHASE_CONFIG = [
-  { key: 'afterCapture',  title: 'After Capture',      accent: 'primary',   icon: 'auto_fix_high', num: '1' },
-  { key: 'destinations',  title: 'Upload Destinations', accent: 'secondary', icon: 'cloud_upload',  num: '2' },
-  { key: 'afterUpload',   title: 'After Upload',        accent: 'tertiary',  icon: 'task_alt',      num: '3' },
-] as const
+const PHASES: { key: Phase; title: string; add: string }[] = [
+  { key: 'afterCapture', title: 'After capture', add: 'Add step' },
+  { key: 'destinations', title: 'Upload', add: 'Add destination' },
+  { key: 'afterUpload', title: 'After upload', add: 'Add step' },
+]
+
+/** Text field at the framed controls' size; the accent edge while typing,
+ *  like the image editor's text box. */
+const INPUT =
+  'h-8 px-2.5 rounded-lg bg-elevated border border-line text-xs font-medium text-fg placeholder:text-fg-tertiary outline-none focus:border-accent'
 
 export default function Workflow() {
   const [templates, setTemplates] = useState<WorkflowTemplate[]>([])
-  const [selected, setSelected] = useState<WorkflowTemplate | null>(null)
-  const [savedToast, setSavedToast] = useState(false)
+  const [selectedId, setSelectedId] = useState('')
   const [activeId, setActiveId] = useState('')
   const [gdriveConnected, setGdriveConnected] = useState(false)
-  const originalRef = useRef<WorkflowTemplate | null>(null)
+  const [loading, setLoading] = useState(true)
 
   useEffect(() => {
     Promise.all([
       window.electronAPI?.getTemplates(),
       window.electronAPI?.getSettings(),
     ]).then(([t, s]) => {
-      if (t) setTemplates(t)
-      const savedId = s?.activeWorkflowId ?? ''
-      const valid = t?.some(tmpl => tmpl.id === savedId)
-      setActiveId(valid ? savedId : 'builtin-r2')
+      const list = t ?? []
+      setTemplates(list)
+      const saved = s?.activeWorkflowId ?? ''
+      const active = list.some(x => x.id === saved) ? saved : 'builtin-r2'
+      setActiveId(active)
+      // Opens on the default workflow: there's no empty "pick one" state.
+      setSelectedId(list.some(x => x.id === active) ? active : list[0]?.id ?? '')
       setGdriveConnected(!!s?.googleDriveConnected)
-    })
+    }).finally(() => setLoading(false))
   }, [])
 
-  const isDirty = selected && !selected.builtIn &&
-    JSON.stringify(selected) !== JSON.stringify(originalRef.current)
+  // Saves as you go. Typing (name, folder) waits 400ms; the last pending
+  // write goes out when the page closes.
+  const pending = useRef<WorkflowTemplate | null>(null)
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const flush = () => {
+    if (timer.current) { clearTimeout(timer.current); timer.current = null }
+    const t = pending.current
+    pending.current = null
+    if (t) window.electronAPI?.saveTemplate(t).catch(err => toastError("Couldn't save workflow", err))
+  }
+  useEffect(() => flush, [])
 
-  const handleSetActive = async (id: string) => {
+  const update = (next: WorkflowTemplate, typing = false) => {
+    setTemplates(prev => prev.map(t => (t.id === next.id ? next : t)))
+    if (pending.current && pending.current.id !== next.id) flush()
+    pending.current = next
+    if (timer.current) clearTimeout(timer.current)
+    if (typing) timer.current = setTimeout(flush, 400)
+    else flush()
+  }
+
+  const select = (id: string) => { flush(); setSelectedId(id) }
+
+  const makeDefault = (id: string) => {
     setActiveId(id)
-    await window.electronAPI?.setSetting('activeWorkflowId', id)
+    void window.electronAPI?.setSetting('activeWorkflowId', id)
   }
 
-  const handleSelect = (t: WorkflowTemplate) => {
-    const copy = { ...t }
-    setSelected(copy)
-    originalRef.current = copy
-  }
-
-  const handleSave = async () => {
-    if (!selected) return
-    const saved = await window.electronAPI?.saveTemplate(selected)
-    if (saved) {
-      setTemplates(prev => {
-        const idx = prev.findIndex(t => t.id === saved.id)
-        if (idx >= 0) { const next = [...prev]; next[idx] = saved; return next }
-        return [...prev, saved]
-      })
-      setSelected(saved)
-      originalRef.current = { ...saved }
-      setSavedToast(true)
-      setTimeout(() => setSavedToast(false), 2000)
-    }
-  }
-
-  const handleDelete = async (id: string) => {
-    await window.electronAPI?.deleteTemplate(id)
-    setTemplates(prev => prev.filter(t => t.id !== id))
-    if (selected?.id === id) { setSelected(null); originalRef.current = null }
-  }
-
-  const handleNewTemplate = () => {
+  const create = async () => {
+    flush()
     const blank: WorkflowTemplate = {
       id: uuidv4(),
-      name: 'New Workflow',
+      name: 'New workflow',
       icon: 'bolt',
       afterCapture: [],
       destinations: [],
-      afterUpload: [{ type: 'notify' }]
+      afterUpload: [{ type: 'notify' }],
     }
-    setSelected(blank)
-    originalRef.current = null // new — always dirty
-  }
-
-  const addDestination = (type: UploadDestination['type']) => {
-    if (!selected) return
-    const dest: UploadDestination = type === 'google-drive'
-      ? { type: 'google-drive' }
-      : { type: 'r2' }
-    setSelected({ ...selected, destinations: [...selected.destinations, dest] })
-  }
-
-  const removeDestination = (idx: number) => {
-    if (!selected) return
-    setSelected({ ...selected, destinations: selected.destinations.filter((_, i) => i !== idx) })
-  }
-
-  const updateDestination = (idx: number, patch: Partial<UploadDestination>) => {
-    if (!selected) return
-    const next = [...selected.destinations]
-    next[idx] = { ...next[idx], ...patch } as UploadDestination
-    setSelected({ ...selected, destinations: next })
-  }
-
-  const addAfterCapture = (type: AfterCaptureStep['type']) => {
-    if (!selected) return
-    const step: AfterCaptureStep = type === 'save' ? { type: 'save', path: '' } : { type }
-    setSelected({ ...selected, afterCapture: [...selected.afterCapture, step] })
-  }
-
-  const moveStep = (field: 'afterCapture' | 'destinations' | 'afterUpload', from: number, to: number) => {
-    if (!selected) return
-    const next = [...selected[field]] as unknown[]
-    const [item] = next.splice(from, 1)
-    next.splice(to, 0, item)
-    setSelected({ ...selected, [field]: next })
-  }
-
-  const removeStep = (field: 'afterCapture' | 'afterUpload', idx: number) => {
-    if (!selected) return
-    setSelected({ ...selected, [field]: (selected[field] as unknown[]).filter((_, i) => i !== idx) })
-  }
-
-  const addAfterUpload = (type: AfterUploadStep['type']) => {
-    if (!selected) return
-    const step: AfterUploadStep = type === 'copyUrl' ? { type: 'copyUrl', which: 'first' } : { type }
-    setSelected({ ...selected, afterUpload: [...selected.afterUpload, step] })
-  }
-
-  const getPhaseSteps = (phase: typeof PHASE_CONFIG[number]) => {
-    if (!selected) return []
-    if (phase.key === 'afterCapture') return selected.afterCapture.map((s, i) => ({ ...s, _idx: i }))
-    if (phase.key === 'destinations') return selected.destinations.map((s, i) => ({ ...s, _idx: i }))
-    return selected.afterUpload.map((s, i) => ({ ...s, _idx: i }))
-  }
-
-  const accentClass = (accent: string, part: 'text' | 'bg' | 'border') => {
-    const map: Record<string, Record<string, string>> = {
-      primary:   { text: 'text-primary',   bg: 'bg-primary/10',   border: 'border-primary/20' },
-      secondary: { text: 'text-secondary', bg: 'bg-secondary/10', border: 'border-secondary/20' },
-      tertiary:  { text: 'text-tertiary',  bg: 'bg-tertiary/10',  border: 'border-tertiary/20' },
+    try {
+      const saved = (await window.electronAPI?.saveTemplate(blank)) ?? blank
+      setTemplates(prev => [...prev, saved])
+      setSelectedId(saved.id)
+    } catch (err) {
+      toastError("Couldn't add workflow", err)
     }
-    return map[accent]?.[part] ?? ''
   }
 
-  const activeTemplate = templates.find(t => t.id === activeId)
+  const remove = async (id: string) => {
+    if (pending.current?.id === id) { pending.current = null; flush() }
+    try {
+      await window.electronAPI?.deleteTemplate(id)
+    } catch (err) {
+      toastError("Couldn't delete workflow", err)
+      return
+    }
+    const rest = templates.filter(t => t.id !== id)
+    setTemplates(rest)
+    // The default goes back to the built-in upload workflow.
+    if (activeId === id) makeDefault('builtin-r2')
+    setSelectedId(activeId === id ? 'builtin-r2' : activeId)
+    toast('Workflow deleted')
+  }
+
+  const selected = templates.find(t => t.id === selectedId) ?? null
+
+  // Blank while the templates load (a few ms), like Settings.
+  if (loading) return <div className="h-full bg-content" />
 
   return (
-    <div className="h-full flex flex-col overflow-hidden">
-      {/* Header */}
-      <header className="h-14 liquid-glass flex items-center justify-between px-6 flex-shrink-0 border-b border-white/5">
-        <div>
-          <h2 className="text-sm font-bold text-white leading-tight" style={{ fontFamily: 'Manrope, sans-serif' }}>Workflow</h2>
-          <p className="text-[11px] text-slate-500 leading-tight">Define where your captures go and what happens next</p>
-        </div>
-        {activeTemplate && (
-          <div className="flex items-center gap-2">
-            <span className="text-[10px] text-slate-500 font-medium">Active:</span>
-            <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg"
-              style={{ background: 'rgba(0,227,253,0.08)', border: '1px solid rgba(0,227,253,0.15)' }}>
-              <span className="material-symbols-outlined text-secondary" style={{ fontSize: 13 }}>{activeTemplate.icon}</span>
-              <span className="text-[11px] font-semibold text-secondary" style={{ fontFamily: 'Manrope, sans-serif' }}>
-                {activeTemplate.name}
-              </span>
-            </div>
-          </div>
-        )}
-      </header>
-
-      <div className="flex flex-1 overflow-hidden">
-        {/* ── Left: Workflow list ── */}
-        <div className="w-64 flex-shrink-0 border-r border-white/5 flex flex-col">
-          <div className="flex items-center justify-between px-5 py-3">
-            <span className="text-[10px] font-bold uppercase tracking-widest text-slate-500" style={{ fontFamily: 'Manrope, sans-serif' }}>Workflows</span>
+    <div className="h-full flex overflow-hidden">
+      {/* The workflows, as Settings' section list: toolbar layer, the
+          picked one in the accent purple, the others grey, fg under the
+          pointer. The default one carries a star at its right end. */}
+      <nav className="w-48 flex-shrink-0 bg-toolbar border-r border-line px-3 py-3 flex flex-col gap-1 overflow-y-auto" aria-label="Workflows">
+        {templates.map(t => {
+          const on = t.id === selectedId
+          return (
             <button
-              onClick={handleNewTemplate}
-              className="w-6 h-6 rounded-lg bg-white/5 hover:bg-primary/10 flex items-center justify-center text-slate-400 hover:text-primary transition-all"
-              title="New workflow"
+              key={t.id}
+              onClick={() => select(t.id)}
+              aria-current={on ? 'true' : undefined}
+              className={`h-8 px-2.5 flex-shrink-0 flex items-center gap-2 rounded-lg text-xs font-medium text-left ${
+                on ? 'bg-accent text-on-accent' : 'text-fg-secondary hover:text-fg'
+              }`}
             >
-              <span className="material-symbols-outlined text-sm">add</span>
+              <Icon name={t.icon} className="text-[16px] flex-shrink-0" />
+              <span className="truncate">{t.name}</span>
+              {t.id === activeId && <Icon name="star" className="ml-auto text-[14px] flex-shrink-0" />}
             </button>
-          </div>
+          )
+        })}
+        <button
+          onClick={() => void create()}
+          className="h-8 px-2.5 flex-shrink-0 flex items-center gap-2 rounded-lg text-xs font-medium text-left text-fg-secondary hover:text-fg"
+        >
+          <Icon name="add" className="text-[16px]" />
+          New workflow
+        </button>
+      </nav>
 
-          <div className="flex-1 overflow-y-auto px-3 pb-3 space-y-1">
-            {templates.map(t => {
-              const isActive = activeId === t.id
-              const isSel = selected?.id === t.id
-              return (
-                <div
-                  key={t.id}
-                  onClick={() => handleSelect(t)}
-                  className={`group flex items-center gap-3 px-3 py-2.5 rounded-xl cursor-pointer transition-all ${
-                    isSel
-                      ? 'active-nav-bg border border-primary/20'
-                      : 'border border-transparent hover:bg-white/[0.04] hover:border-white/5'
-                  }`}
-                >
-                  <div className={`w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0 ${
-                    isSel ? 'bg-primary/15 text-primary' : 'bg-white/5 text-slate-400'
-                  }`}>
-                    <span className="material-symbols-outlined text-base">{t.icon}</span>
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <p className="text-xs font-semibold text-white truncate" style={{ fontFamily: 'Manrope, sans-serif' }}>{t.name}</p>
-                    <p className="text-[10px] text-slate-500 mt-0.5 whitespace-nowrap">
-                      {isActive && (
-                        <span className="font-bold uppercase text-secondary mr-1" style={{ letterSpacing: '0.06em', fontSize: 9 }}>Active ·</span>
-                      )}
-                      {t.destinations.length} dest · {t.afterCapture.length + t.afterUpload.length} steps
-                    </p>
-                  </div>
-                  <div className="flex items-center gap-0.5 flex-shrink-0 opacity-0 group-hover:opacity-100 transition-opacity">
-                    <button
-                      onClick={e => { e.stopPropagation(); handleSetActive(t.id) }}
-                      className={`p-1 rounded-md transition-all ${isActive ? 'text-secondary' : 'text-slate-600 hover:text-secondary hover:bg-secondary/10'}`}
-                      title={isActive ? 'Default workflow' : 'Set as default'}
-                    >
-                      <span className="material-symbols-outlined text-sm">{isActive ? 'star' : 'star_outline'}</span>
-                    </button>
-                    {!t.builtIn && (
-                      <button
-                        onClick={e => { e.stopPropagation(); handleDelete(t.id) }}
-                        className="p-1 rounded-md text-slate-600 hover:text-red-400 hover:bg-red-500/10 transition-all"
-                      >
-                        <span className="material-symbols-outlined text-sm">delete</span>
-                      </button>
-                    )}
-                  </div>
-                </div>
-              )
-            })}
-
-            {templates.length === 0 && (
-              <div className="text-center py-8">
-                <span className="material-symbols-outlined text-2xl text-slate-700">inbox</span>
-                <p className="text-[11px] text-slate-600 mt-2">No workflows yet</p>
-              </div>
-            )}
-          </div>
-        </div>
-
-        {/* ── Right: Pipeline editor ── */}
-        {selected ? (
-          <div className="flex-1 overflow-y-auto p-5 space-y-4">
-            {/* Template name + actions */}
-            <div className="flex items-center gap-3">
-              <div className={`w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0 border ${
-                activeId === selected.id
-                  ? 'bg-secondary/10 border-secondary/25 text-secondary'
-                  : 'bg-white/5 border-white/10 text-slate-400'
-              }`}>
-                <span className="material-symbols-outlined text-lg">{selected.icon}</span>
-              </div>
-              <input
-                value={selected.name}
-                onChange={e => setSelected({ ...selected, name: e.target.value })}
-                className="flex-1 bg-transparent text-white text-base font-bold focus:outline-none border-b border-transparent focus:border-primary/30 pb-0.5 transition-colors"
-                style={{ fontFamily: 'Manrope, sans-serif' }}
-                disabled={selected.builtIn}
-              />
-              <div className="flex items-center gap-2 flex-shrink-0">
-                {/* Set Active button */}
-                <button
-                  onClick={() => handleSetActive(selected.id)}
-                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-bold transition-all ${
-                    activeId === selected.id
-                      ? 'text-secondary border border-secondary/25'
-                      : 'text-slate-500 hover:text-secondary hover:bg-secondary/10 border border-white/10'
-                  }`}
-                  style={{
-                    fontFamily: 'Manrope, sans-serif',
-                    background: activeId === selected.id ? 'rgba(0,227,253,0.08)' : undefined
-                  }}
-                >
-                  <span className="material-symbols-outlined text-xs">
-                    {activeId === selected.id ? 'star' : 'star_outline'}
-                  </span>
-                  {activeId === selected.id ? 'Active' : 'Set Active'}
-                </button>
-
-                {/* Save button — only show when dirty */}
-                {!selected.builtIn && (isDirty || savedToast) && (
-                  <button
-                    onClick={handleSave}
-                    disabled={savedToast}
-                    className={`flex items-center gap-1.5 px-4 py-1.5 rounded-lg text-[11px] font-bold transition-all ${
-                      savedToast
-                        ? 'text-secondary border border-secondary/25'
-                        : 'primary-gradient text-slate-900 hover:scale-[1.02] active:scale-95'
-                    }`}
-                    style={{
-                      fontFamily: 'Manrope, sans-serif',
-                      background: savedToast ? 'rgba(0,227,253,0.08)' : undefined
-                    }}
-                  >
-                    <span className="material-symbols-outlined text-xs">
-                      {savedToast ? 'check_circle' : 'save'}
-                    </span>
-                    {savedToast ? 'Saved' : 'Save'}
-                  </button>
+      <div className="flex-1 overflow-y-auto bg-content">
+        {selected && (
+          <div className="max-w-xl mx-auto px-5 pt-5 pb-8 space-y-6">
+            <section>
+              <div className="mb-2 px-1">
+                <h2 className="text-sm font-semibold text-fg truncate">{selected.name}</h2>
+                {selected.builtIn && (
+                  <p className="mt-1 text-[10px] font-medium text-fg-secondary">Built in, can't be changed.</p>
                 )}
               </div>
-            </div>
+              <Group>
+                {!selected.builtIn && (
+                  <Row label="Rename">
+                    <input
+                      value={selected.name}
+                      onChange={e => update({ ...selected, name: e.target.value }, true)}
+                      onBlur={() => { if (!selected.name.trim()) update({ ...selected, name: 'New workflow' }) }}
+                      aria-label="Workflow name"
+                      className={`${INPUT} w-48`}
+                    />
+                  </Row>
+                )}
+                <Row
+                  label="Use by default"
+                  description={selected.id === activeId ? 'Run in the editor uses this workflow.' : 'Run in the editor uses the starred workflow.'}
+                >
+                  <button
+                    onClick={() => makeDefault(selected.id)}
+                    disabled={selected.id === activeId}
+                    className={BUTTON}
+                  >
+                    {selected.id === activeId ? 'Default' : 'Make default'}
+                  </button>
+                </Row>
+                {!selected.builtIn && (
+                  <Row label="Delete workflow">
+                    <button onClick={() => void remove(selected.id)} className={DANGER_BUTTON}>Delete</button>
+                  </Row>
+                )}
+              </Group>
+            </section>
 
-            {/* ── 3 Phase Pipeline ── */}
-            {PHASE_CONFIG.map((phase) => {
-              const steps = getPhaseSteps(phase)
-              const field = phase.key
-              return (
-                <div key={phase.key} className="glass-refractive rounded-2xl overflow-hidden">
-                  {/* Phase header */}
-                  <div className="flex items-center gap-3 px-4 py-3 border-b border-white/5">
-                    <div className={`w-6 h-6 rounded-md ${accentClass(phase.accent, 'bg')} flex items-center justify-center`}>
-                      <span className={`material-symbols-outlined text-xs ${accentClass(phase.accent, 'text')}`}>{phase.icon}</span>
-                    </div>
-                    <div className="flex-1">
-                      <span className="text-[11px] font-bold text-white" style={{ fontFamily: 'Manrope, sans-serif' }}>{phase.title}</span>
-                      <span className="text-[10px] text-slate-600 ml-2">
-                        {steps.length === 0 ? 'No steps' : `${steps.length} step${steps.length > 1 ? 's' : ''}`}
-                      </span>
-                    </div>
-                    <span className={`text-[10px] font-black ${accentClass(phase.accent, 'text')} opacity-40`}>{phase.num}</span>
-                  </div>
-
-                  {/* Steps */}
-                  <div className="p-3 space-y-1.5">
-                    {steps.length === 0 && (
-                      <div className="text-center py-3">
-                        <p className="text-[10px] text-slate-600">No steps configured</p>
-                      </div>
-                    )}
-
-                    {steps.map((step, i) => {
-                      const meta = STEP_META[step.type] ?? { icon: 'help', label: step.type, color: phase.accent }
-                      return (
-                        <div key={i}>
-                          <div className="group flex items-center gap-3 px-3 py-2 rounded-lg bg-white/[0.03] border border-white/5 hover:border-white/10 transition-all">
-                            <div className={`w-6 h-6 rounded-md ${accentClass(meta.color, 'bg')} flex items-center justify-center flex-shrink-0`}>
-                              <span className={`material-symbols-outlined text-xs ${accentClass(meta.color, 'text')}`}>{meta.icon}</span>
-                            </div>
-                            <span className="text-xs font-medium text-slate-300 flex-1" style={{ fontFamily: 'Manrope, sans-serif' }}>
-                              {field === 'destinations' && step.type === 'google-drive' ? 'Upload to Google Drive' :
-                               field === 'destinations' && step.type === 'r2' ? `Upload to R2${(step as { bucket?: string }).bucket ? ` (${(step as { bucket?: string }).bucket})` : ''}` :
-                               meta.label}
-                            </span>
-                            {!selected.builtIn && (
-                              <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
-                                {i > 0 && (
-                                  <button onClick={() => moveStep(field, i, i - 1)} className="p-0.5 text-slate-600 hover:text-white rounded transition-colors">
-                                    <span className="material-symbols-outlined text-xs">arrow_upward</span>
-                                  </button>
-                                )}
-                                {i < steps.length - 1 && (
-                                  <button onClick={() => moveStep(field, i, i + 1)} className="p-0.5 text-slate-600 hover:text-white rounded transition-colors">
-                                    <span className="material-symbols-outlined text-xs">arrow_downward</span>
-                                  </button>
-                                )}
-                                <button
-                                  onClick={() => field === 'destinations' ? removeDestination(i) : removeStep(field as 'afterCapture' | 'afterUpload', i)}
-                                  className="p-0.5 text-slate-600 hover:text-red-400 rounded transition-colors"
-                                >
-                                  <span className="material-symbols-outlined text-xs">close</span>
-                                </button>
-                              </div>
-                            )}
-                          </div>
-
-                          {/* Inline config for destinations */}
-                          {field === 'destinations' && step.type === 'google-drive' && !selected.builtIn && (
-                            <div className="ml-9 mt-1.5 mb-1">
-                              <input
-                                value={(step as { folderId?: string }).folderId ?? ''}
-                                onChange={e => updateDestination(i, { folderId: e.target.value } as Partial<UploadDestination>)}
-                                placeholder="Folder name or ID (optional)"
-                                className="w-full bg-white/[0.03] border border-white/5 rounded-lg px-3 py-1.5 text-[11px] text-white placeholder-slate-600 focus:outline-none focus:border-primary/30 transition-colors"
-                              />
-                            </div>
-                          )}
-                          {field === 'destinations' && step.type === 'r2' && !selected.builtIn && (
-                            <div className="ml-9 mt-1.5 mb-1">
-                              <input
-                                value={(step as { bucket?: string }).bucket ?? ''}
-                                onChange={e => updateDestination(i, { bucket: e.target.value } as Partial<UploadDestination>)}
-                                placeholder="Bucket name (leave blank to use default from Settings)"
-                                className="w-full bg-white/[0.03] border border-white/5 rounded-lg px-3 py-1.5 text-[11px] text-white placeholder-slate-600 focus:outline-none focus:border-primary/30 transition-colors"
-                              />
-                            </div>
-                          )}
-                        </div>
-                      )
-                    })}
-
-                    {/* Add step buttons */}
-                    {!selected.builtIn && (
-                      <div className="flex flex-wrap gap-1.5 pt-1.5">
-                        {field === 'afterCapture' && (
-                          <>
-                            <AddChip label="Annotate" icon="draw" accent={phase.accent} onClick={() => addAfterCapture('annotate')} />
-                            <AddChip label="Save" icon="save" accent={phase.accent} onClick={() => addAfterCapture('save')} />
-                            <AddChip label="Clipboard" icon="content_copy" accent={phase.accent} onClick={() => addAfterCapture('clipboard')} />
-                          </>
-                        )}
-                        {field === 'destinations' && (
-                          <>
-                            {gdriveConnected && (
-                              <AddChip label="Google Drive" icon="add_to_drive" accent={phase.accent} onClick={() => addDestination('google-drive')} />
-                            )}
-                            <AddChip label="Lumia" icon="share" accent={phase.accent} onClick={() => addDestination('r2')} />
-                          </>
-                        )}
-                        {field === 'afterUpload' && (
-                          <>
-                            <AddChip label="Copy URL" icon="link" accent={phase.accent} onClick={() => addAfterUpload('copyUrl')} />
-                            <AddChip label="Notify" icon="notifications" accent={phase.accent} onClick={() => addAfterUpload('notify')} />
-                            <AddChip label="Open URL" icon="open_in_new" accent={phase.accent} onClick={() => addAfterUpload('openUrl')} />
-                            <AddChip label="Share" icon="share" accent={phase.accent} onClick={() => addAfterUpload('osShare')} />
-                          </>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                </div>
-              )
-            })}
-          </div>
-        ) : (
-          <div className="flex-1 flex items-center justify-center">
-            <div className="flex flex-col items-center gap-3 max-w-[240px] text-center">
-              <div className="w-14 h-14 rounded-2xl bg-white/[0.03] border border-white/5 flex items-center justify-center">
-                <span className="material-symbols-outlined text-3xl text-slate-600">rocket_launch</span>
-              </div>
-              <p className="text-sm font-bold text-white" style={{ fontFamily: 'Manrope, sans-serif' }}>Select a workflow</p>
-              <p className="text-[11px] text-slate-500 leading-relaxed">Choose from the list or create a new one to configure its pipeline</p>
-              <button
-                onClick={handleNewTemplate}
-                className="mt-1 flex items-center gap-1.5 px-3.5 py-1.5 bg-white/5 hover:bg-white/10 border border-white/10 hover:border-primary/30 rounded-lg text-[11px] font-semibold text-slate-400 hover:text-white transition-all"
-                style={{ fontFamily: 'Manrope, sans-serif' }}
-              >
-                <span className="material-symbols-outlined text-sm">add</span>
-                New Workflow
-              </button>
-            </div>
+            {PHASES.map(phase => (
+              <PhaseGroup
+                key={phase.key}
+                phase={phase}
+                template={selected}
+                gdriveConnected={gdriveConnected}
+                onChange={update}
+              />
+            ))}
           </div>
         )}
       </div>
@@ -455,20 +221,125 @@ export default function Workflow() {
   )
 }
 
-function AddChip({ label, icon, accent, onClick }: { label: string; icon: string; accent: string; onClick: () => void }) {
-  const colorMap: Record<string, string> = {
-    primary:   'hover:border-primary/30 hover:text-primary',
-    secondary: 'hover:border-secondary/30 hover:text-secondary',
-    tertiary:  'hover:border-tertiary/30 hover:text-tertiary',
+/** One phase: a caption over a group of step rows, then the Add row. */
+function PhaseGroup({ phase, template, gdriveConnected, onChange }: {
+  phase: typeof PHASES[number]
+  template: WorkflowTemplate
+  gdriveConnected: boolean
+  onChange: (next: WorkflowTemplate, typing?: boolean) => void
+}) {
+  const steps = template[phase.key] as Step[]
+  const editable = !template.builtIn
+  const set = (next: Step[], typing = false) => onChange({ ...template, [phase.key]: next }, typing)
+  const patch = (i: number, p: Partial<Step>, typing = false) =>
+    set(steps.map((s, j) => (j === i ? ({ ...s, ...p } as Step) : s)), typing)
+  const move = (from: number, to: number) => {
+    const next = [...steps]
+    const [item] = next.splice(from, 1)
+    next.splice(to, 0, item)
+    set(next)
   }
+
+  const addOptions: { value: Step['type']; label: string }[] =
+    phase.key === 'afterCapture'
+      ? [{ value: 'annotate', label: STEP_LABEL.annotate }, { value: 'save', label: STEP_LABEL.save }, { value: 'clipboard', label: STEP_LABEL.clipboard }]
+      : phase.key === 'destinations'
+        ? [{ value: 'r2', label: STEP_LABEL.r2 }, ...(gdriveConnected ? [{ value: 'google-drive' as const, label: STEP_LABEL['google-drive'] }] : [])]
+        : [{ value: 'copyUrl', label: STEP_LABEL.copyUrl }, { value: 'notify', label: STEP_LABEL.notify }, { value: 'openUrl', label: STEP_LABEL.openUrl }, { value: 'osShare', label: STEP_LABEL.osShare }]
+
+  const add = (type: Step['type']) => {
+    const step: Step =
+      type === 'save' ? { type: 'save', path: '' }
+      : type === 'copyUrl' ? { type: 'copyUrl', which: 'first' }
+      : { type } as Step
+    set([...steps, step])
+  }
+
+  const chooseFolder = async (i: number) => {
+    const res = await window.electronAPI?.showOpenDialog({ properties: ['openDirectory', 'createDirectory'] })
+    if (res && !res.canceled && res.filePaths[0]) patch(i, { path: res.filePaths[0] } as Partial<Step>)
+  }
+
   return (
-    <button
-      onClick={onClick}
-      className={`flex items-center gap-1.5 px-2.5 py-1 border border-dashed border-white/10 rounded-lg text-[10px] font-medium text-slate-500 transition-all ${colorMap[accent] ?? ''}`}
-      style={{ fontFamily: 'Manrope, sans-serif' }}
-    >
-      <span className="material-symbols-outlined text-xs">{icon}</span>
-      {label}
-    </button>
+    <section>
+      <p className="mb-1.5 px-1 text-xs font-medium text-fg-secondary">{phase.title}</p>
+      <Group>
+        {steps.length === 0 && !editable && (
+          <div className="min-h-[50px] px-3 flex items-center text-[11px] font-medium text-fg-secondary">No steps</div>
+        )}
+        {steps.map((step, i) => {
+          let description: ReactNode
+          let config: ReactNode = null
+          if (step.type === 'save') {
+            description = step.path
+              ? <span className="select-text">{step.path}</span>
+              : <span className="text-warning-text">Choose a folder. Nothing is saved without one.</span>
+            if (editable) config = <button onClick={() => void chooseFolder(i)} className={BUTTON}>Choose</button>
+          } else if (step.type === 'google-drive' && editable) {
+            config = (
+              <input
+                value={step.folderId ?? ''}
+                onChange={e => patch(i, { folderId: e.target.value || undefined } as Partial<Step>, true)}
+                placeholder="Folder from Settings"
+                aria-label="Drive folder ID"
+                className={`${INPUT} w-40`}
+              />
+            )
+          } else if (step.type === 'google-drive' && step.folderId) {
+            description = step.folderId
+          } else if (step.type === 'r2' && editable) {
+            config = (
+              <input
+                value={step.bucket ?? ''}
+                onChange={e => patch(i, { bucket: e.target.value || undefined } as Partial<Step>, true)}
+                placeholder="Default bucket"
+                aria-label="Bucket"
+                className={`${INPUT} w-40`}
+              />
+            )
+          } else if (step.type === 'r2' && step.bucket) {
+            description = step.bucket
+          }
+          return (
+            <Row key={i} label={STEP_LABEL[step.type] ?? step.type} description={description}>
+              {editable && (
+                <div className="flex items-center gap-3 flex-shrink-0">
+                  {config}
+                  {/* Up / Down stay (disabled) at the ends so the columns
+                      keep their place, like the list rows' actions. */}
+                  <div className="flex items-center gap-3">
+                    <button onClick={() => move(i, i - 1)} disabled={i === 0} className={ICON_BUTTON} data-tip="Up" aria-label="Move up">
+                      <Icon name="arrow_upward" className="text-[16px]" />
+                    </button>
+                    <button onClick={() => move(i, i + 1)} disabled={i === steps.length - 1} className={ICON_BUTTON} data-tip="Down" aria-label="Move down">
+                      <Icon name="arrow_downward" className="text-[16px]" />
+                    </button>
+                    <button
+                      onClick={() => set(steps.filter((_, j) => j !== i))}
+                      className={DANGER_ICON_BUTTON}
+                      data-tip="Remove"
+                      aria-label={`Remove ${STEP_LABEL[step.type] ?? step.type}`}
+                    >
+                      <Icon name="delete" className="text-[16px]" />
+                    </button>
+                  </div>
+                </div>
+              )}
+            </Row>
+          )
+        })}
+        {editable && (
+          <Row label={phase.add}>
+            <Select<Step['type']>
+              value=""
+              placeholder="Choose…"
+              onChange={add}
+              options={addOptions}
+              label={phase.add}
+            />
+          </Row>
+        )}
+      </Group>
+    </section>
   )
 }

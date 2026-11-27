@@ -3,6 +3,7 @@
 // back to the user's default Drive folder, and surfaces every failure as an
 // `UploadResult` so callers (workflow engine, video IPC) can render errors
 // inline without try/catch boilerplate.
+import { net } from 'electron'
 import type { UploadResult } from './types'
 import { getSettings, setSetting } from './settings'
 import {
@@ -58,12 +59,60 @@ function isAuthError(result: UploadResult): boolean {
 
 function resolveFolder(folderId?: string): Resolved<string> {
   const folder = folderId || getSettings().googleDriveFolderId
-  if (!folder) return { error: 'No Drive folder selected — choose one in Settings → Google Drive.' }
+  if (!folder) return { error: 'No Drive folder selected. Pick one in Settings › Uploads.' }
   return { value: folder }
 }
 
 function fail(error: string): UploadResult {
   return { destination: 'google-drive', success: false, error }
+}
+
+/** A Drive file's content by id (the id is in the stored link,
+ *  drive.google.com/file/d/<id>/view), with the user's token; one forced
+ *  refresh and retry on a 401. Returns the response for the caller to
+ *  stream to disk (stream-to-file.ts), never the whole file in memory. Used
+ *  to bring back a clip whose local file is gone (2026-11-21). */
+export async function fetchDriveFile(fileId: string, signal?: AbortSignal): Promise<{ res: Response } | { error: string }> {
+  const get = async (token: string) => net.fetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media`, {
+    headers: { Authorization: `Bearer ${token}` },
+    signal,
+  })
+  try {
+    let token = await ensureAccessToken()
+    if ('error' in token) return { error: token.error }
+    let res = await get(token.value)
+    if (res.status === 401) {
+      token = await ensureAccessToken(true)
+      if ('error' in token) return { error: token.error }
+      res = await get(token.value)
+    }
+    if (!res.ok) return { error: `Drive download failed (HTTP ${res.status})` }
+    return { res }
+  } catch (err) {
+    if (signal?.aborted) return { error: 'cancelled' }
+    return { error: err instanceof Error ? err.message : String(err) }
+  }
+}
+
+/** A Drive folder's current name by id, for Settings (only the id is
+ *  stored; the folder may also have been renamed in Drive since). The
+ *  drive.file scope covers it: the folder was chosen through the Picker.
+ *  One forced refresh and retry on a 401, like the download. */
+export async function getDriveFolderName(folderId: string): Promise<{ name: string } | { error: string }> {
+  const get = async (token: string) => net.fetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(folderId)}?fields=name`, {
+    headers: { Authorization: `Bearer ${token}` },
+  })
+  let token = await ensureAccessToken()
+  if ('error' in token) return { error: token.error }
+  let res = await get(token.value)
+  if (res.status === 401) {
+    token = await ensureAccessToken(true)
+    if ('error' in token) return { error: token.error }
+    res = await get(token.value)
+  }
+  if (!res.ok) return { error: `Drive folder lookup failed (HTTP ${res.status})` }
+  const body = await res.json() as { name?: string }
+  return body.name ? { name: body.name } : { error: 'Drive folder has no name' }
 }
 
 /** Upload an image data URL via multipart upload (≤5 MB). */

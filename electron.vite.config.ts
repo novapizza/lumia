@@ -1,4 +1,5 @@
 import { defineConfig } from 'electron-vite'
+import type { Plugin } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import { resolve } from 'path'
@@ -10,6 +11,34 @@ import { resolve } from 'path'
 // ffmpeg-static is a devDependency (GPL — must never ship) that main only
 // require()s in dev, so it's listed in `include` to stay an external require
 // (dev resolves it from node_modules) instead of being inlined into the bundle.
+// The pages' Content-Security-Policy, written into the built HTML (2026-11-27;
+// a packaged page is a file://, so it can't come as a response header). Build
+// only: the dev server needs inline scripts and a websocket for hot reload.
+// Scripts only from the app itself; images from the app, data / blob URLs,
+// local files (lumia-media) and https (wallpaper photos); video from blob
+// (the recorder's preview) and lumia-media; nothing framed, no plugins.
+const CSP = [
+  "default-src 'self'",
+  "script-src 'self'",
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data: blob: lumia-media: https:",
+  "media-src 'self' blob: lumia-media:",
+  "font-src 'self' data:",
+  "connect-src 'self' lumia-media:",
+  "object-src 'none'",
+  "base-uri 'none'",
+  "form-action 'none'",
+].join('; ')
+function contentSecurityPolicy(): Plugin {
+  return {
+    name: 'lumia-csp',
+    apply: 'build',
+    transformIndexHtml(html) {
+      return html.replace('<head>', `<head>\n    <meta http-equiv="Content-Security-Policy" content="${CSP}" />`)
+    },
+  }
+}
+
 export default defineConfig({
   main: {
     build: {
@@ -47,6 +76,6 @@ export default defineConfig({
         '@': resolve(__dirname, 'src')
       }
     },
-    plugins: [react(), tailwindcss()]
+    plugins: [react(), tailwindcss(), contentSecurityPolicy()]
   }
 })

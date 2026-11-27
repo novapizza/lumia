@@ -1,4 +1,4 @@
-import { ipcMain, app, desktopCapturer, screen, BrowserWindow, nativeImage } from 'electron'
+import { ipcMain, app, desktopCapturer, screen, globalShortcut, systemPreferences, BrowserWindow, nativeImage } from 'electron'
 import { execFile, execFileSync } from 'child_process'
 import { existsSync, mkdirSync, writeFileSync } from 'fs'
 import { join } from 'path'
@@ -6,7 +6,10 @@ import { setTimeout as sleep } from 'timers/promises'
 import * as native from './native-input'
 import { getSettings } from './settings'
 import type { ScrollCaptureMethod } from './settings'
-import { isExtensionConnected, startExtensionCapture, cancelExtensionCapture } from './extension-bridge'
+import { focusedExtensionClient, startExtensionCapture } from './extension-bridge'
+import { sendCaptureToEditor } from './capture'
+import { globalRect } from './capture-source'
+import { showNotification } from './notify'
 import { getDisplayConversionIcc } from './display-icc'
 import { convertBgraToSrgbInPlace } from './icc-to-srgb'
 // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -985,7 +988,7 @@ async function captureScrollingInRect(
   progressCb: (data: { frame: number; maxFrames: number; phase?: 'capturing' | 'stitching' }) => void,
   isCancelledFn: () => boolean,
   displayId?: number | null
-): Promise<{ dataUrl: string }> {
+): Promise<{ dataUrl: string; srgb: boolean }> {
   const allDisplays = screen.getAllDisplays()
   const targetDisplay = (displayId != null
     ? allDisplays.find(d => d.id === displayId)
@@ -1249,7 +1252,7 @@ async function captureScrollingInRect(
     }
   }
 
-  if (frames.length === 0) return { dataUrl: '' }
+  if (frames.length === 0) return { dataUrl: '', srgb: true }
 
   // ── Fixed region detection ───────────────────────────────────────────
   // Use early detection if we have enough frames, else detect from what we have
@@ -1288,7 +1291,9 @@ async function captureScrollingInRect(
   progressCb({ frame: frames.length, maxFrames: frames.length, phase: 'stitching' })
   const dataUrl = stitchFramesIncremental(frames, scrollSteps, topFixed, bottomFixed)
 
-  return { dataUrl }
+  // srgb: the frames were converted. Otherwise the saved PNG is tagged with
+  // the display's profile, if it has one (a LUT profile can't be converted).
+  return { dataUrl, srgb: conversionIcc != null }
 }
 
 // ── Overlay mode tracking ──────────────────────────────────────────────────
@@ -1318,22 +1323,22 @@ export function setOverlayMode(mode: OverlayMode) {
 let scrollDeps: { mainWindow: BrowserWindow; createOverlayWindows: () => void } | null = null
 
 /**
- * Start a scroll capture using the given method, or the saved
- * `scrollCaptureMethod` setting when none is passed.
+ * Start a scroll capture with the given method, or, with none (the scroll
+ * hotkey and the menu-bar item), by the app in front (2026-11-27; it was a
+ * setting before): a browser with the extension connected captures its page
+ * through the extension, anything else gets the screen scroll overlay.
  *
- * Fallback policy: an EXPLICIT 'extension' request (Dashboard card) with no
- * extension connected fails fast with `extension-not-connected` so the UI can
- * show setup help; the implicit path (hotkey / New Capture replay) silently
- * falls back to the classic screen method so the hotkey always does something.
+ * An EXPLICIT 'extension' request (Dashboard card) with no extension
+ * connected fails fast with `extension-not-connected` so the UI can show
+ * setup help.
  */
 export async function launchScrollCapture(
   method?: ScrollCaptureMethod
 ): Promise<{ ok: boolean; error?: string }> {
-  const resolved = method ?? getSettings().scrollCaptureMethod
-  if (resolved === 'extension') {
-    if (isExtensionConnected()) return startExtensionCapture()
-    if (method === 'extension') return { ok: false, error: 'extension-not-connected' }
-    console.log('[scroll-capture] extension method saved but not connected — falling back to screen scroll')
+  if (method === 'extension') return startExtensionCapture()
+  if (method === undefined) {
+    const front = await focusedExtensionClient()
+    if (front) return startExtensionCapture(front)
   }
 
   // Classic screen method: hide the main window, open the region overlay.
@@ -1358,89 +1363,56 @@ export function setupScrollCapture(
   scrollDeps = { mainWindow, createOverlayWindows }
 
   let cancelled = false
-  let captureOpts: {
-    delay: number; maxFrames: number;
-    scrollMethod?: ScrollMethod; scrollToTopFirst?: boolean
-  } = { delay: 600, maxFrames: 50 }
 
   // Unified entry point: routes to the extension bridge or the classic
   // screen pipeline based on the saved setting / explicit method.
   ipcMain.handle('scroll-capture:launch', (_e, method?: ScrollCaptureMethod) =>
     launchScrollCapture(method))
 
-  // Step 1: User clicks "Scrolling" — hide main window, open overlay
-  ipcMain.handle('scroll-capture:start', async (_e, opts?: {
-    delay?: number; maxFrames?: number;
-    scrollMethod?: ScrollMethod; scrollToTopFirst?: boolean
-  }) => {
-    cancelled = false
-    captureOpts = {
-      delay: opts?.delay ?? 600,
-      maxFrames: opts?.maxFrames ?? 50,
-      scrollMethod: opts?.scrollMethod,
-      scrollToTopFirst: opts?.scrollToTopFirst
-    }
-
-    mainWindow.hide()
-    await sleep(200) // wait for window to hide before opening overlay
-
-    // Tell overlay to use 'scroll-region' mode before creating it
-    overlayMode = 'scroll-region'
-    createOverlayWindows()
-    return { ok: true }
-  })
-
-  // Step 2: Overlay confirms region selection
+  // The overlay confirms the area (its Scroll tab, or launchScrollCapture).
+  // The result goes through sendCaptureToEditor like every other capture
+  // (watermark, clipboard, save to disk, history, editor or toast;
+  // 2026-11-23, it used to go to a Dashboard dialog that added the row
+  // itself). While it scrolls, Esc stops it and keeps what's captured so
+  // far, like the extension's Stop & save: a global shortcut, since no
+  // Lumia window is focused then.
   ipcMain.handle('scroll-region:confirm', async (e, rect: { x: number; y: number; width: number; height: number }) => {
-    // Reset here too: the hotkey path opens the overlay without going through
-    // scroll-capture:start, so a previous ESC leaves `cancelled` stuck true and
-    // every subsequent capture would abort at frame 0.
     cancelled = false
     const captureDisplayId = getOverlayDisplayId(e.sender)
     resetOverlayMode()
     closeAllOverlays()
 
+    const ownsEsc = !globalShortcut.isRegistered('Escape')
+      && globalShortcut.register('Escape', () => { cancelled = true })
     try {
+      // macOS posts the wheel events through the Swift helper, which the OS
+      // silently ignores without Accessibility: every frame came out the
+      // same and the capture "worked" without scrolling (2026-11-23).
+      if (process.platform === 'darwin') {
+        if (!existsSync(getScrollHelperPath())) throw new Error('scroll helper missing (run build/compile-mac-helpers.sh)')
+        if (!systemPreferences.isTrustedAccessibilityClient(false)) throw new Error('allow Lumia in System Settings › Privacy & Security › Accessibility')
+      }
       await sleep(150) // brief delay after overlay closes
 
-      const { dataUrl } = await captureScrollingInRect(
+      const { dataUrl, srgb } = await captureScrollingInRect(
         rect,
-        captureOpts,
-        (data) => {
-          if (!mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('scroll-capture:progress', data)
-          }
-        },
+        { delay: 600, maxFrames: 50, scrollToTopFirst: getSettings().scrollCaptureToTop },
+        () => {},
         () => cancelled,
         captureDisplayId
       )
-
-      if (!mainWindow.isDestroyed()) {
-        mainWindow.show()
-        mainWindow.focus()
-        // Only Dashboard listens for scroll-capture:open/result, so make sure
-        // it's the mounted route before we emit — otherwise the result is lost
-        // when the user kicked the capture off from another view (e.g. Settings).
-        mainWindow.webContents.send('navigate', '/dashboard')
-        await sleep(100)
-        mainWindow.webContents.send('scroll-capture:open')
-        // Wait for React to mount ScrollCaptureDialog and register its IPC listener
-        // before sending result — otherwise the event arrives before the listener exists
-        await sleep(500)
-        mainWindow.webContents.send('scroll-capture:result', { dataUrl })
-      }
+      if (ownsEsc) globalShortcut.unregister('Escape')
+      if (!dataUrl) throw new Error('No frames were captured')
+      const displayId = captureDisplayId ?? screen.getPrimaryDisplay().id
+      await sendCaptureToEditor(dataUrl, 'scrolling', srgb ? undefined : displayId, {
+        rect: globalRect(rect, displayId),
+      })
     } catch (err: unknown) {
-      if (!mainWindow.isDestroyed()) {
-        mainWindow.show()
-        mainWindow.focus()
-        // Same as the success path: Dashboard is the only listener for
-        // scroll-capture:open/error, so route there first.
-        mainWindow.webContents.send('navigate', '/dashboard')
-        await sleep(100)
-        mainWindow.webContents.send('scroll-capture:open')
-        await sleep(500)
-        mainWindow.webContents.send('scroll-capture:error', { error: err instanceof Error ? err.message : 'Unknown error' })
-      }
+      const message = err instanceof Error ? err.message : 'Unknown error'
+      showNotification({ body: `Couldn't capture page\n${message}`, kind: 'error' })
+      restoreFromOverlayCancel()
+    } finally {
+      if (ownsEsc && globalShortcut.isRegistered('Escape')) globalShortcut.unregister('Escape')
     }
   })
 
@@ -1450,11 +1422,5 @@ export function setupScrollCapture(
     closeAllOverlays()
     cancelled = true
     restoreFromOverlayCancel()
-  })
-
-  ipcMain.handle('scroll-capture:cancel', () => {
-    cancelled = true
-    // Same dialog cancels both methods — stop an extension session too.
-    cancelExtensionCapture()
   })
 }

@@ -1,12 +1,15 @@
 import { useState, useEffect } from 'react'
 
+import { BUTTON, ACCENT_BUTTON } from './button-classes'
+import { MessageBox } from './MessageBox'
+
 /** First-run prompt asking whether to bind the physical PrintScreen key to
  *  Lumia's "New Capture" action. Fires once: on the first app launch where
  *  printScreenPromptShown is still false. Either button (Yes/No) marks it
  *  as shown so we never re-ask; the user can change their answer later in
- *  Settings → General.
+ *  Settings › General.
  *
- *  Windows-only on purpose — built-in Mac keyboards don't have PrintScreen,
+ *  Windows-only on purpose: built-in Mac keyboards don't have PrintScreen,
  *  so the prompt would be meaningless to most macOS users. Mac users on an
  *  external PC keyboard can opt in manually from Settings.
  */
@@ -14,7 +17,7 @@ export function PrintScreenPromptDialog() {
   const [open, setOpen] = useState(false)
   const [busy, setBusy] = useState(false)
   const [warning, setWarning] = useState('')
-
+  const [detail, setDetail] = useState('')
   useEffect(() => {
     if (window.electronAPI?.platform !== 'win32') return
     window.electronAPI?.getSettings?.().then(s => {
@@ -22,7 +25,7 @@ export function PrintScreenPromptDialog() {
     }).catch(() => { /* ignore — prompt will simply not show this session */ })
   }, [])
 
-  const close = () => { setOpen(false); setWarning('') }
+  const close = () => { setOpen(false); setWarning(''); setDetail('') }
 
   const handleYes = async () => {
     setBusy(true)
@@ -30,7 +33,7 @@ export function PrintScreenPromptDialog() {
       const res = await window.electronAPI?.setPrintScreenAsCapture?.(true)
       // setPrintScreenAsCapture already flips printScreenPromptShown=true
       // server-side, so a "Yes" click costs one IPC instead of two.
-      if (res?.warning) setWarning(res.warning)
+      if (res?.warning) { setWarning(res.warning); setDetail(res.detail ?? '') }
       else              close()
     } finally {
       setBusy(false)
@@ -49,58 +52,44 @@ export function PrintScreenPromptDialog() {
     }
   }
 
+  // Esc is "Keep default", like a dialog's Cancel (it still records that we asked).
+  useEffect(() => {
+    if (!open) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape' || busy) return
+      e.preventDefault()
+      if (warning) close()
+      else void handleNo()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  })
+
   if (!open) return null
 
+  // Dialog look (2026-11-25 review): a solid elevated box with a line edge
+  // over the scrim (no blur, no glass), Section-rank title, Body-rank text,
+  // framed buttons with the main one in accent.
   return (
-    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/50 backdrop-blur-sm">
-      <div className="glass-card rounded-2xl p-7 flex flex-col gap-5 max-w-md mx-4 shadow-2xl border border-white/10">
-        <div className="flex items-start gap-3">
-          <div className="w-10 h-10 rounded-xl bg-primary/15 flex items-center justify-center flex-shrink-0">
-            <span className="material-symbols-outlined text-primary">keyboard</span>
-          </div>
-          <div className="space-y-1.5">
-            <h2 className="text-base font-bold text-[var(--color-on-surface)]" style={{ fontFamily: 'Manrope, sans-serif' }}>
-              Use PrintScreen for capture?
-            </h2>
-            <p className="text-[13px] text-slate-400 leading-relaxed">
-              Bind the PrtSc key to "New Capture" — pressing it instantly replays your last capture mode. Lumia will turn off the Windows "PrintScreen opens Snipping Tool" shortcut so the keypress reaches us.
-            </p>
-            <p className="text-[11px] text-slate-500">You can change this anytime in Settings → General.</p>
-          </div>
+    <div className="fixed inset-0 z-[60] flex items-center justify-center bg-scrim">
+      <div role="dialog" aria-modal="true" aria-labelledby="printscreen-title" className="w-[400px] max-w-[calc(100vw-32px)] rounded-lg bg-elevated border border-line p-3 flex flex-col gap-3">
+        <div className="flex flex-col gap-2">
+          <h2 id="printscreen-title" className="text-sm font-semibold text-fg">Use PrintScreen?</h2>
+          <p className="text-xs text-fg-secondary">
+            PrintScreen starts a new capture or recording, like your last one. Takes the key from the Snipping Tool.<br /><br />You can change this anytime in Settings › General.
+          </p>
         </div>
 
-        {warning && (
-          <p className="text-[11px] text-amber-400 leading-snug bg-amber-500/5 border border-amber-500/20 rounded-lg px-3 py-2">
-            <span className="material-symbols-outlined text-[14px] align-middle mr-1">warning</span>
-            {warning}
-          </p>
-        )}
+        {/* Like a warning toast: it didn't go as asked, nothing broke. */}
+        {warning && <MessageBox kind="warning" message={warning} detail={detail || undefined} />}
 
-        <div className="flex justify-end gap-2">
+        <div className="flex justify-end gap-3">
           {warning ? (
-            <button
-              disabled={busy}
-              onClick={close}
-              className="px-4 py-2 text-sm font-semibold rounded-lg bg-primary/20 text-primary hover:bg-primary/30 transition-colors cursor-pointer disabled:opacity-50"
-            >
-              Got it
-            </button>
+            <button disabled={busy} onClick={close} className={ACCENT_BUTTON}>OK</button>
           ) : (
             <>
-              <button
-                disabled={busy}
-                onClick={handleNo}
-                className="px-4 py-2 text-sm rounded-lg bg-white/5 text-slate-300 hover:bg-white/10 transition-colors cursor-pointer disabled:opacity-50"
-              >
-                Not now
-              </button>
-              <button
-                disabled={busy}
-                onClick={handleYes}
-                className="px-4 py-2 text-sm font-semibold rounded-lg bg-primary/20 text-primary hover:bg-primary/30 transition-colors cursor-pointer disabled:opacity-50"
-              >
-                Use PrintScreen
-              </button>
+              <button disabled={busy} onClick={handleNo} className={BUTTON}>Keep default</button>
+              <button disabled={busy} onClick={handleYes} className={ACCENT_BUTTON}>Use PrintScreen</button>
             </>
           )}
         </div>

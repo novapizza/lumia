@@ -57,3 +57,49 @@ export class DayGenerations {
     return [...snapshot].filter(([d, g]) => (this.gens.get(d) ?? 0) !== g).map(([d]) => d)
   }
 }
+
+// ── The Dashboard's place, kept while the editor or Settings is open ──
+// The Dashboard unmounts for those pages and used to come back at the top.
+// Its place is remembered as a clip and where that clip sat, not as a
+// scroll offset: days load a few at a time, so offsets don't carry over.
+
+export interface ClipBox { id: string; top: number; bottom: number; left: number; right: number }
+
+/** Where the Dashboard was: the anchor point (a clip's centre, or the
+ *  middle line when no clip showed) sat `offset` px under the scroll area's
+ *  top, `dayFraction` of the way down its day. */
+export type PlaceAnchor = { top: true } | { id?: string; day: string; offset: number; dayFraction: number }
+
+/** The clip to remember the place by: `prefer` (the one just opened) while
+ *  any of it shows, so it comes back exactly where it was clicked; else the
+ *  one nearest the middle of the area, by height first, then (in the grid)
+ *  by how near the centre column. Null when no clip is in view. */
+export function pickAnchorClip(clips: ClipBox[], area: { top: number; bottom: number; left: number; right: number }, prefer?: string | null): ClipBox | null {
+  const inView = clips.filter(c => c.bottom > area.top && c.top < area.bottom)
+  const opened = prefer ? inView.find(c => c.id === prefer) : undefined
+  if (opened) return opened
+  const midY = (area.top + area.bottom) / 2
+  const midX = (area.left + area.right) / 2
+  let best: { clip: ClipBox; dy: number; dx: number } | null = null
+  for (const clip of inView) {
+    const dy = Math.abs((clip.top + clip.bottom) / 2 - midY)
+    const dx = Math.abs((clip.left + clip.right) / 2 - midX)
+    if (!best || dy < best.dy - 1 || (Math.abs(dy - best.dy) <= 1 && dx < best.dx)) best = { clip, dy, dx }
+  }
+  return best?.clip ?? null
+}
+
+/** How far to scroll to put the anchor back: its clip's centre at the old
+ *  height, or, when the clip is gone, the same point of its day. Null when
+ *  neither is there (or the place was the top). */
+export function placeDelta(
+  anchor: PlaceAnchor,
+  areaTop: number,
+  clip: { top: number; bottom: number } | undefined,
+  section: { top: number; height: number } | undefined,
+): number | null {
+  if ('top' in anchor) return null
+  if (clip) return (clip.top + clip.bottom) / 2 - areaTop - anchor.offset
+  if (section) return section.top + section.height * anchor.dayFraction - areaTop - anchor.offset
+  return null
+}

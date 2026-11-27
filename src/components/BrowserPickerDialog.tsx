@@ -1,5 +1,9 @@
 import { useState, useEffect } from 'react'
 
+import { Icon } from './Icon'
+import { BUTTON } from './button-classes'
+import { MessageBox } from './MessageBox'
+
 interface BrowserPreview {
   clientId: number
   browser: string
@@ -22,6 +26,7 @@ export default function BrowserPickerDialog({ onClose }: Props) {
   const [previews, setPreviews] = useState<BrowserPreview[] | null>(null)
   const [starting, setStarting] = useState<number | null>(null)
   const [error, setError] = useState('')
+  const [errorDetail, setErrorDetail] = useState('')
 
   useEffect(() => {
     let alive = true
@@ -31,7 +36,7 @@ export default function BrowserPickerDialog({ onClose }: Props) {
     return () => { alive = false }
   }, [])
 
-  // ESC to dismiss
+  // Esc closes
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
     window.addEventListener('keydown', onKeyDown)
@@ -42,53 +47,41 @@ export default function BrowserPickerDialog({ onClose }: Props) {
     if (starting != null) return
     setStarting(clientId)
     setError('')
+    setErrorDetail('')
     const r = await window.electronAPI?.startScrollCaptureWith?.(clientId)
     if (r && !r.ok) {
-      setError(r.error ?? 'Failed to start the capture')
+      setError(r.error ?? "Couldn't start capture")
+      setErrorDetail(r.detail ?? '')
       setStarting(null)
       return
     }
-    // Session started — main pushes scroll-capture:open and the progress
-    // dialog takes over from here.
+    // Session started — it ends in the editor (or a toast), like any capture.
     onClose()
   }
 
+  // Dialog look (2026-11-25 review), like the PrintScreen prompt: a solid
+  // elevated box over the scrim (no blur, no glass). The tab cards follow the
+  // Dashboard's grid cards: a toolbar card, an inset line edge that steps to
+  // line-strong under the pointer, no transitions.
   return (
     <div
-      className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50"
+      className="fixed inset-0 bg-scrim flex items-center justify-center z-[60]"
       onClick={e => { if (e.target === e.currentTarget) onClose() }}
     >
-      <div className="glass-refractive rounded-3xl p-8 w-[560px] max-w-[92vw] shadow-2xl">
-        {/* Header */}
-        <div className="flex items-center justify-between mb-6">
-          <div className="flex items-center gap-3">
-            <div className="w-8 h-8 rounded-full bg-secondary/10 flex items-center justify-center">
-              <span className="material-symbols-outlined text-secondary text-lg">extension</span>
-            </div>
-            <h3 className="text-lg font-bold text-white" style={{ fontFamily: 'Manrope, sans-serif' }}>
-              Choose a browser
-            </h3>
-          </div>
-          <button onClick={onClose} className="text-slate-400 hover:text-white transition-colors">
-            <span className="material-symbols-outlined">close</span>
-          </button>
+      <div role="dialog" aria-modal="true" aria-labelledby="browser-picker-title" className="w-[560px] max-w-[calc(100vw-32px)] rounded-lg bg-elevated border border-line p-3 flex flex-col gap-3">
+        <div className="flex flex-col gap-2">
+          <h2 id="browser-picker-title" className="text-sm font-semibold text-fg">Choose a browser</h2>
+          <p className="text-xs text-fg-secondary">Lumia Scroll Capture is running in several browsers. Pick the tab to capture.</p>
         </div>
 
-        <p className="text-xs text-slate-400 mb-4" style={{ fontFamily: 'Manrope, sans-serif' }}>
-          Several browsers are connected — pick the one whose active tab you want to capture.
-        </p>
-
-        {/* Loading previews */}
+        {/* A real wait: each browser sends a preview of its active tab. */}
         {previews === null && (
-          <div className="flex flex-col items-center justify-center py-10 gap-3">
-            <div className="w-8 h-8 border-2 border-secondary border-t-transparent rounded-full animate-spin" />
-            <p className="text-slate-400 text-sm" style={{ fontFamily: 'Manrope, sans-serif' }}>
-              Fetching tab previews…
-            </p>
+          <div className="h-40 flex items-center justify-center gap-2 text-xs font-medium text-fg-secondary">
+            <Icon name="progress_activity" className="text-[16px] animate-spin" />
+            Loading previews…
           </div>
         )}
 
-        {/* Browser cards */}
         {previews !== null && (
           <div className="grid grid-cols-2 gap-3">
             {previews.map(p => (
@@ -96,53 +89,47 @@ export default function BrowserPickerDialog({ onClose }: Props) {
                 key={p.clientId}
                 onClick={() => pick(p.clientId)}
                 disabled={starting != null}
-                className={`group text-left rounded-xl overflow-hidden bg-white/[0.03] border transition-all duration-200
-                            ${starting === p.clientId
-                              ? 'border-secondary/50 ring-2 ring-secondary/30'
-                              : 'border-white/[0.05] hover:border-secondary/30 hover:bg-secondary/[0.06]'}
-                            disabled:opacity-60 disabled:cursor-not-allowed cursor-pointer`}
+                className="group relative text-left rounded-lg overflow-hidden bg-toolbar"
               >
-                <div className="aspect-video bg-slate-950 relative overflow-hidden">
+                <div className="aspect-video bg-content relative overflow-hidden">
                   {p.dataUrl ? (
-                    <img src={p.dataUrl} className="w-full h-full object-cover object-top opacity-90 group-hover:opacity-100 transition-opacity" />
+                    <img src={p.dataUrl} className="w-full h-full object-cover object-top select-none" />
                   ) : (
                     <div className="w-full h-full flex items-center justify-center">
-                      <span className="material-symbols-outlined text-slate-700 text-3xl">public</span>
+                      <Icon name="public" className="text-[24px] text-fg-tertiary" />
                     </div>
                   )}
+                  {/* Over the preview (media), so a raw scrim is fine here. */}
                   {starting === p.clientId && (
                     <div className="absolute inset-0 bg-black/50 flex items-center justify-center">
-                      <div className="w-6 h-6 border-2 border-secondary border-t-transparent rounded-full animate-spin" />
+                      <Icon name="progress_activity" className="text-[24px] text-white animate-spin" />
                     </div>
                   )}
                 </div>
-                <div className="p-3">
-                  <p className="text-xs font-bold text-white truncate" style={{ fontFamily: 'Manrope, sans-serif' }}>
-                    {p.browser}
-                  </p>
-                  <p className="text-[10px] text-slate-500 truncate mt-0.5" title={p.title || p.url}>
-                    {p.title || p.url || 'No preview available'}
+                <div className="px-2.5 py-2 border-t border-line">
+                  <p className="text-[11px] font-semibold text-fg truncate">{p.browser}</p>
+                  <p className="text-[10px] font-medium text-fg-secondary truncate mt-0.5">
+                    {p.title || p.url || 'No preview'}
                   </p>
                 </div>
+                {/* Edge over everything, inside the card (like a clip card's):
+                    line-strong under the pointer, accent while it starts. */}
+                <div className={`absolute inset-0 rounded-lg pointer-events-none ${
+                  starting === p.clientId
+                    ? 'ring-(length:--selection-ring) ring-inset ring-accent'
+                    : `ring-1 ring-inset ring-line ${starting == null ? 'group-hover:ring-line-strong' : ''}`
+                }`} />
               </button>
             ))}
           </div>
         )}
 
-        {error && (
-          <div className="mt-4 flex items-start gap-2 p-3 bg-red-500/10 border border-red-500/20 rounded-xl">
-            <span className="material-symbols-outlined text-red-400 text-sm flex-shrink-0">error</span>
-            <p className="text-xs text-slate-300">{error}</p>
-          </div>
-        )}
+        {/* Like an error toast. */}
+        {error && <MessageBox kind="error" message={error} detail={errorDetail || undefined} />}
 
-        <button
-          onClick={onClose}
-          className="mt-6 w-full px-6 py-2.5 rounded-2xl border border-slate-500/30 text-slate-300 text-sm font-semibold hover:bg-white/5 transition-colors"
-          style={{ fontFamily: 'Manrope, sans-serif' }}
-        >
-          Cancel
-        </button>
+        <div className="flex justify-end">
+          <button onClick={onClose} className={BUTTON}>Cancel</button>
+        </div>
       </div>
     </div>
   )
