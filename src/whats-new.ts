@@ -41,7 +41,7 @@ export interface Release {
 export const RELEASES: Release[] = [
   {
     version: '3.0.0',
-    date: '2026-11-27', // set to the release day in the release commit
+    date: '2026-11-28',
     notes: [
       {
         title: 'Meet the new Lumia',
