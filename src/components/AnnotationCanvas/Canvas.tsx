@@ -3,6 +3,7 @@ import {
   useCallback,
   useEffect,
   useImperativeHandle,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -15,7 +16,9 @@ import {
   Image as KonvaImage,
   Layer,
   Line,
+  Path,
   Rect,
+  Shape,
   Stage,
   Text,
   Transformer,
@@ -23,7 +26,29 @@ import {
 import useImage from 'use-image'
 import type Konva from 'konva'
 import { useHistory } from '../../hooks/useHistory'
-import type { Tool } from './tools'
+import { useRoleColors } from '../../hooks/useRoleColors'
+import { type Tool, isFreehand, HIGHLIGHTER_WIDTH, HIGHLIGHTER_OPACITY } from './tools'
+import { codeToKey, defaultKeymap, isHoldDown, isHoldKeyEvent, isModifierBinding, matchesBinding, type Keymap } from '../../lib/editor-keys'
+
+/** The theme roles the canvas draws its own controls in. */
+const CANVAS_ROLES = ['accent', 'elevated', 'elevated-hover', 'line-strong', 'danger-text', 'danger-text-hover'] as const
+
+/** The delete handle (screen px): a normal icon button's size, 32px round
+ *  a 16px icon (8px padding, 2026-11-23; 20px with an X, then 24px round a
+ *  14px trash tried), its centre 20.25px right and up from the selection's
+ *  corner, so its edge clears the 8px corner anchor's tip by 7px, the
+ *  callout gap. */
+const DELETE_R = 16
+// Angle step a Shift-drawn line or arrow snaps to (0°, 15°, 30°, …).
+const SHIFT_SNAP_DEG = 15
+const DELETE_ICON = 16
+/** Zoom ceiling, 300% of actual size (Jasper, 2026-11-23). */
+const MAX_ZOOM = 3
+const DELETE_OFFSET = 20.25
+/** Extra, invisible hit area round the delete handle (screen px). */
+const DELETE_HIT_PAD = 4
+/** Lucide Trash2 (24-unit box), drawn on the delete handle. */
+const TRASH_PATH = 'M3 6h18 M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6 M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2 M10 11v6 M14 11v6'
 
 export type { Tool }
 
@@ -48,6 +73,9 @@ export interface DrawObject {
    *  to a same-origin data URL via the main process so the canvas can be
    *  exported without cross-origin tainting. */
   src?: string
+  /** Hidden in the Layers tab (2026-11-23): not drawn, so not clickable and
+   *  not in any export; kept in the drawing and saved. */
+  hidden?: boolean
 }
 
 /** Style of the currently selected shape, reported through
@@ -61,12 +89,17 @@ export interface SelectionInfo {
 }
 
 // ── Sticker image resolution ────────────────────────────────────────────────
+/** A new sticker's width on screen (CSS px) at the zoom it's placed at
+ *  (2026-11-26): 1.5x its cell in the sticker panel. */
+const STICKER_SCREEN_W = 120
+
 // Sticker bytes are fetched + disk-cached in the main process and returned as
 // data URLs (loading remote URLs straight into Konva would taint the canvas and
 // break toDataURL on Save/Copy/Upload). Memoise the per-path promise so the same
 // sticker placed twice, or replayed from history, only crosses IPC once.
 const stickerUrlCache = new Map<string, Promise<string>>()
-function resolveStickerUrl(relPath: string): Promise<string> {
+// Exported for the History panel's sticker thumbnails (2026-11-26).
+export function resolveStickerUrl(relPath: string): Promise<string> {
   let p = stickerUrlCache.get(relPath)
   if (!p) {
     p = window.electronAPI.stickersFetch(relPath).then(r => {
@@ -132,6 +165,9 @@ export interface CanvasHandle {
   /** Snapshot the current composite (background + annotations) as a PNG data URL.
    *  Resolution follows the source's natural pixel dimensions. */
   toDataURL: () => string
+  /** A small JPEG of the image with its drawings, at most `maxWidth` image
+   *  pixels wide: a live thumbnail (Recent images, 2026-11-23). A few ms. */
+  toPreviewDataURL: (maxWidth: number) => string
   /** Same composite as a fresh canvas. Useful for feeding MediaRecorder during
    *  video export (canvas.captureStream). */
   toCanvas: () => HTMLCanvasElement | null
@@ -150,11 +186,70 @@ export interface CanvasHandle {
   /** Place a sticker centred on the image (sized to ~30% of natural width,
    *  aspect preserved) and select it. `src` is the manifest-relative path;
    *  `aspect` is naturalWidth/naturalHeight of the sticker artwork. */
-  addSticker: (opts: { src: string; aspect: number }) => void
+  addSticker: (opts: { src: string; aspect: number; at?: { clientX: number; clientY: number } }) => void
+  /** The size, in screen px at the current zoom, a sticker of this aspect
+   *  lands at (the drag ghost, 2026-11-26). */
+  stickerScreenSize: (aspect: number) => { w: number; h: number }
+  /** Jump to an undo step (History › Edits). */
+  goToStep: (index: number) => void
+  /** Layers tab (2026-11-23): select these shapes (hidden ones skipped), or
+   *  with `toggle` add / remove them from the selection. */
+  selectShapes: (ids: string[], toggle?: boolean) => void
+  /** Layers tab: the drawing in a new order (back to front, every id once).
+   *  Not an undo step: every step takes the new order. */
+  reorderShapes: (ids: string[]) => void
+  /** Layers tab: hide or show a shape. Not an undo step: every step takes
+   *  the new visibility. */
+  setShapeHidden: (id: string, hidden: boolean) => void
+}
+
+/** A background frame around the image (the editor's Background panel,
+ *  2026-11-25): `padding` % of the image's longer side on every side, `css` paints it on
+ *  screen, `paint` into the exported PNG. */
+export interface CanvasFrame {
+  /** Percent of the image's longer side (2026-11-25; image pixels at first),
+   *  so it looks the same on a small capture and a big Retina one. */
+  padding: number
+  /** A drop shadow under the image, image pixels (null: none). */
+  shadow: { offsetY: number; blur: number; alpha: number } | null
+  /** The whole picture's width / height (null: the image plus padding). A
+   *  fixed ratio adds background on one axis. ('original', the image's own
+   *  shape, was tried 2026-11-25 and dropped for this.) */
+  ratio: number | null
+  /** Where the image sits in that extra space: 0 start, 0.5 middle, 1 end. */
+  alignX: number
+  alignY: number
+  css: string
+  paint: (ctx: CanvasRenderingContext2D, width: number, height: number) => void
+}
+
+/** The framed picture for an image `w` × `h`, image pixels: its size and
+ *  where the image sits in it (left / top margin). Shared by the export
+ *  and the on-screen frame so they always agree. */
+export function framePadding(frame: CanvasFrame, w: number, h: number) {
+  return Math.round(Math.max(0, frame.padding) / 100 * Math.max(w, h))
+}
+
+export function frameLayout(frame: CanvasFrame, w: number, h: number) {
+  const p = framePadding(frame, w, h)
+  let width = w + 2 * p
+  let height = h + 2 * p
+  const ratio = frame.ratio
+  if (ratio) {
+    if (width / height < ratio) width = Math.round(height * ratio)
+    else height = Math.round(width / ratio)
+  }
+  const x = p + Math.round((width - w - 2 * p) * frame.alignX)
+  const y = p + Math.round((height - h - 2 * p) * frame.alignY)
+  return { width, height, x, y }
 }
 
 interface Props {
   background: CanvasBackground
+  /** Image only: draws the frame behind the image and bakes it into
+   *  `onExport` / `toDataURL` (Copy, Save, Upload). Shapes stay in image
+   *  coordinates. */
+  frame?: CanvasFrame
   tool: Tool
   color: string
   strokeWidth: number
@@ -171,6 +266,9 @@ interface Props {
    *  selected shape's style. While a shape is selected, changes to the
    *  `color` / `strokeWidth` props restyle it (one undo step per gesture). */
   onSelectionChange?: (selection: SelectionInfo | null) => void
+  /** Every selected shape's id, on each selection change (the Layers tab
+   *  marks those rows). */
+  onSelectedIdsChange?: (ids: string[]) => void
   /** Disable pointer-driven drawing (used by video mode while the video is
    *  actively playing — lets users watch without accidental strokes). */
   readOnly?: boolean
@@ -180,6 +278,44 @@ interface Props {
    *  them. Only read at mount; later changes are ignored so parent
    *  re-renders don't clobber in-progress edits. */
   initialObjects?: DrawObject[]
+  /** The view to open on (zoom + pan, 2026-11-23: the editor remembers it
+   *  per image). Only read at mount. */
+  initialView?: { zoom: number; pan: { x: number; y: number } }
+  /** Fires when the zoom or pan changes. */
+  onViewChange?: (view: { zoom: number; pan: { x: number; y: number } }) => void
+  /** Saved undo steps to open with (History › Edits, 2026-11-23), in place of
+   *  replaying `initialObjects` shape by shape. Only read at mount. */
+  initialSteps?: { steps: DrawObject[][]; cursor: number; dropped?: number }
+  /** Fires on every change to the undo steps: all kept steps (oldest
+   *  first), the one shown, and how many old ones fell off the end. */
+  onStepsChange?: (steps: DrawObject[][], cursor: number, dropped: number) => void
+  /** A shape to point out (History › Edits, the step under the pointer):
+   *  outlined in the accent while set, if it's on the canvas. */
+  highlightId?: string | null
+  /** Settings › Hold key to pan (default off): on, the pan key + drag
+   *  pans. Off, the pan key does nothing and the Cursor tool is the hand: a
+   *  drag from anywhere but a shape pans, a click there deselects, no
+   *  selection box (2026-11-24). */
+  keyToDrag?: boolean
+  /** The image editor's keys (src/lib/editor-keys.ts, changeable in
+   *  Settings › Hotkeys, 2026-11-24); the canvas reads `pan`, `constrain`
+   *  and `delete`. Defaults when left out. */
+  keymap?: Keymap
+  /** The recording's live drawing layer (2026-11-24): the same canvas as
+   *  the editor's, over the screen being recorded. No zoom, no panning (no
+   *  wheel, no double-click reset, no hand, no Space or right-drag); Cursor
+   *  doesn't pan. Use with a `video` background without an element, sized
+   *  to the display in device pixels, so 100% is actual size. */
+  live?: boolean
+  /** With `live`: whether the layer needs the clicks now (the pointer on a
+   *  shape or the delete button, a selection, the text box, a selection box
+   *  being drawn). The rest of the time Cursor lets them through to the
+   *  recorded app. */
+  onInteractiveChange?: (interactive: boolean) => void
+  /** Fires when a stroke starts or ends (`drawing`) and when the text-entry
+   *  box opens or closes (`typing`): the image editor fades its toolbar
+   *  while either is on (2026-11-25). */
+  onActivityChange?: (activity: { drawing: boolean; typing: boolean }) => void
 }
 
 let idCounter = 0
@@ -189,13 +325,6 @@ const uid = () => `obj-${++idCounter}-${Date.now()}`
 // pixels of the stage edge visible inside the container so the canvas never
 // disappears entirely.
 const PAN_MIN_VISIBLE = 80
-
-// Each cached blur is a full-resolution canvas (~33 MB at 4K). Dragging the
-// stroke slider would otherwise materialise one per radius (~20 steps) and
-// never release them. Cap the cache and evict the least-recently-used radius
-// so memory stays bounded; in-use radii (committed blur shapes) are protected
-// from eviction in the populate effect below.
-const BLUR_CACHE_MAX = 3
 
 // Stroke-width slider doubles as the blur-intensity control when the blur
 // tool is selected. Map slider value (1–20) to a CSS blur radius in px.
@@ -220,7 +349,7 @@ function clampPan(
 
 const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
   function AnnotationCanvas(
-    { background, tool, color, strokeWidth, onExport, exportTrigger = 0, onHistoryChange, onZoomChange, onSelectionChange, readOnly = false, initialObjects },
+    { background, frame, tool, color, strokeWidth, onExport, exportTrigger = 0, onHistoryChange, onZoomChange, onSelectionChange, onSelectedIdsChange, readOnly = false, initialObjects, initialView, onViewChange, initialSteps, onStepsChange, highlightId, keyToDrag = false, keymap, live = false, onInteractiveChange, onActivityChange },
     ref,
   ) {
     // ── Background ────────────────────────────────────────────────────────────
@@ -229,9 +358,6 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
     // Blur tool re-uses the stroke-width slider as a blur-intensity control.
     // We cache one pre-blurred canvas per radius so dragging the slider only
     // costs a single CSS-filter pass per new value, not one per mouse move.
-    const blurCacheRef = useRef<Map<number, HTMLCanvasElement>>(new Map())
-    const [blurCacheVersion, setBlurCacheVersion] = useState(0)
-    void blurCacheVersion  // referenced by Konva render reads — forces redraw on cache growth
 
     // For video: repaint the Konva layer on every new frame. The KonvaImage's
     // `image` prop keeps the same HTMLVideoElement reference, so React/Konva
@@ -279,12 +405,41 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
     const isDrawingRef = useRef(false)
     const [currentObj, setCurrentObj] = useState<DrawObject | null>(null)
     const drawStart = useRef({ x: 0, y: 0 })
-    const [selectedId, setSelectedId] = useState<string | null>(null)
+    // Selection (2026-11-23: several shapes at once): drag a box on empty
+    // canvas with Cursor (Shift / ⌘ adds), ⌘-click (Ctrl on Windows) adds or
+    // removes one. `selectedId` is the single selection, for what only makes
+    // sense for one shape (text editing, the tool-switch rule).
+    const [selectedIds, setSelectedIds] = useState<string[]>([])
+    const selectedId = selectedIds.length === 1 ? selectedIds[0] : null
+    const setSelectedId = useCallback((id: string | null) => setSelectedIds(id ? [id] : []), [])
+    const selectedIdsRef = useRef(selectedIds)
+    selectedIdsRef.current = selectedIds
+    const selKey = selectedIds.join(',')
+    // The selection box being dragged (Cursor on empty canvas), in layer
+    // units; `add` when Shift or ⌘ was held (adds to the selection).
+    const [marquee, setMarquee] = useState<{ x0: number; y0: number; x1: number; y1: number; add: boolean } | null>(null)
+    const marqueeRef = useRef(marquee)
+    // The stage's positioned wrapper: presses inside it are the stage's own.
+    const stageWrapRef = useRef<HTMLDivElement>(null)
+    marqueeRef.current = marquee
+    /** A shape's box in layer (image) units. (A blur is a plain box shape
+     *  since 2026-11-23, so it needs no special case any more.) */
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const boxOf = (_id: string, node: Konva.Node, layer: Konva.Container) =>
+      node.getClientRect({ relativeTo: layer as any })
     // Position of the per-shape delete handle (the red X) in layer
     // coordinates. Tracked separately from selectedId so the X follows the
     // shape live during drag/transform without going through the React
     // commit cycle on every mousemove.
     const [deleteHandle, setDeleteHandle] = useState<{ x: number; y: number } | null>(null)
+    // The selection frame and the delete handle in the theme's roles
+    // (2026-11-23; they were #b6a0ff, the old dark accent, and a red circle
+    // with a white ring and a shadow).
+    const role = useRoleColors(CANVAS_ROLES)
+    const [deleteHover, setDeleteHover] = useState(false)
+    // A handle that goes away (Delete key, deselect) never reports the
+    // pointer leaving it.
+    useEffect(() => { if (!deleteHandle) setDeleteHover(false) }, [deleteHandle])
     // Konva node ref for the delete handle so drag/transform can reposition it
     // imperatively without a React re-render of the whole canvas per mousemove.
     const deleteHandleRef = useRef<Konva.Group>(null)
@@ -311,7 +466,7 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
     const [containerSize, setContainerSize] = useState({ w: 0, h: 0 })
 
     // ── Zoom ──────────────────────────────────────────────────────────────────
-    const [userZoom, setUserZoom] = useState(1)
+    const [userZoom, setUserZoom] = useState(() => initialView ? Math.max(0.1, Math.min(initialView.zoom, MAX_ZOOM)) : 1)
     // The ceiling is dynamic (see `maxZoom` below, kept in a ref so the
     // long-lived wheel handler and the []-dep zoom callbacks read the latest
     // value without re-binding).
@@ -326,7 +481,7 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
 
     // ── Pan (right-click drag, Space+left-click drag, cursor-tool left-drag on
     // empty canvas, two-finger touchpad swipe) ──
-    const [panOffset, setPanOffset] = useState({ x: 0, y: 0 })
+    const [panOffset, setPanOffset] = useState(() => initialView?.pan ?? { x: 0, y: 0 })
     const panOffsetRef = useRef(panOffset)
     useEffect(() => { panOffsetRef.current = panOffset }, [panOffset])
     const [isPanningState, setIsPanningState] = useState(false)
@@ -335,13 +490,28 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
     // Space-bar held → cursor flips to grab and left-click starts pan (Figma
     // convention). Ref so the mousedown handler sees the latest value without
     // re-binding listeners on every keypress.
-    const [spaceHeld, setSpaceHeld] = useState(false)
-    const spaceHeldRef = useRef(false)
-    useEffect(() => { spaceHeldRef.current = spaceHeld }, [spaceHeld])
+    const [dragKeyHeld, setDragKeyHeld] = useState(false)
+    const dragKeyHeldRef = useRef(false)
+    useEffect(() => { dragKeyHeldRef.current = dragKeyHeld }, [dragKeyHeld])
     // Latest tool for the long-lived pan mousedown handler (cursor-tool
     // left-drag pan) without re-binding listeners on every tool switch.
     const toolRef = useRef(tool)
     useEffect(() => { toolRef.current = tool }, [tool])
+    // Cursor is the hand (Hold key to pan off). Ref for the pan handler.
+    const handMode = !keyToDrag && tool === 'none' && !readOnly && !live
+    const handModeRef = useRef(handMode)
+    handModeRef.current = handMode
+    const keyToDragRef = useRef(keyToDrag)
+    keyToDragRef.current = keyToDrag
+    const isMac = typeof window !== 'undefined' && window.electronAPI?.platform === 'darwin'
+    const keys = keymap ?? defaultKeymap('image', isMac)
+    const keysRef = useRef(keys)
+    keysRef.current = keys
+    // Plain (non-modifier) keys down right now, by binding name, for hold
+    // keys that aren't modifiers (Space, a letter).
+    const heldKeysRef = useRef(new Set<string>())
+    // Where a hand drag started, to tell a click (deselect) from a pan.
+    const handPressRef = useRef<{ x: number; y: number } | null>(null)
 
     // ── History ───────────────────────────────────────────────────────────────
     const {
@@ -351,6 +521,12 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
       redo,
       canUndo,
       canRedo,
+      goTo,
+      load: loadSteps,
+      mapAll: mapAllSteps,
+      steps: historySteps,
+      cursor: historyCursor,
+      dropped: historyDropped,
     } = useHistory<DrawObject[]>([])
 
     // Rehydrate persisted annotations by replaying each shape as its own
@@ -367,6 +543,11 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
     useEffect(() => {
       if (replayedRef.current) return
       replayedRef.current = true
+      // Saved steps (History › Edits) win over a shape-by-shape replay.
+      if (initialSteps && initialSteps.steps.length > 0) {
+        loadSteps(initialSteps.steps, initialSteps.cursor, initialSteps.dropped ?? 0)
+        return
+      }
       if (!initialObjects || initialObjects.length === 0) return
       for (let i = 0; i < initialObjects.length; i++) {
         commitObjects(initialObjects.slice(0, i + 1))
@@ -377,58 +558,7 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
     const objectsRef = useRef(objects)
     useEffect(() => { objectsRef.current = objects }, [objects])
 
-    // Drop cached blurs whenever the source image swaps so stale radii from a
-    // previous bitmap don't leak in. The populate effect below refills as
-    // soon as render asks for a radius.
-    useEffect(() => {
-      blurCacheRef.current.clear()
-      setBlurCacheVersion(v => v + 1)
-    }, [bgImage])
 
-    // Populate the blur cache whenever a new radius is needed — either by an
-    // existing blur object on the canvas or by the live tool/slider preview.
-    // Each entry is a CSS-blur pass over the source image, so the work is
-    // cheap and amortised across re-renders.
-    useEffect(() => {
-      if (background.kind !== 'image' || !bgImage) return
-      const needed = new Set<number>()
-      for (const obj of objects) {
-        if (obj.type === 'blur') needed.add(blurRadiusFromStrokeWidth(obj.strokeWidth))
-      }
-      if (tool === 'blur') needed.add(blurRadiusFromStrokeWidth(strokeWidth))
-      const cache = blurCacheRef.current
-      let added = false
-      for (const r of needed) {
-        if (cache.has(r)) {
-          // Touch: re-insert so Map iteration order tracks recency (LRU tail).
-          const existing = cache.get(r)!
-          cache.delete(r)
-          cache.set(r, existing)
-          continue
-        }
-        const c = document.createElement('canvas')
-        c.width  = bgImage.width
-        c.height = bgImage.height
-        const ctx = c.getContext('2d')
-        if (!ctx) continue
-        ctx.filter = `blur(${r}px)`
-        ctx.drawImage(bgImage, 0, 0)
-        cache.set(r, c)
-        added = true
-      }
-      // Evict least-recently-used radii once over the cap, but never drop a
-      // radius that's currently in use by a committed blur shape or the live
-      // preview — those are guaranteed to be re-created on the next render
-      // anyway, so evicting them just thrashes.
-      if (cache.size > BLUR_CACHE_MAX) {
-        for (const r of cache.keys()) {
-          if (cache.size <= BLUR_CACHE_MAX) break
-          if (needed.has(r)) continue
-          cache.delete(r)
-        }
-      }
-      if (added) setBlurCacheVersion(v => v + 1)
-    }, [bgImage, background.kind, objects, tool, strokeWidth])
 
     // Notify parent on every commit. Depending on `canUndo`/`canRedo` alone
     // would miss changes where those booleans don't toggle — e.g. after the
@@ -438,11 +568,24 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
     useEffect(() => {
       onHistoryChange?.(canUndo, canRedo, userEditedRef.current)
     }, [objects, canUndo, canRedo, onHistoryChange])
+    // The undo steps for History › Edits (and their saving).
+    const stepCount = historySteps.length
+    useEffect(() => {
+      onStepsChange?.([...historySteps], historyCursor, historyDropped)
+      // historySteps is mutated in place: its length, the cursor and the
+      // shown objects say when it changed.
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [objects, stepCount, historyCursor, historyDropped, onStepsChange])
 
     // ── Container sizing ──────────────────────────────────────────────────────
-    useEffect(() => {
+    // Measured before the first paint (2026-11-23): the observer reports
+    // only after it, so a first frame at { w: 0 } placed the stage centred
+    // on the container's left edge and a wide image's right half flashed
+    // there before it jumped into place.
+    useLayoutEffect(() => {
       const el = containerRef.current
       if (!el) return
+      setContainerSize({ w: el.clientWidth, h: el.clientHeight })
       const ro = new ResizeObserver(entries => {
         const { width, height } = entries[0].contentRect
         setContainerSize({ w: width, h: height })
@@ -473,13 +616,11 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
       ? (bgImage?.height ?? 600)
       : (background.naturalHeight || 600)
 
-    // Base scale: fit content into container.
-    const isTallImage = naturalH / naturalW > 2
-    const baseScale = containerSize.w > 0 && containerSize.h > 0
-      ? isTallImage
-        ? Math.min((containerSize.w - 32) / naturalW, 1)
-        : Math.min((containerSize.w - 32) / naturalW, (containerSize.h - 32) / naturalH, 1)
-      : 1
+    // Base scale (2026-11-23): actual size, whatever the window. 100% zoom
+    // is one image pixel per screen pixel (CSS px = image px / dpr), so a
+    // capture opens as big as it was on screen; larger than the window, it
+    // pans. (It used to fit the window, with 100% meaning "fitted".)
+    const baseScale = 1 / (window.devicePixelRatio || 1)
 
     const scale = baseScale * userZoom
 
@@ -489,13 +630,15 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
     // 65,535 px on a side or ~268M px² of backing-buffer area (CSS px ×
     // devicePixelRatio, since Konva renders buffers at dpr× the CSS size).
     // Stay under both with headroom; floor at 1 so 100% is always reachable.
+    // And never past 300% (Jasper, 2026-11-23): the stage's canvas spans the
+    // whole zoomed image, so higher zoom made every redraw lag.
     const maxZoom = useMemo(() => {
       const dpr = window.devicePixelRatio || 1
       const maxSide = 60_000 / dpr
       const maxArea = 240_000_000 / (dpr * dpr)
       const w = naturalW * baseScale
       const h = naturalH * baseScale
-      return Math.max(1, Math.min(maxSide / w, maxSide / h, Math.sqrt(maxArea / (w * h))))
+      return Math.max(1, Math.min(MAX_ZOOM, maxSide / w, maxSide / h, Math.sqrt(maxArea / (w * h))))
     }, [naturalW, naturalH, baseScale])
     useEffect(() => {
       maxZoomRef.current = maxZoom
@@ -505,6 +648,7 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
     }, [maxZoom])
 
     useEffect(() => { onZoomChange?.(userZoom) }, [userZoom, onZoomChange])
+    useEffect(() => { onViewChange?.({ zoom: userZoom, pan: panOffset }) }, [userZoom, panOffset, onViewChange])
 
     // Wheel handling:
     //   • Ctrl/Cmd+wheel and trackpad pinch (Chromium translates pinch
@@ -527,7 +671,7 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
     // available in all Chromium versions (which is what Electron uses).
     useEffect(() => {
       const el = containerRef.current
-      if (!el) return
+      if (!el || live) return
       const onWheel = (e: WheelEvent) => {
         e.preventDefault()
 
@@ -598,7 +742,7 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
     // Double-click to reset zoom + pan
     useEffect(() => {
       const el = containerRef.current
-      if (!el) return
+      if (!el || live) return
       const onDblClick = (e: MouseEvent) => {
         // Double-clicking inside the text box (word-select) must not yank the
         // view — the box lives inside this container so the event bubbles here.
@@ -618,37 +762,29 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
 
     // Mouse-drag to pan. Triggers:
     //   • Right-click drag (legacy fallback)
-    //   • Space-bar held + left-click drag (Figma convention)
-    //   • Cursor tool + left-click drag on empty canvas (clicks on shapes
-    //     still select/drag them)
+    //   • Space-bar held + left-click drag (Figma / Photoshop convention)
     // Uses capture phase so Konva doesn't also start drawing on the same gesture.
     useEffect(() => {
       const el = containerRef.current
-      if (!el) return
+      if (!el || live) return
       const onMouseDown = (e: MouseEvent) => {
         const rightClick    = e.button === 2
-        const spaceLeftDrag = e.button === 0 && spaceHeldRef.current
-        // Cursor tool: left-drag pans when no shape is under the pointer.
-        // Konva's hit canvas decides, so this agrees exactly with what a
-        // click would select (bg image is listening=false → counts as empty;
-        // transformer anchors and the delete handle count as shapes).
-        let cursorLeftDrag = false
-        if (!rightClick && !spaceLeftDrag && e.button === 0 && toolRef.current === 'none') {
+        const spaceLeftDrag = e.button === 0 && dragKeyHeldRef.current
+        // Hand (Hold key to pan off): a left press anywhere but on a shape, a
+        // Transformer handle, the delete handle or the text box pans.
+        let handDrag = false
+        if (e.button === 0 && handModeRef.current && !(e.target as HTMLElement).closest?.('textarea')) {
           const stage = stageRef.current
-          if (stage) {
-            stage.setPointersPositions(e)
-            const pos = stage.getPointerPosition()
-            cursorLeftDrag = !pos || !stage.getIntersection(pos)
-          } else {
-            cursorLeftDrag = true
-          }
+          const r = stage?.container().getBoundingClientRect()
+          const onNode = !!(stage && r) && !!stage.getIntersection({ x: e.clientX - r.left, y: e.clientY - r.top })
+          handDrag = !onNode
         }
-        if (!rightClick && !spaceLeftDrag && !cursorLeftDrag) return
+        // Cursor's drag on empty canvas no longer pans (2026-11-23): it draws
+        // a selection box. Space (any tool), right-drag and the hand pan.
+        if (!rightClick && !spaceLeftDrag && !handDrag) return
+        handPressRef.current = handDrag ? { x: e.clientX, y: e.clientY } : null
         e.preventDefault()
-        // Cursor-tool pan lets the event reach Konva so the stage's own
-        // mousedown still deselects on empty-canvas clicks; the other
-        // triggers must not (space+left would start a draw).
-        if (!cursorLeftDrag) e.stopPropagation()
+        e.stopPropagation()
         isPanning.current = true
         setIsPanningState(true)
         // Read the latest pan from the ref so this effect doesn't need
@@ -667,10 +803,15 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
           rect.width, rect.height, stageW, stageH,
         ))
       }
-      const onMouseUp = () => {
+      const onMouseUp = (e: MouseEvent) => {
         if (!isPanning.current) return
         isPanning.current = false
         setIsPanningState(false)
+        // A hand press that didn't move is a click on empty canvas: deselect
+        // (Shift / ⌘ keep the selection, as with the selection box).
+        const hp = handPressRef.current
+        handPressRef.current = null
+        if (hp && Math.hypot(e.clientX - hp.x, e.clientY - hp.y) < 3 && !(e.shiftKey || e.metaKey || e.ctrlKey)) setSelectedIds([])
       }
       const onContextMenu = (e: MouseEvent) => e.preventDefault()
 
@@ -692,26 +833,39 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
     useEffect(() => {
       const el = containerRef.current
       if (!el) return
+      // Not before the image (and so its real size) is known: the 800 x 600
+      // placeholder would clamp a remembered pan (initialView) away.
+      if (background.kind === 'image' && !bgImage) return
       const stageW = naturalW * baseScale * userZoom
       const stageH = naturalH * baseScale * userZoom
       setPanOffset(prev => clampPan(prev, el.clientWidth, el.clientHeight, stageW, stageH))
-    }, [userZoom, baseScale, naturalW, naturalH, containerSize])
+    }, [userZoom, baseScale, naturalW, naturalH, containerSize, background.kind, bgImage])
 
-    // Space-bar tracking. Window-level so user can hold space anywhere on the
-    // canvas. Skipped while typing in an input so text annotation isn't broken.
+    // Pan-key tracking (the `pan` key, Space by default). Window-level so the
+    // key works anywhere on the canvas. Skipped while typing in an input so
+    // text annotation isn't broken. Only with Settings › Hold key to pan on.
+    // Also keeps `heldKeysRef` (plain keys down) for the hold keys.
     useEffect(() => {
       const onKeyDown = (e: KeyboardEvent) => {
-        if (e.code !== 'Space' || e.repeat) return
+        const k = codeToKey(e.code)
+        if (k) heldKeysRef.current.add(k)
+        const pan = keysRef.current.pan
+        if (e.repeat || !keyToDragRef.current || !isHoldKeyEvent(pan, e, isMac)) return
         const t = e.target as HTMLElement | null
         if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return
-        e.preventDefault()
-        setSpaceHeld(true)
+        // Space would scroll / press a focused button, a letter would type,
+        // Alt alone would focus the menu bar on Windows. Ctrl, Cmd and Shift
+        // are left alone (chords).
+        if (!isModifierBinding(pan) || pan === 'Alt') e.preventDefault()
+        setDragKeyHeld(true)
       }
       const onKeyUp = (e: KeyboardEvent) => {
-        if (e.code !== 'Space') return
-        setSpaceHeld(false)
+        const k = codeToKey(e.code)
+        if (k) heldKeysRef.current.delete(k)
+        if (!isHoldKeyEvent(keysRef.current.pan, e, isMac)) return
+        setDragKeyHeld(false)
       }
-      const onBlur = () => setSpaceHeld(false)
+      const onBlur = () => { heldKeysRef.current.clear(); setDragKeyHeld(false) }
       window.addEventListener('keydown', onKeyDown)
       window.addEventListener('keyup',   onKeyUp)
       window.addEventListener('blur',    onBlur)
@@ -720,27 +874,64 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
         window.removeEventListener('keyup',   onKeyUp)
         window.removeEventListener('blur',    onBlur)
       }
+    // isMac never changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [])
 
     const stageWidth  = Math.round(naturalW * scale)
     const stageHeight = Math.round(naturalH * scale)
+    // The stage's place, snapped to device pixels (2026-11-25), so the
+    // Background frame drawn behind it lines up on every side: unsnapped,
+    // the two rounded separately and a 1px frame showed only at the right
+    // and bottom.
+    const dpr = window.devicePixelRatio || 1
+    const snapPx = (v: number) => Math.round(v * dpr) / dpr
+    const stageLeft = snapPx((containerSize.w - stageWidth) / 2 + panOffset.x)
+    const stageTop  = snapPx((containerSize.h - stageHeight) / 2 + panOffset.y)
+    // The frame's width in CSS px, whole device pixels, at least one when
+    // there is padding; around the image's exact size (the stage can be up
+    // to half a pixel bigger from the rounding above).
+    const padPx = frame ? framePadding(frame, naturalW, naturalH) : 0
+    const framePx = padPx > 0
+      ? Math.max(1, Math.round(padPx * scale * dpr)) / dpr
+      : 0
+    // A frame shows with padding or a ratio (a ratio alone adds background
+    // on one axis), images only.
+    const frameOn = !!frame && background.kind === 'image' && (padPx > 0 || frame.ratio !== null)
+    // Its margins on screen, CSS px: the padding part in whole device
+    // pixels (framePx), the ratio's extra space on top of it.
+    const frameBox = (() => {
+      if (!frameOn || !frame) return null
+      const lay = frameLayout(frame, naturalW, naturalH)
+      const p = padPx
+      const margin = (m: number) => framePx + snapPx((m - p) * scale)
+      const left = margin(lay.x)
+      const top = margin(lay.y)
+      const right = margin(lay.width - naturalW - lay.x)
+      const bottom = margin(lay.height - naturalH - lay.y)
+      const w = snapPx(naturalW * scale)
+      const h = snapPx(naturalH * scale)
+      return { left: stageLeft - left, top: stageTop - top, width: left + w + right, height: top + h + bottom }
+    })()
 
     // Prepare the stage for a natural-resolution export and return a restore
     // fn. Two concerns handled here:
     //   1. Selection chrome — detach the purple Transformer frame and hide the
     //      red X delete handle so neither bakes into the PNG. (Previously only
     //      toAnnotationsCanvas did this, so Copy/Save/Upload captured the UI.)
-    //   2. Zoom independence — strokeScaleEnabled=false renders strokes in
-    //      screen px, so at zoom != 1 exporting with pixelRatio=1/scale would
-    //      leak the current zoom into stroke / arrowhead thickness. Temporarily
-    //      reset the stage scale to baseScale (zoom = 1) so exports always
-    //      rasterise strokes at the fit-to-container scale. Geometry is
+    //   2. Zoom independence — the stage is reset to baseScale (zoom = 1)
+    //      for the export, so it's always drawn at 100%. Strokes and arrow
+    //      heads are in image units since 2026-11-23 (they scale with the
+    //      stage), so this is what keeps the zoom out of the PNG. Geometry is
     //      unaffected because pixelRatio compensates 1:1 (see below).
     const prepareExport = useCallback((stage: Konva.Stage): (() => void) => {
       const tr = trRef.current
       const handle = stage.findOne('#__delete_handle__')
+      const highlight = stage.findOne('#__highlight__')
       const prevTrNodes = tr?.nodes() ?? []
       const prevHandle = handle?.visible() ?? true
+      const prevHighlight = highlight?.visible() ?? true
+      highlight?.visible(false)
       const prevScaleX = stage.scaleX()
       const prevScaleY = stage.scaleY()
       tr?.nodes([])
@@ -767,6 +958,7 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
       return () => {
         if (tr && prevTrNodes.length > 0) tr.nodes(prevTrNodes)
         handle?.visible(prevHandle)
+        highlight?.visible(prevHighlight)
         for (const r of arrowRestores) r()
         stage.scale({ x: prevScaleX, y: prevScaleY })
         stage.batchDraw()
@@ -795,7 +987,47 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
       const stage = stageRef.current
       if (!stage || !bgImage) return ''
       const restore = prepareExport(stage)
-      const out = stage.toDataURL({ mimeType: 'image/png', ...exportRect() })
+      let out: string
+      if (frameOn && frame) {
+        // The frame (2026-11-25): a bigger canvas (padding on every side,
+        // widened or heightened to the ratio), painted with the background,
+        // the image composite on top where the alignment puts it.
+        const inner = stage.toCanvas(exportRect())
+        const lay = frameLayout(frame, inner.width, inner.height)
+        const c = document.createElement('canvas')
+        c.width = lay.width
+        c.height = lay.height
+        const ctx = c.getContext('2d')!
+        frame.paint(ctx, c.width, c.height)
+        // The shadow follows the image's alpha, so a window capture's
+        // transparent corners cast none.
+        ctx.save()
+        if (frame.shadow) {
+          ctx.shadowColor = `rgba(0,0,0,${frame.shadow.alpha})`
+          ctx.shadowBlur = frame.shadow.blur
+          ctx.shadowOffsetY = frame.shadow.offsetY
+        }
+        ctx.drawImage(inner, lay.x, lay.y)
+        ctx.restore()
+        out = c.toDataURL('image/png')
+      } else {
+        out = stage.toDataURL({ mimeType: 'image/png', ...exportRect() })
+      }
+      restore()
+      return out
+    }, [bgImage, exportRect, prepareExport, frame, frameOn])
+
+    const toPreviewDataURL = useCallback((maxWidth: number): string => {
+      const stage = stageRef.current
+      if (!stage || !bgImage) return ''
+      const rect = exportRect()
+      const restore = prepareExport(stage)
+      const out = stage.toDataURL({
+        ...rect,
+        mimeType: 'image/jpeg',
+        quality: 0.8,
+        pixelRatio: Math.min(rect.pixelRatio, maxWidth / Math.max(1, rect.width)),
+      })
       restore()
       return out
     }, [bgImage, exportRect, prepareExport])
@@ -847,26 +1079,44 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
       commitObjects([...objectsRef.current, ...stamped])
     }, [commitObjects])
 
-    // Place a sticker centred on the image, sized to ~30% of the image's
-    // natural width with its own aspect preserved, then select it so the user
-    // can immediately drag/resize. Lives here (not the Editor) because the
-    // natural dimensions and selection state are local to the canvas.
-    const addSticker = useCallback((opts: { src: string; aspect: number }) => {
-      const aspect = opts.aspect > 0 ? opts.aspect : 1   // naturalWidth / naturalHeight
-      // Fit box = 80% of the image in each axis. `maxFitW` is the widest the
-      // sticker can be while honouring its aspect AND staying inside that box —
-      // capping width alone let tall stickers (or small/short images) spill
-      // past the top/bottom. Default to ~15% of the image width, then clamp to
-      // [floor, maxFitW]; the 48px floor is itself capped by the fit so it
-      // can't overflow a tiny image.
+    // A sticker's size on the image (natural px), for addSticker and the
+    // drag ghost (stickerScreenSize, at the current zoom).
+    const stickerSize = useCallback((aspectIn: number) => {
+      const aspect = aspectIn > 0 ? aspectIn : 1   // naturalWidth / naturalHeight
+      // STICKER_SCREEN_W wide on screen at the current zoom (2026-11-26; 15%
+      // of the image's width before, far too big on a full-screen capture),
+      // capped to a fit box of 80% of the image in each axis. `maxFitW` is
+      // the widest the sticker can be while honouring its aspect AND staying
+      // inside that box (capping width alone let tall stickers spill past
+      // the top / bottom of a short image).
       const fitW = naturalW * 0.8
       const fitH = naturalH * 0.8
       const maxFitW = Math.min(fitW, fitH * aspect)
-      const floorW = Math.min(48, maxFitW)
-      const w = Math.round(Math.min(maxFitW, Math.max(floorW, naturalW * 0.15)))
-      const h = Math.round(w / aspect)
-      const x = Math.round((naturalW - w) / 2)
-      const y = Math.round((naturalH - h) / 2)
+      const w = Math.max(1, Math.round(Math.min(maxFitW, STICKER_SCREEN_W / (scale || 1))))
+      const h = Math.max(1, Math.round(w / aspect))
+      return { w, h }
+    }, [naturalW, naturalH, scale])
+    const stickerScreenSize = useCallback((aspect: number) => {
+      const { w, h } = stickerSize(aspect)
+      return { w: w * scale, h: h * scale }
+    }, [stickerSize, scale])
+    // Place a sticker centred on the image (or on a drop point), its own
+    // aspect preserved, then select it so the user can immediately
+    // drag/resize. Lives here (not the Editor) because the natural
+    // dimensions and selection state are local to the canvas.
+    const addSticker = useCallback((opts: { src: string; aspect: number; at?: { clientX: number; clientY: number } }) => {
+      const { w, h } = stickerSize(opts.aspect)
+      // Centred on the image, or (dropped, 2026-11-23) on the drop point,
+      // kept inside the image.
+      let x = Math.round((naturalW - w) / 2)
+      let y = Math.round((naturalH - h) / 2)
+      const stage = stageRef.current
+      if (opts.at && stage) {
+        const r = stage.container().getBoundingClientRect()
+        const cx = (opts.at.clientX - r.left) / scale, cy = (opts.at.clientY - r.top) / scale
+        x = Math.round(Math.min(Math.max(0, cx - w / 2), naturalW - w))
+        y = Math.round(Math.min(Math.max(0, cy - h / 2), naturalH - h))
+      }
       const id = uid()
       userEditedRef.current = true
       commitObjects([
@@ -874,20 +1124,66 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
         { id, type: 'sticker', src: opts.src, x, y, width: w, height: h, color: '#000000', strokeWidth: 0 },
       ])
       setSelectedId(id)
-    }, [commitObjects, naturalW, naturalH])
+    }, [commitObjects, stickerSize, scale, naturalW, naturalH])
 
     // Undo/redo are user actions too — flip the edit latch so the parent's
     // debounced save fires for them (otherwise undoing the only edit back to
     // the baseline length would look like rehydration and skip the save).
     const undoUser = useCallback(() => { userEditedRef.current = true; undo() }, [undo])
     const redoUser = useCallback(() => { userEditedRef.current = true; redo() }, [redo])
+    const goToStepUser = useCallback((i: number) => { userEditedRef.current = true; goTo(i) }, [goTo])
+
+    // ── Layers tab (2026-11-23) ─────────────────────────────────────────────
+    const selectShapes = useCallback((ids: string[], toggle = false) => {
+      const shown = ids.filter(id => objectsRef.current.some(o => o.id === id && !o.hidden))
+      setSelectedIds(prev => toggle
+        ? [...prev.filter(id => !shown.includes(id)), ...shown.filter(id => !prev.includes(id))]
+        : shown)
+    }, [])
+    // Order and visibility aren't undo steps (2026-11-23): they're written
+    // into every step (mapAllSteps), so undo / redo / a step jump keep them.
+    const reorderShapes = useCallback((ids: string[]) => {
+      const cur = objectsRef.current
+      if (ids.length !== cur.length || ids.every((id, i) => cur[i].id === id)) return
+      if (new Set(ids).size !== ids.length || !cur.every(o => ids.includes(o.id))) return
+      const rank = new Map(ids.map((id, i) => [id, i]))
+      userEditedRef.current = true
+      // In each step the shapes this order knows take its order, in the
+      // places they hold; shapes only other steps have keep their places.
+      mapAllSteps(step => {
+        const slots = step.flatMap((o, i) => (rank.has(o.id) ? [i] : []))
+        const known = slots.map(i => step[i]).sort((a, b) => rank.get(a.id)! - rank.get(b.id)!)
+        const next = [...step]
+        slots.forEach((slot, k) => { next[slot] = known[k] })
+        return next
+      })
+    }, [mapAllSteps])
+    const setShapeHidden = useCallback((id: string, hidden: boolean) => {
+      const o = objectsRef.current.find(x => x.id === id)
+      if (!o || !!o.hidden === hidden) return
+      userEditedRef.current = true
+      mapAllSteps(step => step.map(x => {
+        if (x.id !== id) return x
+        const { hidden: _drop, ...rest } = x
+        return hidden ? { ...rest, hidden: true } : rest
+      }))
+      if (hidden) setSelectedIds(prev => prev.filter(s => s !== id))
+    }, [mapAllSteps])
+    // A shape that ends up hidden (an undo, a step jump) leaves the selection.
+    useEffect(() => {
+      setSelectedIds(prev => {
+        const next = prev.filter(id => objects.some(o => o.id === id && !o.hidden))
+        return next.length === prev.length ? prev : next
+      })
+    }, [objects])
 
     // Expose imperative handle to parent
     useImperativeHandle(ref, () => ({
       undo: undoUser, redo: redoUser, clear: clearViaCommit, canUndo, canRedo,
       zoomIn, zoomOut, zoomReset, zoomLevel: userZoom,
-      toDataURL, toCanvas, toAnnotationsCanvas, getObjects, addObjects, addSticker,
-    }), [undoUser, redoUser, clearViaCommit, canUndo, canRedo, zoomIn, zoomOut, zoomReset, userZoom, toDataURL, toCanvas, toAnnotationsCanvas, getObjects, addObjects, addSticker])
+      toDataURL, toPreviewDataURL, toCanvas, toAnnotationsCanvas, getObjects, addObjects, addSticker, stickerScreenSize,
+      goToStep: goToStepUser, selectShapes, reorderShapes, setShapeHidden,
+    }), [undoUser, redoUser, clearViaCommit, canUndo, canRedo, zoomIn, zoomOut, zoomReset, userZoom, toDataURL, toPreviewDataURL, toCanvas, toAnnotationsCanvas, getObjects, addObjects, addSticker, stickerScreenSize, goToStepUser, selectShapes, reorderShapes, setShapeHidden])
 
     // ── Export trigger (legacy path — kept for Editor's workflow buttons) ────
     useEffect(() => {
@@ -903,13 +1199,14 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
     useEffect(() => {
       const tr = trRef.current
       if (!tr) return
-      if (!selectedId || textInput?.editingId === selectedId) { tr.nodes([]); tr.getLayer()?.batchDraw(); return }
       const stage = stageRef.current
-      if (!stage) return
-      const node = stage.findOne('#' + selectedId)
-      if (node) { tr.nodes([node]); tr.getLayer()?.batchDraw() }
-      else tr.nodes([])
-    }, [selectedId, objects, stickerLoadTick, textInput])
+      const ids = selectedIds.filter(id => id !== textInput?.editingId)
+      if (!stage || ids.length === 0) { tr.nodes([]); tr.getLayer()?.batchDraw(); return }
+      // Several shapes: one frame round them all (Konva's Transformer
+      // spans its nodes; dragging one moves them together).
+      tr.nodes(ids.map(id => stage.findOne('#' + id)).filter((n): n is Konva.Node => !!n))
+      tr.getLayer()?.batchDraw()
+    }, [selKey, objects, stickerLoadTick, textInput])
 
     // Switching tools drops the selection — except when the new tool is the
     // selected shape's own kind. Selecting a shape makes the Editor switch to
@@ -932,12 +1229,16 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
     // not echo back into the toolbar.
     const onSelectionChangeRef = useRef(onSelectionChange)
     useEffect(() => { onSelectionChangeRef.current = onSelectionChange }, [onSelectionChange])
+    const onSelectedIdsChangeRef = useRef(onSelectedIdsChange)
+    useEffect(() => { onSelectedIdsChangeRef.current = onSelectedIdsChange }, [onSelectedIdsChange])
     useEffect(() => {
       const cb = onSelectionChangeRef.current
       if (!cb) return
-      const obj = selectedId ? objectsRef.current.find(o => o.id === selectedId) : undefined
+      const first = selectedIdsRef.current[0]
+      const obj = first ? objectsRef.current.find(o => o.id === first) : undefined
       cb(obj ? { id: obj.id, type: obj.type, color: obj.color, strokeWidth: obj.strokeWidth } : null)
-    }, [selectedId])
+      onSelectedIdsChangeRef.current?.(selectedIdsRef.current)
+    }, [selKey])
 
     // Toolbar color / stroke-width changes while a shape is selected restyle
     // that shape (the toolbar was just synced to it, so the user is editing
@@ -952,21 +1253,19 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
       const prev = prevStyleRef.current
       prevStyleRef.current = { color, strokeWidth }
       if (prev.color === color && prev.strokeWidth === strokeWidth) return
-      if (!selectedId) return
-      const cur = objectsRef.current.find(o => o.id === selectedId)
-      // Stickers carry no style; nothing to restyle.
-      if (!cur || cur.type === 'sticker') return
-      const patch: Partial<DrawObject> = {}
-      if (cur.color !== color) patch.color = color
-      if (cur.strokeWidth !== strokeWidth) patch.strokeWidth = strokeWidth
-      if (Object.keys(patch).length === 0) return
+      // Every selected shape that carries a style (stickers don't).
+      const ids = new Set(selectedIds)
+      const targets = objectsRef.current.filter(o => ids.has(o.id) && o.type !== 'sticker')
+      if (targets.length === 0) return
+      const changed = targets.some(o => o.color !== color || o.strokeWidth !== strokeWidth)
+      if (!changed) return
       userEditedRef.current = true
-      const coalesce = styleCoalesceRef.current?.id === selectedId
+      const coalesce = styleCoalesceRef.current?.id === selKey
         && styleCoalesceRef.current.result === objectsRef.current
-      const result = objectsRef.current.map(o => (o.id === selectedId ? { ...o, ...patch } : o))
-      styleCoalesceRef.current = { id: selectedId, result }
+      const result = objectsRef.current.map(o => (ids.has(o.id) && o.type !== 'sticker' ? { ...o, color, strokeWidth } : o))
+      styleCoalesceRef.current = { id: selKey, result }
       commitObjects(result, { replace: coalesce })
-    }, [color, strokeWidth, selectedId, commitObjects])
+    }, [color, strokeWidth, selKey, commitObjects])
 
     // Track the top-right corner of the selected shape so the delete handle
     // (small red X next to the Transformer) follows the shape during drag /
@@ -975,15 +1274,20 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
     // updates during drag/transform move the Konva node directly via its ref,
     // avoiding a full canvas re-render on every mousemove.
     useEffect(() => {
-      if (!selectedId || textInput?.editingId === selectedId) { setDeleteHandle(null); return }
+      const ids = selectedIds.filter(id => id !== textInput?.editingId)
       const stage = stageRef.current
-      if (!stage) { setDeleteHandle(null); return }
-      const node = stage.findOne('#' + selectedId)
-      const layer = node?.getLayer() ?? null
-      if (!node || !layer) { setDeleteHandle(null); return }
+      if (ids.length === 0 || !stage) { setDeleteHandle(null); return }
+      const nodes = ids.map(id => stage.findOne('#' + id)).filter((n): n is Konva.Node => !!n)
+      const layer = nodes[0]?.getLayer() ?? null
+      if (nodes.length === 0 || !layer) { setDeleteHandle(null); return }
+      // At the top-right of all of them (the frame round the selection).
       const compute = () => {
-        const box = node.getClientRect({ relativeTo: layer as any })
-        return { x: box.x + box.width, y: box.y }
+        let right = -Infinity, top = Infinity
+        nodes.forEach((n, i) => {
+          const b = boxOf(ids[i], n, layer)
+          right = Math.max(right, b.x + b.width); top = Math.min(top, b.y)
+        })
+        return { x: right, y: top }
       }
       setDeleteHandle(compute())
       const update = () => {
@@ -993,33 +1297,38 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
           // The 12/scale offset mirrors the React-rendered placement below
           // (x={deleteHandle.x + 12/scale}) so the imperative move lands the
           // handle in exactly the same spot, just without a React re-render.
-          handle.position({ x: p.x + 12 / scale, y: p.y - 12 / scale })
+          handle.position({ x: p.x + DELETE_OFFSET / scale, y: p.y - DELETE_OFFSET / scale })
           handle.getLayer()?.batchDraw()
         } else {
           setDeleteHandle(p)
         }
       }
-      node.on('dragmove.deletehandle transform.deletehandle', update)
+      nodes.forEach(n => n.on('dragmove.deletehandle transform.deletehandle', update))
       return () => {
-        node.off('dragmove.deletehandle transform.deletehandle')
+        nodes.forEach(n => n.off('dragmove.deletehandle transform.deletehandle'))
       }
-    }, [selectedId, objects, baseScale, scale, textInput])
+    // boxOf reads objects, already a dependency. stickerLoadTick: a sticker's
+    // node only mounts once its picture has loaded, after it's placed and
+    // selected; without it a new sticker got no delete button (2026-11-26).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [selKey, objects, baseScale, scale, textInput, stickerLoadTick])
 
-    // ── Keyboard: Delete / Backspace removes the selected shape ──────────────
+    // ── Keyboard: the `delete` key (Delete / Backspace) removes the selection ─
     useEffect(() => {
       const onKey = (e: KeyboardEvent) => {
         const tag = (e.target as HTMLElement).tagName
         if (tag === 'INPUT' || tag === 'TEXTAREA') return
-        if ((e.key === 'Delete' || e.key === 'Backspace') && selectedId) {
+        if (matchesBinding(keysRef.current.delete, e, isMac) && selectedIds.length > 0) {
           e.preventDefault()
           userEditedRef.current = true
-          commitObjects(prev => prev.filter(o => o.id !== selectedId))
-          setSelectedId(null)
+          const ids = new Set(selectedIds)
+          commitObjects(prev => prev.filter(o => !ids.has(o.id)))
+          setSelectedIds([])
         }
       }
       window.addEventListener('keydown', onKey)
       return () => window.removeEventListener('keydown', onKey)
-    }, [selectedId, commitObjects])
+    }, [selKey, commitObjects])
 
     // ── Select / move while drawing ───────────────────────────────────────────
     // In a drawing/text tool, pressing on an existing shape never draws:
@@ -1056,8 +1365,10 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
       setIsDrawing(true)
       isDrawingRef.current = true
       drawStart.current = pos
+      penTrailRef.current = [pos.x, pos.y]
+      lastDrawPosRef.current = pos
       const base: DrawObject = { id: uid(), type: tool, color, strokeWidth }
-      if (tool === 'pen') {
+      if (isFreehand(tool)) {
         setCurrentObj({ ...base, points: [pos.x, pos.y] })
       } else if (tool === 'rect' || tool === 'blur') {
         setCurrentObj({ ...base, x: pos.x, y: pos.y, width: 0, height: 0 })
@@ -1131,7 +1442,16 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
         pendingPressRef.current = null
         if (readOnly || e.evt.button === 2) return
         if (tool === 'none') {
-          if (e.target === e.target.getStage()) setSelectedId(null)
+          // Space held: the container pans; nothing else.
+          if (dragKeyHeldRef.current || handModeRef.current) return
+          // Empty canvas (the image counts, it doesn't listen): start a
+          // selection box; a press that doesn't move just deselects.
+          if (e.target === e.target.getStage()) {
+            const raw = e.target.getStage()!.getPointerPosition()!
+            const p = { x: raw.x / scale, y: raw.y / scale }
+            const add = e.evt.shiftKey || e.evt.metaKey || e.evt.ctrlKey
+            setMarquee({ x0: p.x, y0: p.y, x1: p.x, y1: p.y, add })
+          }
           return
         }
         // Transformer anchors and the delete handle handle their own presses.
@@ -1142,10 +1462,11 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
         const raw = e.target.getStage()!.getPointerPosition()!
         const pos = { x: raw.x / scale, y: raw.y / scale }
 
+        // Only Cursor selects and moves shapes (2026-11-23): a drawing tool
+        // draws, also when the press lands on a shape. One exception: the
+        // Text tool on a text re-opens it for editing (decided on release).
         const hitId = objectIdFromTarget(e.target)
-        if (hitId) {
-          // Existing shape: a click (decided on release) selects it, a drag
-          // (decided on move) is Konva's — never a new stroke.
+        if (hitId && tool === 'text' && objectsRef.current.find(o => o.id === hitId)?.type === 'text') {
           pendingPressRef.current = { objId: hitId }
           return
         }
@@ -1161,8 +1482,67 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
       [tool, scale, readOnly, openTextEntry, startDrawing, objectIdFromTarget],
     )
 
+    // Every point the pointer passed in the current pen stroke, kept while
+    // Shift shows it as a straight line so releasing Shift brings it back.
+    const penTrailRef = useRef<number[]>([])
+    // Last pointer position of the current drawing (image coordinates), for
+    // reshaping on a Shift press without a pointer move.
+    const lastDrawPosRef = useRef({ x: 0, y: 0 })
+
+    // Reshape the shape being drawn for the pointer at `pos`. With Shift held,
+    // Pen draws one straight line from its start and both it and Arrow snap
+    // to SHIFT_SNAP_DEG steps; Rect, Blur and Ellipse keep equal sides (square, circle).
+    const updateDrawing = useCallback((pos: { x: number; y: number }, shift: boolean) => {
+      const s = drawStart.current
+      setCurrentObj(prev => {
+        if (!prev) return null
+        if (isFreehand(prev.type) || prev.type === 'arrow') {
+          let end = pos
+          if (shift) {
+            const dx = pos.x - s.x, dy = pos.y - s.y
+            const step = SHIFT_SNAP_DEG * Math.PI / 180
+            const a = Math.round(Math.atan2(dy, dx) / step) * step
+            // Project the pointer onto the snapped direction so the end
+            // follows the pointer along it.
+            const len = dx * Math.cos(a) + dy * Math.sin(a)
+            end = { x: s.x + len * Math.cos(a), y: s.y + len * Math.sin(a) }
+          }
+          if (isFreehand(prev.type) && !shift) return { ...prev, points: [...penTrailRef.current] }
+          return { ...prev, points: [s.x, s.y, end.x, end.y] }
+        }
+        let dx = pos.x - s.x, dy = pos.y - s.y
+        if (shift) {
+          const side = Math.max(Math.abs(dx), Math.abs(dy))
+          dx = Math.sign(dx || 1) * side
+          dy = Math.sign(dy || 1) * side
+        }
+        if (prev.type === 'rect' || prev.type === 'blur') {
+          return {
+            ...prev,
+            x: Math.min(s.x, s.x + dx),
+            y: Math.min(s.y, s.y + dy),
+            width: Math.abs(dx),
+            height: Math.abs(dy),
+          }
+        }
+        if (prev.type === 'ellipse') {
+          return {
+            ...prev,
+            radiusX: Math.abs(dx) / 2,
+            radiusY: Math.abs(dy) / 2,
+            x: s.x + dx / 2,
+            y: s.y + dy / 2,
+          }
+        }
+        return prev
+      })
+    }, [])
+
     const handleMouseMove = useCallback(
       (e: Konva.KonvaEventObject<MouseEvent>) => {
+        // A selection box follows the pointer from a window listener (below),
+        // also outside the image.
+        if (marqueeRef.current) return
         if (pendingPressRef.current) {
           // Pressed on a shape, Konva hasn't started dragging it yet: never
           // draw. A button released off-stage voids the press.
@@ -1172,46 +1552,33 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
         if (!isDrawing || !currentObj) return
         const raw = e.target.getStage()!.getPointerPosition()!
         const pos = { x: raw.x / scale, y: raw.y / scale }
-
-        if (currentObj.type === 'pen') {
-          setCurrentObj(prev =>
-            prev ? { ...prev, points: [...(prev.points ?? []), pos.x, pos.y] } : null,
-          )
-        } else if (currentObj.type === 'rect' || currentObj.type === 'blur') {
-          const s = drawStart.current
-          const nx = Math.min(s.x, pos.x)
-          const ny = Math.min(s.y, pos.y)
-          const nw = Math.abs(pos.x - s.x)
-          const nh = Math.abs(pos.y - s.y)
-          setCurrentObj(prev =>
-            prev ? { ...prev, x: nx, y: ny, width: nw, height: nh } : null,
-          )
-        } else if (currentObj.type === 'ellipse') {
-          const s = drawStart.current
-          setCurrentObj(prev =>
-            prev
-              ? {
-                  ...prev,
-                  radiusX: Math.abs(pos.x - s.x) / 2,
-                  radiusY: Math.abs(pos.y - s.y) / 2,
-                  x: (s.x + pos.x) / 2,
-                  y: (s.y + pos.y) / 2,
-                }
-              : null,
-          )
-        } else if (currentObj.type === 'arrow') {
-          const pts = currentObj.points ?? []
-          setCurrentObj(prev =>
-            prev ? { ...prev, points: [pts[0], pts[1], pos.x, pos.y] } : null,
-          )
-        }
+        if (isFreehand(currentObj.type)) penTrailRef.current.push(pos.x, pos.y)
+        lastDrawPosRef.current = pos
+        updateDrawing(pos, isHoldDown(keysRef.current.constrain, e.evt, heldKeysRef.current, isMac))
       },
-      [isDrawing, currentObj, scale],
+      [isDrawing, currentObj, scale, updateDrawing],
     )
+
+    // The straight-line key (`constrain`, Shift by default) pressed or
+    // released mid-drag reshapes the drawing at once, without waiting for the
+    // pointer to move.
+    useEffect(() => {
+      if (!isDrawing) return
+      const onKey = (e: KeyboardEvent) => {
+        if (e.repeat || !isHoldKeyEvent(keysRef.current.constrain, e, isMac)) return
+        updateDrawing(lastDrawPosRef.current, e.type === 'keydown')
+      }
+      window.addEventListener('keydown', onKey)
+      window.addEventListener('keyup', onKey)
+      return () => {
+        window.removeEventListener('keydown', onKey)
+        window.removeEventListener('keyup', onKey)
+      }
+    }, [isDrawing, updateDrawing])
 
     const MIN_SHAPE_SIZE = 4
     const isTrivialShape = (obj: DrawObject) => {
-      if (obj.type === 'pen') return (obj.points?.length ?? 0) < 4
+      if (isFreehand(obj.type)) return (obj.points?.length ?? 0) < 4
       if (obj.type === 'arrow') {
         const p = obj.points ?? []
         return p.length < 4 || (Math.abs(p[2] - p[0]) < MIN_SHAPE_SIZE && Math.abs(p[3] - p[1]) < MIN_SHAPE_SIZE)
@@ -1226,6 +1593,28 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
     }
 
     const handleMouseUp = useCallback(() => {
+      // A selection box: every shape it touches is selected (Finder);
+      // Shift / ⌘ add them to the selection. Under 3px on screen it was a
+      // click on empty canvas: deselect (unless adding).
+      const m = marqueeRef.current
+      if (m) {
+        marqueeRef.current = null
+        setMarquee(null)
+        const x = Math.min(m.x0, m.x1), y = Math.min(m.y0, m.y1)
+        const w = Math.abs(m.x1 - m.x0), h = Math.abs(m.y1 - m.y0)
+        if (Math.max(w, h) * scale < 3) { if (!m.add) setSelectedIds([]); return }
+        const stage = stageRef.current
+        const layer = stage?.getLayers()[0]
+        if (!stage || !layer) return
+        const hit = objectsRef.current.filter(o => {
+          const node = stage.findOne('#' + o.id)
+          if (!node) return false
+          const b = boxOf(o.id, node, layer)
+          return b.x <= x + w && b.x + b.width >= x && b.y <= y + h && b.y + b.height >= y
+        }).map(o => o.id)
+        setSelectedIds(prev => m.add ? [...prev, ...hit.filter(id => !prev.includes(id))] : hit)
+        return
+      }
       const pending = pendingPressRef.current
       if (pending) {
         pendingPressRef.current = null
@@ -1246,9 +1635,13 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
       setIsDrawing(false)
       if (isTrivialShape(currentObj)) { setCurrentObj(null); return }
       userEditedRef.current = true
-      commitObjects(prev => [...prev, currentObj])
+      // A new blur goes to the bottom of the order, under everything; the
+      // rest go on top (2026-11-23).
+      commitObjects(prev => currentObj.type === 'blur' ? [currentObj, ...prev] : [...prev, currentObj])
       setCurrentObj(null)
-    }, [isDrawing, currentObj, commitObjects, beginTextEdit])
+    // boxOf reads refs; scale for the click-vs-drag threshold.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [isDrawing, currentObj, commitObjects, beginTextEdit, scale])
 
     // Global mouseup so a shape still commits if the pointer exits the stage
     useEffect(() => {
@@ -1261,114 +1654,148 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
       return () => window.removeEventListener('mouseup', onUp)
     }, [isDrawing, handleMouseUp])
 
+    // Window point → image coordinates (may lie outside the image).
+    const clientToImage = useCallback((clientX: number, clientY: number) => {
+      const r = stageRef.current?.container().getBoundingClientRect()
+      if (!r) return { x: 0, y: 0 }
+      return { x: (clientX - r.left) / scale, y: (clientY - r.top) / scale }
+    }, [scale])
+
+    // Cursor's selection box can start anywhere in the canvas area, not only
+    // on the image (2026-11-24). Presses on the image start it in
+    // handleMouseDown; this takes the rest of the area.
+    const handleAreaMouseDown = useCallback((e: React.MouseEvent) => {
+      if (readOnly || tool !== 'none' || e.button !== 0 || dragKeyHeldRef.current || handModeRef.current) return
+      if (stageWrapRef.current?.contains(e.target as Node)) return
+      const p = clientToImage(e.clientX, e.clientY)
+      const add = e.shiftKey || e.metaKey || e.ctrlKey
+      setMarquee({ x0: p.x, y0: p.y, x1: p.x, y1: p.y, add })
+    }, [readOnly, tool, clientToImage])
+
+    // While a selection box is open it follows the pointer anywhere in the
+    // window and closes on release, wherever that happens.
+    const marqueeOn = marquee !== null
+    useEffect(() => {
+      if (!marqueeOn) return
+      const onMove = (e: MouseEvent) => {
+        if (!(e.buttons & 1)) return
+        const p = clientToImage(e.clientX, e.clientY)
+        setMarquee(m => (m ? { ...m, x1: p.x, y1: p.y } : m))
+      }
+      const onUp = (e: MouseEvent) => {
+        if (e.button !== 0) return
+        handleMouseUp()
+      }
+      window.addEventListener('mousemove', onMove)
+      window.addEventListener('mouseup', onUp)
+      return () => {
+        window.removeEventListener('mousemove', onMove)
+        window.removeEventListener('mouseup', onUp)
+      }
+    }, [marqueeOn, clientToImage, handleMouseUp])
+
     // Bake a Konva node's transient transform (drag offset + resize scale)
     // back into the persisted DrawObject geometry, then zero the node so the
     // next render — driven purely by the data — reproduces the same result
     // without double-applying. Without this, drag/resize of non-Text shapes
     // lived only on the node and was lost when the canvas re-rendered or the
     // annotations were re-serialized.
-    const bakeNodeIntoObject = useCallback((id: string, node: Konva.Node) => {
-      // node.x()/y() is the node's full position. For shapes rendered WITHOUT
-      // an x/y prop (pen, arrow — points are absolute and the node sits at the
-      // origin) this is purely the drag offset. For shapes rendered WITH an
-      // x/y prop (rect, blur, ellipse, text) node.x() already encodes the new
-      // absolute position, so it replaces the stored x/y directly.
-      const nx = node.x()
-      const ny = node.y()
-      const sx = node.scaleX()
-      const sy = node.scaleY()
+    // Write dragged / transformed nodes back into their objects, in one
+    // commit (one undo step), however many moved together (a group of
+    // selected shapes, 2026-11-23).
+    const bakeNodesIntoObjects = useCallback((entries: { id: string; node: Konva.Node }[]) => {
+      if (entries.length === 0) return
       userEditedRef.current = true
-      const obj = objectsRef.current.find(o => o.id === id)
-      // Origin-anchored shapes render their geometry in group-local coords with
-      // the node at (0,0), so node.x()/y() is a pure drag offset that must be
-      // ADDED to the stored geometry: pen/arrow (absolute points) and the blur
-      // GROUP (it carries clipX/clipY locally). x/y-prop shapes (rect, ellipse,
-      // text, and the blur PLACEHOLDER Rect) render `x={obj.x}` so node.x()
-      // already IS the new absolute x. The blur object can render either way,
-      // so disambiguate by node class — only the Group is origin-anchored.
-      const isBlurGroup = obj?.type === 'blur' && node.getClassName() === 'Group'
-      const isOriginAnchored = obj?.type === 'pen' || obj?.type === 'arrow' || isBlurGroup
+      const plans = new Map(entries.map(({ id, node }) => {
+        // node.x()/y() is the node's full position. For shapes rendered
+        // WITHOUT an x/y prop (pen, arrow: points are absolute and the node
+        // sits at the origin) it's the drag offset; for shapes WITH an x/y
+        // prop (rect, ellipse, text, sticker, the blur placeholder) it's the
+        // new absolute position.
+        const obj = objectsRef.current.find(o => o.id === id)
+        const isOriginAnchored = isFreehand(obj?.type) || obj?.type === 'arrow'
+        return [id, { node, nx: node.x(), ny: node.y(), sx: node.scaleX(), sy: node.scaleY(), isOriginAnchored }] as const
+      }))
       commitObjects(prev => prev.map(o => {
-        if (o.id !== id) return o
-        if (o.type === 'pen' || o.type === 'arrow') {
+        const p = plans.get(o.id)
+        if (!p) return o
+        const { nx, ny, sx, sy } = p
+        if (isFreehand(o.type) || o.type === 'arrow') {
           const pts = o.points ?? []
-          const next = pts.map((p, i) => i % 2 === 0 ? nx + p * sx : ny + p * sy)
-          return { ...o, points: next }
+          return { ...o, points: pts.map((v, i) => i % 2 === 0 ? nx + v * sx : ny + v * sy) }
         }
         if (o.type === 'blur') {
-          // Group: clipX/clipY are local, so add the drag offset. Placeholder
-          // Rect: node.x() is already absolute.
-          return {
-            ...o,
-            x: isBlurGroup ? nx + (o.x ?? 0) * sx : nx,
-            y: isBlurGroup ? ny + (o.y ?? 0) * sy : ny,
-            width: (o.width ?? 0) * sx,
-            height: (o.height ?? 0) * sy,
-          }
+          // Rendered from its top-left with a positive size (see renderObj);
+          // a flip during a resize turns the scale negative: keep the box
+          // normalised.
+          const w = Math.abs(o.width ?? 0) * sx, h = Math.abs(o.height ?? 0) * sy
+          return { ...o, x: w < 0 ? nx + w : nx, y: h < 0 ? ny + h : ny, width: Math.abs(w), height: Math.abs(h) }
         }
-        if (o.type === 'rect') {
-          return {
-            ...o,
-            x: nx,
-            y: ny,
-            width: (o.width ?? 0) * sx,
-            height: (o.height ?? 0) * sy,
-          }
+        if (o.type === 'rect' || o.type === 'sticker') {
+          return { ...o, x: nx, y: ny, width: (o.width ?? 0) * sx, height: (o.height ?? 0) * sy }
         }
         if (o.type === 'ellipse') {
-          return {
-            ...o,
-            x: nx,
-            y: ny,
-            radiusX: (o.radiusX ?? 0) * sx,
-            radiusY: (o.radiusY ?? 0) * sy,
-          }
+          return { ...o, x: nx, y: ny, radiusX: (o.radiusX ?? 0) * sx, radiusY: (o.radiusY ?? 0) * sy }
         }
-        if (o.type === 'text') {
-          return { ...o, x: nx, y: ny }
-        }
-        if (o.type === 'sticker') {
-          // Same as rect: x/y are absolute, scale bakes into width/height.
-          return {
-            ...o,
-            x: nx,
-            y: ny,
-            width: (o.width ?? 0) * sx,
-            height: (o.height ?? 0) * sy,
-          }
-        }
+        if (o.type === 'text') return { ...o, x: nx, y: ny }
         return o
       }))
-      // Reset the node transform — the committed data already encodes it. Scale
-      // must always be cleared (Rect/Ellipse/etc. don't pass a scale prop, so
-      // react-konva won't reset it for us). Origin-anchored nodes (pen, arrow,
-      // blur) have no x/y prop either, so reset their position to the origin or
-      // the baked-in offset would be double-applied on the next render. The
-      // blur's inner image (counter-offset during drag) also returns to local
-      // (0,0) on the data-driven re-render.
-      node.scale({ x: 1, y: 1 })
-      if (isOriginAnchored) {
-        node.position({ x: 0, y: 0 })
-        const inner = (node as Konva.Group).findOne?.('Image')
-        inner?.position({ x: 0, y: 0 })
-      }
+      // Reset the node transforms: the committed data encodes them. Scale
+      // always (no scale prop resets it); origin-anchored nodes also back
+      // to the origin, or the offset would apply twice.
+      plans.forEach(({ node, isOriginAnchored }) => {
+        node.scale({ x: 1, y: 1 })
+        if (isOriginAnchored) node.position({ x: 0, y: 0 })
+      })
     }, [commitObjects])
+    const bakeNodeIntoObject = useCallback((id: string, node: Konva.Node) => bakeNodesIntoObjects([{ id, node }]), [bakeNodesIntoObjects])
+    // A drag or transform of a selected group ends with one event per node
+    // (transform) or one for the node held (drag): bake the whole group once.
+    const groupBakedRef = useRef(false)
+    const bakeSelection = useCallback(() => {
+      if (groupBakedRef.current) return
+      groupBakedRef.current = true
+      setTimeout(() => { groupBakedRef.current = false }, 0)
+      const stage = stageRef.current
+      if (!stage) return
+      bakeNodesIntoObjects(selectedIdsRef.current
+        .map(id => ({ id, node: stage.findOne('#' + id) }))
+        .filter((e): e is { id: string; node: Konva.Node } => !!e.node))
+    }, [bakeNodesIntoObjects])
 
     // ── Per-object shape renderer ─────────────────────────────────────────────
     const selectable = tool === 'none'
+    // The grab band round a line (2026-11-23): the line as drawn on screen
+    // plus 4px (2px each side), at least 8px (6px tried), so the pointer and a press
+    // react only just before the line (it was stroke + 8px, at least 14px,
+    // fixed on screen: the move pointer showed ~6px early, and at high zoom
+    // the band was thinner than the line). In stage units.
+    const hitWidth = (sw: number) => Math.max(sw * (scale / baseScale) + 4, 8) / scale
     const renderObj = (obj: DrawObject, isPreview = false) => {
       if (isPreview && isTrivialShape(obj)) return null
       const key = isPreview ? 'preview' : obj.id
-      // Every committed shape is draggable in every tool: a press on an
-      // existing shape never starts a new stroke (see handleMouseDown), so a
-      // drag can always move it. The preview (shape being drawn) is not, and
-      // while read-only (video playing) only the cursor tool may still drag —
-      // drawing tools stay fully inert there, as before.
-      const manipulable = !isPreview && (!readOnly || selectable)
+      // Only Cursor drags shapes (2026-11-23; they were draggable in every
+      // tool, a press on one never drew): drawing tools draw over them.
+      // Holding Space turns Cursor into a pan tool: shapes ignore presses.
+      const manipulable = !isPreview && selectable && !dragKeyHeld
 
+      // A click selects the shape; ⌘-click (Ctrl on Windows) adds it to the
+      // selection or takes it out (2026-11-23).
+      const pick = (e: Konva.KonvaEventObject<MouseEvent | TouchEvent>) => {
+        if (!selectable || dragKeyHeldRef.current) return
+        const ev = e.evt as MouseEvent
+        if (ev.metaKey || ev.ctrlKey) {
+          setSelectedIds(prev => prev.includes(obj.id) ? prev.filter(id => id !== obj.id) : [...prev, obj.id])
+        } else {
+          // A plain click (Konva fires none after a drag, so dragging a
+          // group isn't one) selects just this shape, as in Finder.
+          setSelectedId(obj.id)
+        }
+      }
+      const inGroup = () => selectedIdsRef.current.length > 1 && selectedIdsRef.current.includes(obj.id)
       const commonInteractive = !isPreview && {
-        onClick: () => { if (selectable) setSelectedId(obj.id) },
-        onTap:   () => { if (selectable) setSelectedId(obj.id) },
+        onClick: pick,
+        onTap: pick,
         onMouseEnter: () => setHoverId(obj.id),
         onMouseLeave: () => setHoverId(prev => (prev === obj.id ? null : prev)),
         // A real drag is not a click → the pending press must not select /
@@ -1376,28 +1803,35 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
         onDragStart: () => { pendingPressRef.current = null },
         // Selecting on release (not mid-drag) keeps the drag itself free of
         // React work; the toolbar / tool then follow the moved shape.
+        // A selected group moves and resizes together: bake them all.
         onDragEnd: (e: Konva.KonvaEventObject<DragEvent>) => {
+          if (inGroup()) { bakeSelection(); return }
           bakeNodeIntoObject(obj.id, e.target)
           setSelectedId(obj.id)
         },
-        onTransformEnd: (e: Konva.KonvaEventObject<Event>) => bakeNodeIntoObject(obj.id, e.target),
+        onTransformEnd: (e: Konva.KonvaEventObject<Event>) => {
+          if (inGroup()) { bakeSelection(); return }
+          bakeNodeIntoObject(obj.id, e.target)
+        },
       }
 
-      if (obj.type === 'pen') {
+      if (isFreehand(obj.type)) {
+        const hl = obj.type === 'highlighter'
         return (
           <Line
             key={key}
             id={obj.id}
             points={obj.points ?? []}
             stroke={obj.color}
-            strokeWidth={obj.strokeWidth}
-            // Don't let the stage's fit-to-container scale shrink/expand
-            // strokes — strokeWidth should read as constant screen pixels
-            // across images of different natural sizes. Export still
-            // produces a stroke proportional to the image because
-            // toDataURL passes pixelRatio=1/scale.
-            strokeScaleEnabled={false}
-            hitStrokeWidth={Math.max(obj.strokeWidth + 8, 14) / scale}
+            opacity={hl ? HIGHLIGHTER_OPACITY : 1}
+            // Strokes are part of the image (2026-11-23): width in image
+            // units (strokeWidth / baseScale), scaled with the stage, so
+            // zooming shrinks and grows them with the picture. strokeWidth
+            // reads as screen px at 100% (actual size), which is also what
+            // the export draws. (They were fixed screen px at every zoom,
+            // so at 10% lines ten times too thick merged into a blob.)
+            strokeWidth={obj.strokeWidth * (hl ? HIGHLIGHTER_WIDTH : 1) / baseScale}
+            hitStrokeWidth={hitWidth(obj.strokeWidth * (hl ? HIGHLIGHTER_WIDTH : 1))}
             tension={0.5}
             lineCap="round"
             lineJoin="round"
@@ -1425,9 +1859,8 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
             // forgiving without bringing the interior back.
             fillEnabled={false}
             stroke={obj.color}
-            strokeWidth={obj.strokeWidth}
-            strokeScaleEnabled={false}
-            hitStrokeWidth={Math.max(obj.strokeWidth + 8, 14) / scale}
+            strokeWidth={obj.strokeWidth / baseScale}
+            hitStrokeWidth={hitWidth(obj.strokeWidth)}
             draggable={manipulable}
             {...commonInteractive}
           />
@@ -1437,15 +1870,17 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
         const bx = obj.x ?? 0, by = obj.y ?? 0
         const bw = obj.width ?? 0, bh = obj.height ?? 0
         const radius = blurRadiusFromStrokeWidth(obj.strokeWidth)
-        const blurredBg = blurCacheRef.current.get(radius) ?? null
-        // Video background has no pre-blurred sample — fall through to the
-        // placeholder frosted rect. (Video blur is a v1.5 feature.)
-        if (!blurredBg || bw <= 0 || bh <= 0) {
+        // Top-left and a positive size (a box dragged up or left has a
+        // negative width / height); the bake writes it back that way.
+        const left = Math.min(bx, bx + bw), top = Math.min(by, by + bh)
+        const w = Math.abs(bw), h = Math.abs(bh)
+        // Video: the placeholder frosted rect (video blur is a v1.5 feature).
+        if (background.kind !== 'image' || !bgImage || w <= 0 || h <= 0) {
           return (
             <Rect
               key={key}
               id={obj.id}
-              x={bx} y={by} width={bw} height={bh}
+              x={left} y={top} width={w} height={h}
               fill="rgba(128,128,128,0.35)"
               stroke="rgba(255,255,255,0.4)"
               dash={[4, 4]}
@@ -1454,34 +1889,59 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
             />
           )
         }
+        // One box shape (2026-11-23; it was a group clipped to the box round
+        // a blurred copy of the whole image, which nothing could click and
+        // whose frame was the whole image). Hit and frame are its rectangle
+        // (width / height; fill only feeds the hit canvas).
+        //
+        // Drawing (2026-11-23): it blurs what is already on the canvas under
+        // its box (the image, then the blurs drawn before it, since blurs
+        // come first in the layer) and paints that back into the box, so
+        // overlapping blurs add up instead of the top one replacing the
+        // others with its own blurred copy of the plain image. Read from the
+        // canvas being drawn (the screen, or an export's own canvas), in
+        // device pixels: the radius is in image px, scaled by the layer's
+        // transform. Works at any place and size, so also mid-drag / resize.
         return (
-          <Group
+          <Shape
             key={key}
             id={obj.id}
-            clipX={bx} clipY={by} clipWidth={bw} clipHeight={bh}
+            x={left} y={top} width={w} height={h}
+            fill="#000"
+            sceneFunc={(ctx, shape) => {
+              const c = (ctx as unknown as { _context: CanvasRenderingContext2D })._context
+              const m = c.getTransform()
+              const dw = shape.width() * m.a, dh = shape.height() * m.d
+              const x0 = m.e + Math.min(0, dw), y0 = m.f + Math.min(0, dh)
+              const aw = Math.abs(dw), ah = Math.abs(dh)
+              if (aw < 1 || ah < 1) return
+              // Device px per image px (the shape's own resize scale aside).
+              const unit = Math.abs(m.a / (shape.scaleX() || 1))
+              const r = radius * unit
+              // Sample a margin round the box so its edges blur with what's
+              // beside them, not with emptiness.
+              const pad = Math.ceil(r * 3)
+              const sx = Math.max(0, Math.floor(x0 - pad)), sy = Math.max(0, Math.floor(y0 - pad))
+              const ex = Math.min(c.canvas.width, Math.ceil(x0 + aw + pad)), ey = Math.min(c.canvas.height, Math.ceil(y0 + ah + pad))
+              if (ex <= sx || ey <= sy) return
+              c.save()
+              c.setTransform(1, 0, 0, 1, 0, 0)
+              c.beginPath()
+              c.rect(x0, y0, aw, ah)
+              c.clip()
+              c.filter = `blur(${r}px)`
+              c.drawImage(c.canvas, sx, sy, ex - sx, ey - sy, sx, sy, ex - sx, ey - sy)
+              c.restore()
+            }}
+            hitFunc={(ctx, shape) => {
+              ctx.beginPath()
+              ctx.rect(0, 0, shape.width(), shape.height())
+              ctx.closePath()
+              ctx.fillStrokeShape(shape)
+            }}
             draggable={manipulable}
             {...commonInteractive}
-            // The inner pre-blurred image sits at group-local (0,0) and is the
-            // size of the whole background. As the group moves, counter-offset
-            // the inner image by (-x, -y) so it stays pinned to the layer
-            // origin — that way the clip window reveals the blurred pixels
-            // NOW under the region, not those from the drag-start location.
-            // bakeNodeIntoObject (onDragEnd, via commonInteractive) then writes
-            // the new clip coords and the re-render restores the inner image
-            // to local (0,0).
-            onDragMove={e => {
-              const g = e.target as Konva.Group
-              const inner = g.findOne('Image')
-              inner?.position({ x: -g.x(), y: -g.y() })
-            }}
-          >
-            <KonvaImage
-              image={blurredBg}
-              width={naturalW}
-              height={naturalH}
-              listening={false}
-            />
-          </Group>
+          />
         )
       }
       if (obj.type === 'ellipse') {
@@ -1494,9 +1954,8 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
             radiusX={obj.radiusX ?? 0}
             radiusY={obj.radiusY ?? 0}
             stroke={obj.color}
-            strokeWidth={obj.strokeWidth}
-            strokeScaleEnabled={false}
-            hitStrokeWidth={Math.max(obj.strokeWidth + 8, 14) / scale}
+            strokeWidth={obj.strokeWidth / baseScale}
+            hitStrokeWidth={hitWidth(obj.strokeWidth)}
             fill="transparent"
             // See the rect above — outline-only hit testing matches the
             // visible outline-only fill.
@@ -1513,15 +1972,14 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
             id={obj.id}
             points={obj.points ?? []}
             stroke={obj.color}
-            strokeWidth={obj.strokeWidth}
-            strokeScaleEnabled={false}
-            hitStrokeWidth={Math.max(obj.strokeWidth + 8, 14) / scale}
+            strokeWidth={obj.strokeWidth / baseScale}
+            hitStrokeWidth={hitWidth(obj.strokeWidth)}
             fill={obj.color}
             // Arrow head size is in image-pixel units, so it shrinks
             // visually as the stage scales. Counter-scale by 1/scale to
             // keep the head consistent across image sizes.
-            pointerLength={Math.max(8, obj.strokeWidth * 3) / scale}
-            pointerWidth={Math.max(8, obj.strokeWidth * 3) / scale}
+            pointerLength={Math.max(8, obj.strokeWidth * 3) / baseScale}
+            pointerWidth={Math.max(8, obj.strokeWidth * 3) / baseScale}
             draggable={manipulable}
             {...commonInteractive}
           />
@@ -1581,22 +2039,58 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
     // size scaled to the stage, same color) so typing/editing happens in
     // place; the box is shifted up-left by its padding + 1px border so the
     // glyphs land where the shape renders.
-    const TEXT_BOX_PAD = 4
+    // More room left and right than above and below (2026-11-24).
+    const TEXT_BOX_PAD_X = 6
+    const TEXT_BOX_PAD_Y = 4
     const textEntryObj = textInput?.editingId ? objects.find(o => o.id === textInput.editingId) : undefined
     const textEntryFontPx = ((textEntryObj?.strokeWidth ?? strokeWidth) * 6 + 12) * scale
     const textEntryColor = textEntryObj?.color ?? color
+
+    // ── Highlight (History › Edits, 2026-11-23) ─────────────────────────────
+    // The hovered step's shape, outlined: its box in layer (image) units,
+    // re-measured when the shapes, the zoom or the target change.
+    const [highlightBox, setHighlightBox] = useState<{ x: number; y: number; width: number; height: number } | null>(null)
+    useEffect(() => {
+      const stage = stageRef.current
+      const node = highlightId && stage ? stage.findOne('#' + highlightId) : null
+      const layer = node?.getLayer() ?? null
+      if (!node || !layer || !highlightId) { setHighlightBox(null); return }
+      setHighlightBox(boxOf(highlightId, node, layer))
+    }, [highlightId, objects, scale])
 
     // ── Cursor ────────────────────────────────────────────────────────────────
     // Hovering a shape in a drawing/text tool shows the move cursor (drag
     // moves it, click selects it) — not while a stroke is in progress. Looked
     // up in `objects` so a deleted shape can't leave a stale cursor behind.
-    const hoverObj = hoverId && !isDrawing && tool !== 'none' ? objects.find(o => o.id === hoverId) : undefined
+    // Cursor over a shape shows the move pointer (2026-11-23): only Cursor
+    // moves shapes, so drawing tools keep their crosshair over them.
+    const hoverObj = hoverId && !isDrawing && tool === 'none' ? objects.find(o => o.id === hoverId) : undefined
+
+    // `live`: tell the window when it has to take the clicks (see the prop).
+    const interactive = !!hoverId || deleteHover || selectedIds.length > 0 || !!textInput || marquee !== null || isDrawing
+    const onInteractiveRef = useRef(onInteractiveChange)
+    onInteractiveRef.current = onInteractiveChange
+    useEffect(() => {
+      if (live) onInteractiveRef.current?.(interactive)
+    }, [live, interactive])
+    const typing = !!textInput
+    const onActivityRef = useRef(onActivityChange)
+    onActivityRef.current = onActivityChange
+    useEffect(() => {
+      onActivityRef.current?.({ drawing: isDrawing, typing })
+    }, [isDrawing, typing])
     const cursor = isPanningState ? 'grabbing'
-      : spaceHeld ? 'grab'
+      : dragKeyHeld ? 'grab'
       : readOnly ? 'default'
+      // The delete X is a control: the arrow, whatever the tool (2026-11-23;
+      // a drawing tool's crosshair showed over it).
+      : deleteHover ? 'default'
       : hoverObj ? 'move'
-      : tool === 'pen' ? 'crosshair'
+      : handMode ? 'grab'
+      : isFreehand(tool) ? 'crosshair'
       : tool === 'text' ? 'text'
+      // Cursor on empty canvas: the arrow (a drag draws a selection box);
+      // Space turns it into the hand (above).
       : tool === 'none' ? 'default'
       : 'crosshair'
 
@@ -1609,14 +2103,34 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
       <div
         ref={containerRef}
         className="w-full h-full relative overflow-hidden"
-        style={{ cursor: isPanningState ? 'grabbing' : spaceHeld ? 'grab' : undefined }}
+        style={{ cursor: isPanningState ? 'grabbing' : dragKeyHeld || handMode ? 'grab' : undefined }}
+        onMouseDown={handleAreaMouseDown}
       >
-        <div style={{
+        {/* The background frame, behind the image: the padding
+            around it at the current zoom, moving with the pan. */}
+        {frame && frameBox && (
+          <div
+            aria-hidden="true"
+            style={{
+              position: 'absolute',
+              ...frameBox,
+              background: frame.css,
+              pointerEvents: 'none',
+            }}
+          />
+        )}
+        <div ref={stageWrapRef} style={{
           position: 'absolute',
-          left: (containerSize.w - stageWidth) / 2 + panOffset.x,
-          top:  (containerSize.h - stageHeight) / 2 + panOffset.y,
+          left: stageLeft,
+          top:  stageTop,
           width: stageWidth,
           height: stageHeight,
+          // The Background frame's shadow on screen, at the zoom
+          // (2026-11-25); drop-shadow follows the image's alpha like the
+          // export's canvas shadow.
+          ...(frameOn && frame?.shadow
+            ? { filter: `drop-shadow(0 ${frame.shadow.offsetY * scale}px ${frame.shadow.blur * scale}px rgba(0,0,0,${frame.shadow.alpha}))` }
+            : {}),
         }}>
           <Stage
             ref={stageRef}
@@ -1639,29 +2153,68 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
                   listening={false}
                 />
               )}
-              {objects.map(obj => renderObj(obj))}
-              {currentObj && renderObj(currentObj, true)}
+              {/* Every shape in its order (2026-11-23): a blur blurs what is
+                  under it, so one moved above a shape (Layers tab) blurs that
+                  shape too. New blurs start at the bottom (see the commit),
+                  so by default they still sit under the drawings. A blur
+                  being drawn shows there too; other shapes on top. Hidden
+                  shapes aren't drawn at all. */}
+              {currentObj?.type === 'blur' && renderObj(currentObj, true)}
+              {objects.filter(o => !o.hidden).map(obj => renderObj(obj))}
+              {currentObj && currentObj.type !== 'blur' && renderObj(currentObj, true)}
+              {/* The highlight: the selection frame's box exactly (2026-11-23;
+                  it was 4px bigger with a 2px line and round corners): a 1px
+                  accent line on the shape's box and a faint accent wash,
+                  never clickable. */}
+              {highlightBox && (
+                <Group id="__highlight__" listening={false}>
+                  <Rect
+                    x={highlightBox.x}
+                    y={highlightBox.y}
+                    width={highlightBox.width}
+                    height={highlightBox.height}
+                    fill={role.accent}
+                    opacity={0.12}
+                  />
+                  <Rect
+                    x={highlightBox.x}
+                    y={highlightBox.y}
+                    width={highlightBox.width}
+                    height={highlightBox.height}
+                    stroke={role.accent}
+                    strokeWidth={1}
+                    strokeScaleEnabled={false}
+                  />
+                </Group>
+              )}
               <Transformer
                 ref={trRef}
                 rotateEnabled={false}
                 // Stickers resize from the corners with locked aspect ratio so
                 // the artwork never distorts; other shapes keep free resize.
-                keepRatio={objects.find(o => o.id === selectedId)?.type === 'sticker'}
+                keepRatio={objects.some(o => selectedIds.includes(o.id) && o.type === 'sticker')}
                 enabledAnchors={
-                  objects.find(o => o.id === selectedId)?.type === 'sticker'
+                  objects.some(o => selectedIds.includes(o.id) && o.type === 'sticker')
                     ? ['top-left', 'top-right', 'bottom-left', 'bottom-right']
                     : undefined
                 }
-                borderStroke="#a78bfa"
-                anchorStroke="#a78bfa"
-                anchorFill="#ffffff"
+                borderStroke={role.accent}
+                anchorStroke={role.accent}
+                anchorFill={role.elevated}
                 anchorSize={8}
               />
-              {/* Click-to-delete handle. Mirrors the X on the live
-                  recording-time annotation overlay so both selection
-                  surfaces feel the same. Sits just outside the
-                  Transformer's top-right anchor to avoid overlapping it. */}
-              {deleteHandle && selectedId && (
+              {/* Click-to-delete handle, just outside the Transformer's
+                  top-right anchor. Styled like a framed button (2026-11-23):
+                  a 16px trash icon in a 32px circle on elevated with a 1px
+                  line-strong edge inside
+                  it (line was lost against the image; line-strong is what
+                  the cards' hover buttons use over media),
+                  its edge 7px off the corner handle (the callout gap),
+                  the icon red at rest (danger-text, Jasper 2026-11-23; grey
+                  first), 1px lines as our icons draw; under the pointer the
+                  fill steps to elevated-hover and the icon to
+                  danger-text-hover. No shadow. */}
+              {deleteHandle && selectedIds.length > 0 && (
                 // Counter-scale the handle so it stays the same size on
                 // screen no matter how the stage was scaled to fit the
                 // image. The offset from the shape's corner uses 1/scale
@@ -1670,32 +2223,57 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
                 <Group
                   id="__delete_handle__"
                   ref={deleteHandleRef}
-                  x={deleteHandle.x + 12 / scale}
-                  y={deleteHandle.y - 12 / scale}
+                  x={deleteHandle.x + DELETE_OFFSET / scale}
+                  y={deleteHandle.y - DELETE_OFFSET / scale}
                   scaleX={1 / scale}
                   scaleY={1 / scale}
                   onClick={(e) => {
                     e.cancelBubble = true
-                    // Reset the cursor here — clicking the X destroys the group
-                    // before Konva fires mouseLeave, so 'pointer' would stick.
-                    document.body.style.cursor = ''
+                    // Clicking the X removes it before Konva fires mouseLeave:
+                    // drop the hover here, or the next handle starts hovered.
+                    setDeleteHover(false)
                     userEditedRef.current = true
-                    commitObjects(prev => prev.filter(o => o.id !== selectedId))
-                    setSelectedId(null)
+                    const ids = new Set(selectedIdsRef.current)
+                    commitObjects(prev => prev.filter(o => !ids.has(o.id)))
+                    setSelectedIds([])
                   }}
                   onTap={(e) => {
                     e.cancelBubble = true
-                    document.body.style.cursor = ''
+                    setDeleteHover(false)
                     userEditedRef.current = true
-                    commitObjects(prev => prev.filter(o => o.id !== selectedId))
-                    setSelectedId(null)
+                    const ids = new Set(selectedIdsRef.current)
+                    commitObjects(prev => prev.filter(o => !ids.has(o.id)))
+                    setSelectedIds([])
                   }}
-                  onMouseEnter={() => { document.body.style.cursor = 'pointer' }}
-                  onMouseLeave={() => { document.body.style.cursor = '' }}
+                  // The arrow pointer, as on every control (macOS cursor rules).
+                  onMouseEnter={() => setDeleteHover(true)}
+                  onMouseLeave={() => setDeleteHover(false)}
                 >
-                  <Circle radius={11} fill="#ef4444" stroke="#ffffff" strokeWidth={2} shadowColor="#000" shadowBlur={6} shadowOpacity={0.4} />
-                  <Line points={[-4, -4, 4, 4]} stroke="#ffffff" strokeWidth={2} lineCap="round" />
-                  <Line points={[-4, 4, 4, -4]} stroke="#ffffff" strokeWidth={2} lineCap="round" />
+                  {/* Hit area 4px wider than the drawn circle, invisible: a
+                      cursor touches things only at its hotspot (the
+                      crosshair's centre), while its drawn arms reach further,
+                      so the X switched to the arrow only after the cross
+                      already overlapped it (2026-11-23). Still 3px clear of
+                      the corner resize handle. */}
+                  <Circle radius={DELETE_R + DELETE_HIT_PAD} fill="transparent" />
+                  <Circle radius={DELETE_R} fill={deleteHover ? role['elevated-hover'] : role.elevated} />
+                  <Circle radius={DELETE_R - 0.5} stroke={role['line-strong']} strokeWidth={1} />
+                  {/* Lucide's Trash2 (2026-11-23; was an X), 16px like an
+                      icon button's, 1px lines like the Icon component's. */}
+                  <Path
+                    data={TRASH_PATH}
+                    x={-DELETE_ICON / 2}
+                    y={-DELETE_ICON / 2}
+                    scaleX={DELETE_ICON / 24}
+                    scaleY={DELETE_ICON / 24}
+                    stroke={deleteHover ? role['danger-text-hover'] : role['danger-text']}
+                    strokeWidth={1}
+                    strokeScaleEnabled={false}
+                    fillEnabled={false}
+                    lineCap="round"
+                    lineJoin="round"
+                    listening={false}
+                  />
                 </Group>
               )}
             </Layer>
@@ -1710,7 +2288,7 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
           {textInput && (
             <div
               className="absolute z-10"
-              style={{ left: textInput.screenX - TEXT_BOX_PAD - 1, top: textInput.screenY - TEXT_BOX_PAD - 1 }}
+              style={{ left: textInput.screenX - TEXT_BOX_PAD_X - 1, top: textInput.screenY - TEXT_BOX_PAD_Y - 1 }}
               onMouseDown={e => e.stopPropagation()}
             >
               <textarea
@@ -1762,25 +2340,41 @@ const AnnotationCanvas = forwardRef<CanvasHandle, Props>(
                 // line breaks are the ones the user typed. fieldSizing: content
                 // grows the box with the text in both axes (Chromium 123+).
                 // lineHeight 1 matches Konva's default line height.
-                className="block bg-slate-900/70 border border-primary/50 rounded-md outline-none min-w-[160px] backdrop-blur-sm shadow-lg resize-none overflow-hidden"
+                // Drawn like a selected shape's Transformer frame (no fill,
+                // 1px solid accent, square corners) so typing looks like the
+                // committed text, selected, with a caret (2026-11-24).
+                // text-entry-font: Manrope with tighter ascent / descent so
+                // the caret isn't taller than the line (index.css).
+                className="block bg-transparent border border-accent outline-none resize-none overflow-hidden text-entry-font"
                 style={{
-                  fontFamily: 'Manrope, sans-serif',
                   fontWeight: 700,
                   fontSize: textEntryFontPx,
                   lineHeight: 1,
                   color: textEntryColor,
-                  padding: TEXT_BOX_PAD,
+                  padding: `${TEXT_BOX_PAD_Y}px ${TEXT_BOX_PAD_X}px`,
                   whiteSpace: 'pre',
                   fieldSizing: 'content',
                 }}
-                placeholder="Type…"
               />
-              <div className="mt-1 inline-block rounded bg-slate-900/80 px-1.5 py-1 text-[11px] leading-none text-white/80 whitespace-nowrap select-none">
-                Enter confirm · Shift+Enter new line · Esc cancel
-              </div>
+              {/* No placeholder: the caret in the empty box is the hint
+                  (2026-11-24; a "Type…" span until then). */}
             </div>
           )}
         </div>
+        {/* The selection box (Cursor's drag): a 1px accent line and a faint
+            accent wash, as the Dashboard's. Drawn over the whole area, not in
+            the stage, so it isn't clipped to the image (2026-11-24). */}
+        {marquee && (
+          <div
+            className="absolute z-20 rounded-sm border border-accent bg-accent/15 pointer-events-none"
+            style={{
+              left: (containerSize.w - stageWidth) / 2 + panOffset.x + Math.min(marquee.x0, marquee.x1) * scale,
+              top: (containerSize.h - stageHeight) / 2 + panOffset.y + Math.min(marquee.y0, marquee.y1) * scale,
+              width: Math.abs(marquee.x1 - marquee.x0) * scale,
+              height: Math.abs(marquee.y1 - marquee.y0) * scale,
+            }}
+          />
+        )}
       </div>
     )
   },

@@ -1,8 +1,10 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { createPortal } from 'react-dom'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 
+import { Icon } from './Icon'
+import { ICON_BUTTON, ACCENT_ICON_BUTTON } from './button-classes'
+import { paintStrip, type StripSprite } from '../lib/filmstrip-build'
 /** Format ms as m:ss.cc. Every time in the bar uses it: hundredths so a
- *  single-frame step (≈17 ms at 60 fps) visibly changes the readout. */
+ *  single-frame step (≈33 ms at the recorder's 30 fps) visibly changes the readout. */
 export function formatPlayheadTime(ms: number): string {
   const totalCs = Math.max(0, Math.round(ms / 10))
   const cs = totalCs % 100
@@ -20,125 +22,35 @@ export function formatDuration(ms: number): string {
 }
 
 /** Track height in CSS px — the filmstrip is drawn at this height (tall
- *  enough for the frames to be readable). Tile width follows from it. */
-const TRACK_HEIGHT_PX = 70
+ *  enough for the frames to be readable). Tile width follows from it.
+ *  60 (2026-11-23, was 70): with the 6px overhang above and below, the
+ *  frame is as tall as the 72px button stacks either side. */
+const TRACK_HEIGHT_PX = 60
 /** Landing bracket: 12px wide, 2px taller than the track at each end. */
 const BRACKET_W = 12
 const BRACKET_H = TRACK_HEIGHT_PX + 4
-/** Upper bound on filmstrip tiles, whatever the window width. */
-const MAX_FILMSTRIP_FRAMES = 40
-
-/** Paint evenly spaced frames of `src` side by side into `canvasRef` (one
- *  ~16:9 tile per slot, cover-cropped), sized to the track's `widthPx`.
- *
- *  Drawn straight onto a canvas rather than turned into <img> data URLs on
- *  purpose: lumia-media:// is cross-origin to the renderer, so a canvas that
- *  receives a video frame is tainted and toDataURL() throws. A tainted canvas
- *  can still be DISPLAYED — it just can't be read back — which is all a
- *  filmstrip needs, and it avoids opening the protocol to CORS reads.
- *
- *  Uses its own throwaway <video> (one seek per tile) so the user's player is
- *  never disturbed, and drops the decoder when done. Tiles are painted into
- *  an offscreen canvas and copied over: progressively on the first build, in
- *  one go on a rebuild after a resize so the old strip stays up meanwhile. */
-function useFilmstrip(
-  canvasRef: React.RefObject<HTMLCanvasElement | null>,
-  src: string | undefined,
-  durationMs: number,
-  widthPx: number,
-) {
-  const paintedRef = useRef(false)
-  useEffect(() => {
-    paintedRef.current = false
-    const c = canvasRef.current
-    if (c) { c.width = 0; c.height = 0 }
-  }, [src, canvasRef])
-  useEffect(() => {
-    const visible = canvasRef.current
-    if (!visible || !src || durationMs <= 0 || widthPx <= 0) return
-    let cancelled = false
-    const progressive = !paintedRef.current
-    const dpr = Math.min(2, window.devicePixelRatio || 1)
-    const W = Math.round(widthPx * dpr)
-    const H = Math.round(TRACK_HEIGHT_PX * dpr)
-    const count = Math.min(MAX_FILMSTRIP_FRAMES, Math.max(1, Math.ceil(widthPx / (TRACK_HEIGHT_PX * 16 / 9))))
-    const off = document.createElement('canvas')
-    off.width = W
-    off.height = H
-    const ctx = off.getContext('2d')
-    const v = document.createElement('video')
-    v.muted = true
-    v.preload = 'auto'
-
-    const present = () => {
-      if (visible.width !== W || visible.height !== H) { visible.width = W; visible.height = H }
-      visible.getContext('2d')?.drawImage(off, 0, 0)
-    }
-    const seekTo = (sec: number) => new Promise<boolean>((resolve) => {
-      const timer = setTimeout(() => { v.removeEventListener('seeked', onSeeked); resolve(false) }, 3000)
-      const onSeeked = () => { clearTimeout(timer); resolve(true) }
-      v.addEventListener('seeked', onSeeked, { once: true })
-      v.currentTime = sec
-    })
-
-    const run = async () => {
-      await new Promise<void>((resolve, reject) => {
-        v.addEventListener('loadeddata', () => resolve(), { once: true })
-        v.addEventListener('error', () => reject(new Error(v.error?.message || 'load failed')), { once: true })
-        v.src = src
-      })
-      if (!ctx || cancelled) return
-      const vw = v.videoWidth || 16
-      const vh = v.videoHeight || 9
-      for (let i = 0; i < count && !cancelled; i++) {
-        // Sample the middle of each slot so the first/last tiles aren't
-        // pinned to the very start/end (often a blank or the stop click).
-        const ok = await seekTo(((i + 0.5) / count) * durationMs / 1000)
-        if (cancelled) return
-        if (!ok) continue
-        const x0 = Math.round((i * W) / count)
-        const x1 = Math.round(((i + 1) * W) / count)
-        const tw = x1 - x0
-        // Cover-crop the frame into the tile.
-        const k = Math.max(tw / vw, H / vh)
-        const sw = tw / k
-        const sh = H / k
-        ctx.drawImage(v, (vw - sw) / 2, (vh - sh) / 2, sw, sh, x0, 0, tw, H)
-        if (i > 0) { ctx.fillStyle = 'rgba(0,0,0,0.35)'; ctx.fillRect(x0, 0, Math.max(1, Math.round(dpr)), H) }
-        if (progressive) present()
-      }
-      if (!cancelled) { present(); paintedRef.current = true }
-    }
-    run().catch((err) => { console.warn('[filmstrip] could not build frames', err) }).finally(() => {
-      v.removeAttribute('src')
-      v.load() // release the media pipeline right away
-    })
-    return () => { cancelled = true }
-  }, [canvasRef, src, durationMs, widthPx])
-}
-
-/** Shown in the middle of the bottom row. */
-const INLINE_SHORTCUTS: readonly (readonly [keys: readonly string[], label: string])[] = [
-  [['D'], 'Start'],
-  [['F'], 'End'],
-  [['←', '→'], 'Frame'],
-  [['Shift', '←', '→'], '10 Frames'],
-  [['Space'], 'Play'],
-]
+// The video editor's keys (Editor.tsx handles them) are in
+// src/lib/editor-keys.ts and changeable in Settings › Hotkeys (2026-11-24).
 
 /** Shortest selection the bar lets you make — matches MIN_TRIM_MS in main. */
 export const MIN_TRIM_SELECTION_MS = 500
 
 interface TrackProps {
-  /** Playable URL of the ORIGINAL recording — the filmstrip source. */
-  videoSrc?: string
+  /** The filmstrip of the ORIGINAL recording (hooks/useFilmstrip.ts), or
+   *  null while there is none yet: the track is empty until then. */
+  filmstrip: StripSprite | null
   durationMs: number
   currentMs: number
   startMs: number
   endMs: number
   onChange: (startMs: number, endMs: number) => void
   onSeek: (ms: number) => void
+  /** While a handle is dragged, the video shows that handle's frame
+   *  (2026-11-23); `null` when the drag ends: back to the playhead. */
+  onPreview: (ms: number | null) => void
   disabled: boolean
+  /** The video is playing: the playhead shows its time bubble. */
+  playing: boolean
 }
 
 interface ActionsProps {
@@ -156,36 +68,71 @@ interface ActionsProps {
   disabled: boolean
   onApply: () => void
   onReset: () => void
+  /** Our own player controls (2026-11-22; the native ones are gone). */
+  playing: boolean
+  onTogglePlay: () => void
+  muted: boolean
+  /** The recording has sound: only then is Mute shown. */
+  hasAudio: boolean
+  onToggleMute: () => void
 }
 
 type DragTarget = 'start' | 'end' | 'seek'
 
+/** A time over a point of the track, in the tooltip's styling with a
+ *  little triangle pointing down at it (like QuickTime Player). It sits
+ *  above the handles' 6px overhang, out into the video area. */
+function TimeBubble({ left, ms }: { left: string; ms: number }) {
+  return (
+    <div
+      className="absolute bottom-full mb-[13px] -translate-x-1/2 z-30 pointer-events-none px-2 py-1 rounded-md bg-tooltip ring-1 ring-inset ring-tooltip-ring text-on-tooltip text-xs font-medium tabular-nums whitespace-nowrap"
+      style={{ left }}
+    >
+      {formatPlayheadTime(ms)}
+      {/* The triangle: the ring colour, with the fill 1px inside it; both
+          start on the bubble's 1px inset edge, which the fill opens. */}
+      <span className="absolute left-1/2 top-full -mt-px -translate-x-1/2 w-0 h-0 border-x-[6px] border-x-transparent border-t-[6px] border-t-tooltip-ring" />
+      <span className="absolute left-1/2 top-full -mt-[2px] -translate-x-1/2 w-0 h-0 border-x-[5px] border-x-transparent border-t-[5px] border-t-tooltip" />
+    </div>
+  )
+}
+
 /** The filmstrip, two handles for the trim range, a playhead, and the area
  *  outside the selection dimmed. */
 function TrimTrack({
-  videoSrc, durationMs, currentMs, startMs, endMs, onChange, onSeek, disabled,
+  filmstrip, durationMs, currentMs, startMs, endMs, onChange, onSeek, onPreview, disabled, playing,
 }: TrackProps) {
   const trackRef = useRef<HTMLDivElement | null>(null)
   const dragRef = useRef<DragTarget | null>(null)
+  // The same, as state, for the time bubbles (2026-11-22).
+  const [dragging, setDragging] = useState<DragTarget | null>(null)
   /** Where in the handle it was grabbed (ms from the handle's edge), so the
    *  handle doesn't jump to put its edge under the cursor. */
   const grabOffsetRef = useRef(0)
   const pct = (ms: number) => (durationMs > 0 ? (ms / durationMs) * 100 : 0)
 
-  // The filmstrip is rebuilt when the track width settles after a resize.
+  // The filmstrip is drawn from the recording's saved strip (2026-11-27; it
+  // used to decode every frame again at each open, one seek per tile, and
+  // show them one by one): one paint, before the bar's first frame when the
+  // strip is there, and again at every width (cheap, so a resize needs no
+  // settling wait). Measured and painted in layout effects for that.
   const filmstripRef = useRef<HTMLCanvasElement | null>(null)
   const [trackWidth, setTrackWidth] = useState(0)
-  useEffect(() => {
+  useLayoutEffect(() => {
     const el = trackRef.current
     if (!el) return
-    let timer: ReturnType<typeof setTimeout> | undefined
     const measure = () => setTrackWidth(el.clientWidth)
     measure()
-    const ro = new ResizeObserver(() => { clearTimeout(timer); timer = setTimeout(measure, 250) })
+    const ro = new ResizeObserver(measure)
     ro.observe(el)
-    return () => { clearTimeout(timer); ro.disconnect() }
+    return () => ro.disconnect()
   }, [])
-  useFilmstrip(filmstripRef, videoSrc, durationMs, trackWidth)
+  useLayoutEffect(() => {
+    const canvas = filmstripRef.current
+    if (!canvas) return
+    if (!filmstrip || trackWidth <= 0) { canvas.width = 0; canvas.height = 0; return }
+    paintStrip(canvas, filmstrip, trackWidth, TRACK_HEIGHT_PX)
+  }, [filmstrip, trackWidth])
 
   // Not clamped to the track: the handles sit just outside it at the ends,
   // and applyDrag clamps every target anyway.
@@ -214,7 +161,7 @@ function TrimTrack({
   }, [startMs, endMs, durationMs, currentMs, onChange, onSeek])
 
   const onPointerDown = (target: DragTarget) => (e: React.PointerEvent) => {
-    if (disabled || e.button !== 0) return // right-click opens the menu instead
+    if (disabled || e.button !== 0) return // left button only (the right-click menu was removed, 2026-11-23)
     e.stopPropagation()
     e.preventDefault()
     const ms = msAt(e.clientX)
@@ -226,6 +173,7 @@ function TrimTrack({
       else if (ms > endMs) target = 'end'
     }
     dragRef.current = target
+    setDragging(target)
     try { (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId) } catch { /* ignore */ }
     applyDrag(target, ms - grabOffsetRef.current)
   }
@@ -234,16 +182,26 @@ function TrimTrack({
     // The button is up but no pointerup reached us: Electron drops it when
     // the release happens over a window drag region (title bar) or outside
     // the window. End the drag instead of following a cursor that let go.
-    if ((e.buttons & 1) === 0) { dragRef.current = null; return }
+    if ((e.buttons & 1) === 0) { dragRef.current = null; setDragging(null); return }
     applyDrag(dragRef.current, msAt(e.clientX) - grabOffsetRef.current)
   }
-  const onPointerUp = () => { dragRef.current = null }
+  const onPointerUp = () => { dragRef.current = null; setDragging(null) }
+  // The video follows a dragged handle, and returns to the playhead after.
+  const previewMs = dragging === 'start' ? startMs : dragging === 'end' ? endMs : null
+  useEffect(() => { onPreview(previewMs) }, [previewMs, onPreview])
   // Also end it if the capture is lost or the window loses focus mid-drag.
   useEffect(() => {
-    const end = () => { dragRef.current = null }
+    const end = () => { dragRef.current = null; setDragging(null) }
     window.addEventListener('blur', end)
     return () => window.removeEventListener('blur', end)
   }, [])
+
+  // The strip's corners are rounded, except on a side whose handle has come
+  // within its own width (12px) of that end: its straight inner edge would
+  // leave a gap against the curve (2026-11-22).
+  const squareLeft = trackWidth > 0 && (pct(startMs) / 100) * trackWidth < BRACKET_W
+  const squareRight = trackWidth > 0 && (1 - pct(endMs) / 100) * trackWidth < BRACKET_W
+  const corners = `${squareLeft ? 'rounded-l-none' : 'rounded-l-md'} ${squareRight ? 'rounded-r-none' : 'rounded-r-md'}`
 
   // Hovering outside the selection previews where a click would put the
   // nearest handle. Hidden over the handles themselves and while dragging.
@@ -254,58 +212,20 @@ function TrimTrack({
     setHoverMs(disabled || dragRef.current || overHandle ? null : msAt(e.clientX))
   }
 
-  // Right-click menu: "Start here" / "End here" at the clicked spot.
-  const [menu, setMenu] = useState<{ x: number; y: number; ms: number } | null>(null)
-  const menuRef = useRef<HTMLDivElement | null>(null)
-  const onContextMenu = (e: React.MouseEvent) => {
-    e.preventDefault()
-    if (disabled || durationMs <= 0) return
-    const ms = Math.min(durationMs, Math.max(0, msAt(e.clientX)))
-    setMenu({ x: e.clientX, y: e.clientY, ms })
-  }
-  useEffect(() => {
-    if (!menu) return
-    const close = () => setMenu(null)
-    const onDown = (e: MouseEvent) => { if (!menuRef.current?.contains(e.target as Node)) close() }
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') { e.preventDefault(); close() } }
-    window.addEventListener('mousedown', onDown)
-    window.addEventListener('keydown', onKey, true)
-    window.addEventListener('resize', close)
-    window.addEventListener('blur', close)
-    return () => {
-      window.removeEventListener('mousedown', onDown)
-      window.removeEventListener('keydown', onKey, true)
-      window.removeEventListener('resize', close)
-      window.removeEventListener('blur', close)
-    }
-  }, [menu])
-  // Opens up from the cursor; nudged left if it would run off the right edge.
-  useLayoutEffect(() => {
-    const el = menuRef.current
-    if (!menu || !el) return
-    const overflow = el.getBoundingClientRect().right - (window.innerWidth - 8)
-    if (overflow > 0) el.style.left = `${menu.x - overflow}px`
-  }, [menu])
-  const canStartAt = (ms: number) => ms <= endMs - MIN_TRIM_SELECTION_MS
-  const canEndAt = (ms: number) => ms >= startMs + MIN_TRIM_SELECTION_MS
-  const pickFromMenu = (target: 'start' | 'end') => {
-    if (menu) applyDrag(target, menu.ms)
-    setMenu(null)
-  }
-  // Hidden while the menu is open.
-  const landing = hoverMs === null || menu ? null
+  const landing = hoverMs === null ? null
     : hoverMs < startMs ? { ms: Math.max(0, hoverMs), side: 'start' as const }
     : hoverMs > endMs ? { ms: Math.min(durationMs, hoverMs), side: 'end' as const }
     : null
 
   return (
     // 16px side margin: room for the handles, which stick out 12px past the
-    // strip's ends. 12px above it and 6px below: the frame bars overhang it
-    // by 6px, so they keep 6px clear of the edge and of the row below.
-    <div className="relative px-4 pt-3 pb-1.5">
+    // strip's ends. 6px above and below: the frame bars overhang it by 6px.
+    <div className="relative px-4 py-1.5">
       <div
         ref={trackRef}
-        className={`relative bg-white/[0.04] ${disabled ? 'opacity-50' : 'cursor-pointer'}`}
+        // Rounded 6px (2026-11-22): on the strip's own layers, not with
+        // overflow-hidden here, which would clip the handles and bubbles.
+        className={`relative bg-content ${corners}`}
         style={{ height: TRACK_HEIGHT_PX }}
         onPointerDown={onPointerDown('seek')}
         onPointerMove={onTrackPointerMove}
@@ -313,20 +233,37 @@ function TrimTrack({
         onPointerUp={onPointerUp}
         onPointerCancel={onPointerUp}
         onLostPointerCapture={onPointerUp}
-        onContextMenu={onContextMenu}
       >
-        {/* Filmstrip — evenly spaced frames of the original recording */}
+        {/* Filmstrip: evenly spaced frames of the original recording */}
         <canvas
           ref={filmstripRef}
-          className="absolute inset-0 w-full h-full pointer-events-none"
+          className={`absolute inset-0 w-full h-full pointer-events-none ${corners}`}
           aria-hidden="true"
         />
-        {/* Dimmed regions outside the selection */}
-        <div className="absolute inset-y-0 left-0 bg-black/65 pointer-events-none" style={{ width: `${pct(startMs)}%` }} />
-        <div className="absolute inset-y-0 right-0 bg-black/65 pointer-events-none" style={{ width: `${100 - pct(endMs)}%` }} />
-        {/* Selection frame */}
+        {/* Outside the selection: darkened in dark mode (70% black), lightened
+            in light mode (70% white), so the cut-off frames sink into the bar
+            (2026-11-22; dark was 65% black, then washed white and undone). */}
+        <div className={`absolute inset-y-0 left-0 ${squareLeft ? '' : 'rounded-l-md'} bg-black/70 in-[.light]:bg-white/70 pointer-events-none`} style={{ width: `${pct(startMs)}%` }} />
+        <div className={`absolute inset-y-0 right-0 ${squareRight ? '' : 'rounded-r-md'} bg-black/70 in-[.light]:bg-white/70 pointer-events-none`} style={{ width: `${100 - pct(endMs)}%` }} />
+        {/* The strip's edge (2026-11-22): a 1px `line-subtle` ring just
+            outside the strip, on the bar (an inset one over the frames read
+            too strong: the see-through line let the frames shine through).
+            The purple frame's bars and the handles cover it where the
+            selection is; its corners follow the strip's. */}
+        <div className={`absolute inset-0 ring-1 ring-line-subtle pointer-events-none ${corners}`} />
+        {/* Playhead: a thin red line, 2px `danger` (Jasper, 2026-11-22).
+            Tried before: white, white with a dark edge, accent 2 / 3 / 4px
+            with white or line-strong edges. Under the purple frame and
+            handles. */}
         <div
-          className="absolute -top-1.5 -bottom-1.5 border-y-[6px] border-tertiary pointer-events-none"
+          className="absolute inset-y-0 w-0.5 bg-danger pointer-events-none"
+          style={{ left: `${pct(currentMs)}%` }}
+        />
+        {/* Selection frame */}
+        {/* The purple frame: plain accent bars, no shadow (2026-11-23,
+            shadows tried and dropped). */}
+        <div
+          className="absolute -top-1.5 -bottom-1.5 border-y-[6px] border-accent pointer-events-none"
           style={{ left: `${pct(startMs)}%`, width: `${pct(endMs) - pct(startMs)}%` }}
         />
         {/* Where a click would land the nearest handle, drawn as a bracket
@@ -339,7 +276,7 @@ function TrimTrack({
              borders can't round the open ends. */}
         {landing && (
           <svg
-            className={`absolute -top-0.5 text-tertiary pointer-events-none ${landing.side === 'end' ? '-scale-x-100' : ''}`}
+            className={`absolute -top-0.5 text-accent pointer-events-none ${landing.side === 'end' ? '-scale-x-100' : ''}`}
             width={BRACKET_W}
             height={BRACKET_H}
             viewBox={`0 0 ${BRACKET_W} ${BRACKET_H}`}
@@ -366,7 +303,7 @@ function TrimTrack({
             aria-valuemin={0}
             aria-valuemax={durationMs}
             aria-valuenow={h === 'start' ? startMs : endMs}
-            className={`absolute -top-1.5 -bottom-1.5 w-3 bg-tertiary flex items-center justify-center ${
+            className={`absolute -top-1.5 -bottom-1.5 w-3 bg-accent flex items-center justify-center ${
               h === 'start' ? 'rounded-l-md -translate-x-full' : 'rounded-r-md'
             } ${disabled ? '' : 'cursor-ew-resize'}`}
             style={{ left: `${pct(h === 'start' ? startMs : endMs)}%` }}
@@ -376,125 +313,194 @@ function TrimTrack({
             onPointerCancel={onPointerUp}
             onLostPointerCapture={onPointerUp}
           >
-            <div className="w-0.5 h-3 rounded bg-slate-900/60" />
+            {/* A solid mix of on-accent into the accent (2026-11-27; it
+                was on-accent at 60% opacity: colours shift, they don't
+                fade). */}
+            <div className="w-0.5 h-3 rounded bg-[color-mix(in_srgb,var(--color-on-accent)_60%,var(--color-accent))]" />
           </div>
         ))}
-        {/* Playhead */}
-        <div
-          className="absolute inset-y-0 w-0.5 bg-white shadow pointer-events-none"
-          style={{ left: `${pct(currentMs)}%` }}
-        />
+        {/* Time bubbles, QuickTime-style (2026-11-22): the start time over
+            the start handle while it's dragged, the end time over the end
+            handle, the playhead's time over the playhead while the video
+            plays or the playhead is dragged. Centred on the handle (it sits
+            12px outside its line) or on the playhead line. */}
+        {dragging === 'start' && <TimeBubble left={`calc(${pct(startMs)}% - 6px)`} ms={startMs} />}
+        {dragging === 'end' && <TimeBubble left={`calc(${pct(endMs)}% + 6px)`} ms={endMs} />}
+        {/* The landing bracket gets its time too (2026-11-23), the triangle
+            on the bracket's vertical stroke (1px outside the time's line). */}
+        {landing && dragging === null && <TimeBubble left={`calc(${pct(landing.ms)}% ${landing.side === 'start' ? '-' : '+'} 1px)`} ms={landing.ms} />}
+        {/* While a handle is dragged, the trimmed clip's length sits in the
+            middle of the selection, over the frames (2026-11-22; it was in
+            the handle's bubble). Tooltip styling, no triangle. */}
+        {(dragging === 'start' || dragging === 'end') && (
+          <div
+            className="absolute top-1/2 -translate-x-1/2 -translate-y-1/2 z-30 pointer-events-none px-2 py-1 rounded-md bg-tooltip ring-1 ring-inset ring-tooltip-ring text-on-tooltip text-xs font-medium tabular-nums whitespace-nowrap"
+            style={{ left: `${(pct(startMs) + pct(endMs)) / 2}%` }}
+          >
+            {formatDuration(endMs - startMs)}
+          </div>
+        )}
+        {(dragging === 'seek' || (playing && dragging === null)) && <TimeBubble left={`calc(${pct(currentMs)}% + 1px)`} ms={currentMs} />}
       </div>
 
-      {/* Right-click menu. Portaled to <body> so no ancestor with a
-           transform or backdrop-filter becomes its containing block. */}
-      {menu && createPortal(
-        <div
-          ref={menuRef}
-          role="menu"
-          className="fixed z-[100] glass-refractive rounded-xl p-1 min-w-[150px] text-[12px]"
-          style={{ left: menu.x, top: menu.y, transform: 'translateY(-100%)' }}
-          onContextMenu={e => e.preventDefault()}
-        >
-          <div className="px-2.5 pt-1 pb-1.5 text-[11px] text-slate-500 tabular-nums">{formatPlayheadTime(menu.ms)}</div>
-          {([['start', 'Start here', canStartAt], ['end', 'End here', canEndAt]] as const).map(([target, label, can]) => (
-            <button
-              key={target}
-              type="button"
-              role="menuitem"
-              disabled={!can(menu.ms)}
-              onClick={() => pickFromMenu(target)}
-              className="w-full h-7 px-2.5 rounded-lg text-left font-semibold text-slate-200 hover:bg-white/10 disabled:opacity-40 disabled:hover:bg-transparent"
-            >
-              {label}
-            </button>
-          ))}
-        </div>,
-        document.body,
-      )}
     </div>
   )
 }
 
-/** The row under the track: the trim readout, the shortcuts and the
- *  Apply / Reset buttons. */
-function TrimActions({
-  currentMs, startMs, endMs, durationMs, dirty, hasAppliedTrim, snappedMs, busy, disabled, onApply, onReset,
-}: ActionsProps) {
-  const lengthMs = endMs - startMs
-  const isFullRange = startMs <= 0 && endMs >= durationMs
-  // Same height, padding and spacing as the editor's top toolbar (h-10,
-  // px-3, gap-2, h-7 buttons). Three columns so the shortcuts sit in the
-  // true center; the side columns grow (pushing it off-center) rather than
-  // overlap when space runs out.
-  return (
-    <div className="h-10 px-3 grid grid-cols-[1fr_auto_1fr] items-center gap-2 text-[11px]">
-      {/* A small copy of the bar, in timeline order: start and end on the
-           handle color, the playhead on white in the middle, then the
-           length as a duration. Same 28px height as the buttons and the
-           handles' 6px corners; the white is square like the filmstrip. */}
-      <div className="flex items-center gap-3 min-w-0 tabular-nums whitespace-nowrap">
-        {/* text-[#fff], not text-white: light mode remaps .text-white to dark grey */}
-        <span className="h-7 p-[3px] rounded-md bg-tertiary flex items-center font-semibold text-[#fff]">
-          <span className="px-2">{formatPlayheadTime(startMs)}</span>
-          <span className="h-full px-2 bg-white text-[#2d2f33] flex items-center">{formatPlayheadTime(currentMs)}</span>
-          <span className="px-2">{formatPlayheadTime(endMs)}</span>
-        </span>
-        <span className="text-slate-400 font-semibold">{formatDuration(lengthMs)}</span>
-        {hasAppliedTrim && !dirty && snappedMs >= 250 && (
-          <span className="flex items-center gap-1 text-amber-300/90" title="A lossless cut can only start on a keyframe">
-            <span className="material-symbols-outlined text-[14px]">info</span>
-            Cut starts {(snappedMs / 1000).toFixed(1)}s earlier (keyframe)
-          </span>
-        )}
-      </div>
-      {/* Shortcuts, centered in the row */}
-      <div className="flex items-center justify-center gap-3 text-slate-500">
-        {INLINE_SHORTCUTS.map(([keys, label]) => (
-          <span key={label} className="flex items-center gap-1">
-            {keys.map(k => (
-              <kbd key={k} className="px-1 h-[18px] leading-[18px] rounded bg-white/[0.06] text-slate-400 font-semibold text-[10px]" style={{ fontFamily: 'inherit' }}>{k}</kbd>
-            ))}
-            <span className="ml-0.5">{label}</span>
-          </span>
-        ))}
-      </div>
-      <div className="col-start-3 flex items-center justify-end gap-2">
-        {(hasAppliedTrim || dirty) && (
-          <button
-            onClick={onReset}
-            disabled={disabled || busy}
-            className="h-7 px-2.5 rounded-lg bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white font-semibold disabled:opacity-40 flex items-center gap-1.5"
-            title={hasAppliedTrim ? 'Remove the trim and use the full recording' : 'Discard selection changes'}
-          >
-            <span className="material-symbols-outlined text-[14px]">undo</span>
-            Reset
-          </button>
-        )}
+/** The trim bar's controls (2026-11-22, compact layout): play / pause and
+ *  mute stacked left of the filmstrip, Trim and Reset stacked right of it,
+ *  all 32px icon buttons. A button that can't act shows disabled rather
+ *  than going, so the stacks keep their shape. */
+function SideControls({ side, ...p }: ActionsProps & { side: 'left' | 'right' }) {
+  const isFullRange = p.startMs <= 0 && p.endMs >= p.durationMs
+  if (side === 'left') {
+    return (
+      <div className="flex flex-col gap-2 flex-shrink-0">
+        <button onClick={p.onTogglePlay} className={ICON_BUTTON} data-tip={p.playing ? 'Pause' : 'Play'} aria-label={p.playing ? 'Pause' : 'Play'}>
+          <Icon name={p.playing ? 'pause' : 'play_arrow'} className="text-[16px]" />
+        </button>
         <button
-          onClick={onApply}
-          disabled={disabled || busy || !dirty || (isFullRange && !hasAppliedTrim)}
-          className="h-7 px-2.5 rounded-lg primary-gradient text-slate-900 font-bold hover:brightness-110 disabled:opacity-40 flex items-center gap-1.5"
-          title="Cut the recording to the selection (the original is kept)"
+          onClick={p.onToggleMute}
+          disabled={!p.hasAudio}
+          className={ICON_BUTTON}
+          data-tip={!p.hasAudio ? 'No sound' : p.muted ? 'Unmute' : 'Mute'}
+          aria-label={!p.hasAudio ? 'The video has no sound' : p.muted ? 'Unmute' : 'Mute'}
         >
-          {busy
-            ? <div className="w-3 h-3 rounded-full border-2 border-current border-t-transparent animate-spin" />
-            : <span className="material-symbols-outlined text-[14px]">cut</span>}
-          {busy ? 'Trimming…' : 'Apply trim'}
+          <Icon name={p.muted || !p.hasAudio ? 'volume_off' : 'volume_up'} className="text-[16px]" />
         </button>
       </div>
+    )
+  }
+  return (
+    <div className="flex flex-col gap-2 flex-shrink-0">
+      <button
+        onClick={p.onApply}
+        disabled={p.disabled || p.busy || !p.dirty || (isFullRange && !p.hasAppliedTrim)}
+        className={ACCENT_ICON_BUTTON}
+        data-tip={p.busy ? 'Trimming…' : 'Trim'}
+        aria-label="Cut the video to the selection (the original is kept)"
+      >
+        {p.busy
+          ? <Icon name="progress_activity" className="text-[16px] animate-spin" />
+          : <Icon name="cut" className="text-[16px]" />}
+      </button>
+      <button
+        onClick={p.onReset}
+        disabled={p.disabled || p.busy || !(p.hasAppliedTrim || p.dirty)}
+        className={ICON_BUTTON}
+        data-tip="Reset"
+        aria-label={p.hasAppliedTrim ? 'Remove the trim and use the full video' : 'Discard selection changes'}
+      >
+        <Icon name="restart_alt" className="text-[16px]" />
+      </button>
     </div>
   )
 }
 
-/** Trim bar at the bottom of the video editor: the track over the readout
- *  row, in one panel. Purely presentational: the Editor owns the numbers
- *  and talks to main. */
-export default function VideoTrimBar(props: TrackProps & ActionsProps) {
+/** How long the pointer may rest before the floating controls fade out. */
+const CONTROLS_IDLE_MS = 3000
+/** The fade itself: Tailwind classes for a floating control, shown or not.
+ *  300ms opacity, none under reduced motion (a motion Jasper asked for). */
+export const autoHideClass = (shown: boolean) =>
+  `transition-opacity duration-300 ease-out motion-reduce:transition-none ${shown ? 'opacity-100' : 'opacity-0 pointer-events-none'}`
+
+export interface AutoHide {
+  shown: boolean
+  /** Spread on each floating control: the pointer on it or keyboard focus
+   *  in it keeps everything shown. */
+  hold: {
+    onPointerEnter: () => void
+    onPointerLeave: () => void
+    onFocus: () => void
+    onBlur: (e: React.FocusEvent<HTMLElement>) => void
+  }
+}
+
+/** Auto-hide for the editors' floating controls: the video trim bar
+ *  (2026-11-23; a round close button shared it for a while) and the image
+ *  toolbar (2026-11-25). Shown on load; fade out when the pointer rests for
+ *  CONTROLS_IDLE_MS or `busy` turns on (video: playback starts; image: a
+ *  stroke starts or the text box opens); back on any pointer move in the
+ *  window or when `busy` turns off. While `ignoreMoves` is on (image: a
+ *  stroke is being drawn, the pointer moves all the time) pointer moves
+ *  don't bring them back. Never hide while the pointer is on one of them
+ *  (they hide after it leaves and rests) or one has keyboard focus, nor
+ *  while `keepShown` is on (image: the sticker panel is open, 2026-11-26);
+ *  the idle wait starts again when it goes off. */
+export function useAutoHideControls(busy: boolean, ignoreMoves = false, keepShown = false): AutoHide {
+  const [shown, setShown] = useState(true)
+  const overRef = useRef(false)
+  const focusRef = useRef(false)
+  const keepRef = useRef(keepShown)
+  keepRef.current = keepShown
+  const timerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  const hideSoon = useCallback(() => {
+    clearTimeout(timerRef.current)
+    timerRef.current = setTimeout(() => {
+      if (!overRef.current && !focusRef.current && !keepRef.current) setShown(false)
+    }, CONTROLS_IDLE_MS)
+  }, [])
+  useEffect(() => {
+    if (keepShown) { clearTimeout(timerRef.current); setShown(true) }
+    else hideSoon()
+  }, [keepShown, hideSoon])
+  const ignoreMovesRef = useRef(ignoreMoves)
+  ignoreMovesRef.current = ignoreMoves
+  useEffect(() => {
+    const onMove = () => { if (ignoreMovesRef.current) return; setShown(true); hideSoon() }
+    window.addEventListener('pointermove', onMove)
+    hideSoon()
+    return () => { window.removeEventListener('pointermove', onMove); clearTimeout(timerRef.current) }
+  }, [hideSoon])
+  const wasBusyRef = useRef(busy)
+  useEffect(() => {
+    if (busy === wasBusyRef.current) return
+    wasBusyRef.current = busy
+    if (busy) {
+      clearTimeout(timerRef.current)
+      if (!overRef.current && !focusRef.current && !keepRef.current) setShown(false)
+    } else {
+      setShown(true)
+      hideSoon()
+    }
+  }, [busy, hideSoon])
+  const hold = useMemo<AutoHide['hold']>(() => ({
+    onPointerEnter: () => { overRef.current = true },
+    onPointerLeave: () => { overRef.current = false; hideSoon() },
+    onFocus: () => { focusRef.current = true; setShown(true) },
+    onBlur: e => { if (!e.currentTarget.contains(e.relatedTarget as Node | null)) { focusRef.current = false; hideSoon() } },
+  }), [hideSoon])
+  return { shown, hold }
+}
+
+/** Trim bar at the bottom of the video editor: the controls stacked either
+ *  side of the filmstrip. Purely presentational: the Editor owns the
+ *  numbers and talks to main, and the auto-hide (useAutoHideControls). */
+export default function VideoTrimBar({ autoHide, ...props }: TrackProps & ActionsProps & { autoHide: AutoHide }) {
   return (
-    <div className="flex-shrink-0 liquid-glass border-t border-white/5 select-none" style={{ fontFamily: 'Manrope, sans-serif' }}>
-      <TrimTrack {...props} />
-      <TrimActions {...props} />
+    // The toolbar layer with an inside top edge, like the AppBar's bottom
+    // one (2026-11-22; it was glass).
+    // Final 2026-11-23: floating over the video, 20px in from the
+    // window's sides (the AppBar's edge offset: traffic lights, gear), 24px
+    // up from the bottom; was a full-width bar under it
+    // (`flex-shrink-0 bg-toolbar edge-t`). The whole group fades as one.
+    <div
+      // The edge is drawn inside (ring-inset, 2026-11-23), like the AppBar's
+      // edge line: the 10px padding runs from the bar's outer edge, so a
+      // time bubble overlaps it by 2px, as the Upload menu does the AppBar.
+      className={`absolute left-(--mx) right-(--mx) bottom-(--my) z-20 rounded-lg bg-toolbar ring-1 ring-inset ring-line select-none ${autoHideClass(autoHide.shown)}`}
+      {...autoHide.hold}
+    >
+      {/* No row under the strip (2026-11-22): the bubbles show the time
+          while playing or dragging, the callout the length. 10px all round
+          (2026-11-23), the AppBar buttons' space above and below on its
+          52px bar; buttons to a fully extended trim arm 10px too (gap-1.5
+          + the 4px the track's px-4 leaves beside a 12px handle). */}
+      <div className="flex items-center gap-1.5 p-2.5">
+        <SideControls side="left" {...props} />
+        <div className="flex-1 min-w-0"><TrimTrack {...props} /></div>
+        <SideControls side="right" {...props} />
+      </div>
     </div>
   )
 }

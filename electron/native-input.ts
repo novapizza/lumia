@@ -15,7 +15,6 @@ export const VK_CONTROL = 0x11
 export const VK_HOME = 0x24
 export const VK_DOWN = 0x28
 export const VK_NEXT = 0x22 // Page Down
-export const VK_UP = 0x26
 
 export const WM_VSCROLL = 0x0115
 export const SB_LINEDOWN = 1
@@ -47,7 +46,6 @@ let _GetClassNameW: (hwnd: any, buf: any, maxCount: number) => number
 let _GetWindowTextLengthW: (hwnd: any) => number
 let _GetWindowTextW: (hwnd: any, buf: any, maxCount: number) => number
 let _ShowWindow: (hwnd: any, nCmdShow: number) => boolean
-let _EnumWindows: (callback: any, lParam: any) => boolean
 let _DwmGetWindowAttribute: (hwnd: any, attr: number, pvAttribute: any, cbAttribute: number) => number
 // Same DWM API but with the output typed as a DWORD pointer — used for
 // scalar attributes like DWMWA_CLOAKED where the RECT-shaped binding above
@@ -59,8 +57,10 @@ let _IsIconic: (hwnd: any) => boolean
 let _GetLayeredWindowAttributes: (hwnd: any, key: any, alpha: any, flags: any) => boolean
 let _SetThreadDpiAwarenessContext: (ctx: any) => any
 let _SetWindowDisplayAffinity: (hwnd: any, affinity: number) => boolean
-const DPI_AWARENESS_CONTEXT_SYSTEM_AWARE = -2       // passed as negative intptr_t handle
-const DPI_AWARENESS_CONTEXT_PER_MONITOR_V2 = -4
+let _OpenProcess: (access: number, inherit: boolean, pid: number) => any
+let _QueryFullProcessImageNameW: (h: any, flags: number, buf: any, size: any) => boolean
+let _CloseHandle: (h: any) => boolean
+const DPI_AWARENESS_CONTEXT_PER_MONITOR_V2 = -4      // passed as negative intptr_t handle
 
 function ensureLoaded(): boolean {
   if (_loaded) return true
@@ -102,7 +102,6 @@ function ensureLoaded(): boolean {
     _GetWindowTextLengthW = user32.func('int __stdcall GetWindowTextLengthW(intptr_t hWnd)')
     _GetWindowTextW  = user32.func('int __stdcall GetWindowTextW(intptr_t hWnd, _Out_ uint16_t *lpString, int nMaxCount)')
     _ShowWindow      = user32.func('bool __stdcall ShowWindow(intptr_t hWnd, int nCmdShow)')
-    _EnumWindows     = user32.func('bool __stdcall EnumWindows(intptr_t lpEnumFunc, intptr_t lParam)')
     // SetThreadDpiAwarenessContext is available on Win10 1607+. Used to force
     // GetWindowRect to return virtualized (primary-scale) DIP coords, dodging
     // the per-monitor physical-pixel math entirely.
@@ -110,6 +109,10 @@ function ensureLoaded(): boolean {
       _SetThreadDpiAwarenessContext = user32.func('intptr_t __stdcall SetThreadDpiAwarenessContext(intptr_t dpiContext)')
     } catch { /* older Windows: leave undefined, caller falls back to raw rect */ }
     _SetWindowDisplayAffinity = user32.func('bool __stdcall SetWindowDisplayAffinity(intptr_t hWnd, uint32_t dwAffinity)')
+    const kernel32 = koffi.load('kernel32.dll')
+    _OpenProcess = kernel32.func('intptr_t __stdcall OpenProcess(uint32_t dwDesiredAccess, bool bInheritHandle, uint32_t dwProcessId)')
+    _QueryFullProcessImageNameW = kernel32.func('bool __stdcall QueryFullProcessImageNameW(intptr_t hProcess, uint32_t dwFlags, _Out_ uint16_t *lpExeName, _Inout_ uint32_t *lpdwSize)')
+    _CloseHandle = kernel32.func('bool __stdcall CloseHandle(intptr_t hObject)')
 
     const dwmapi = koffi.load('dwmapi.dll')
     _DwmGetWindowAttribute = dwmapi.func('int32_t __stdcall DwmGetWindowAttribute(intptr_t hwnd, uint32_t dwAttribute, _Out_ RECT *pvAttribute, uint32_t cbAttribute)')
@@ -125,6 +128,36 @@ function ensureLoaded(): boolean {
   } catch (err) {
     return false
   }
+}
+
+/** The app and title of a top-level window, for a capture's source label:
+ *  the title from GetWindowTextW, the app as the process's exe name without
+ *  ".exe" (e.g. "chrome", "Code"). Either may be missing. */
+export function getWindowSourceInfo(hwnd: any): { app?: string; title?: string } {
+  if (!ensureLoaded()) return {}
+  const out: { app?: string; title?: string } = {}
+  try {
+    const buf = new Uint16Array(512)
+    const n = _GetWindowTextW(hwnd, buf, buf.length)
+    if (n > 0) out.title = String.fromCharCode(...buf.subarray(0, n))
+    const pidOut = [0]
+    _GetWindowThreadProcessId(hwnd, pidOut)
+    const PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    const h = pidOut[0] ? _OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pidOut[0]) : 0
+    if (h) {
+      try {
+        const path = new Uint16Array(1024)
+        const size = [path.length]
+        if (_QueryFullProcessImageNameW(h, 0, path, size)) {
+          const full = String.fromCharCode(...path.subarray(0, size[0]))
+          const exe = full.split(/[\\/]/).pop() ?? ''
+          const app = exe.replace(/\.exe$/i, '')
+          if (app) out.app = app
+        }
+      } finally { _CloseHandle(h) }
+    }
+  } catch { /* leave what we have */ }
+  return out
 }
 
 /** Check if native input is available (koffi loaded on Windows) */

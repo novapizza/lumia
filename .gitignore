@@ -60,3 +60,6 @@ electron/gdrive-credentials.ts
 
 # Claude Code local user settings (machine-specific, not shared)
 .claude/settings.local.json
+
+# Brainstorm mockups (superpowers visual companion)
+.superpowers/

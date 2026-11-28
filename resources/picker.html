@@ -2,51 +2,72 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <link rel="icon" type="image/png" href="/favicon.png" />
-  <title>Choose Google Drive folder — Lumia</title>
-  <style>
-    html, body { margin: 0; padding: 0; min-height: 100%; background: #f8fafc; color: #0f172a; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
-    body { display: flex; align-items: center; justify-content: center; padding: 24px; box-sizing: border-box; }
-    .card { max-width: 480px; text-align: center; padding: 32px; background: #fff; border: 1px solid #e2e8f0; border-radius: 16px; box-shadow: 0 4px 24px rgba(15, 23, 42, 0.06); }
-    h1 { margin: 0 0 8px; font-size: 18px; font-weight: 600; }
-    p { margin: 0; font-size: 14px; color: #475569; line-height: 1.5; }
-    .error { color: #dc2626; }
-    .success { color: #15803d; }
-    .spinner { width: 28px; height: 28px; border: 3px solid #e2e8f0; border-top-color: #475569; border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 16px; }
-    @keyframes spin { to { transform: rotate(360deg); } }
-    .hint { margin-top: 16px; font-size: 12px; color: #94a3b8; }
-  </style>
+  <!-- Served by the picker server: the app's theme and Manrope, the same
+       dialog look as the OAuth pages (electron/browser-page.ts). -->
+  <link rel="stylesheet" href="/lumia-page.css" />
+  <title>Choose a Drive folder</title>
 </head>
 <body>
-  <div class="card" id="card">
-    <div class="spinner" id="spinner"></div>
-    <h1 id="title">Loading folder picker…</h1>
-    <p id="message">Connecting to Google Drive.</p>
-  </div>
+  <main class="box" id="box">
+    <div class="text">
+      <h1 id="title">Choose a Drive folder</h1>
+      <p id="body" hidden></p>
+    </div>
+    <div class="wait" id="wait">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>
+      <span>Opening Google Drive…</span>
+    </div>
+    <div class="message" id="message" role="alert" hidden>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="12" x2="12" y1="8" y2="12"/><line x1="12" x2="12.01" y1="16" y2="16"/></svg>
+      <div><div class="what" id="what"></div><div class="why" id="why" hidden></div></div>
+    </div>
+  </main>
   <script src="https://apis.google.com/js/api.js"></script>
   <script>
     (function () {
-      var card = document.getElementById('card')
-      var spinner = document.getElementById('spinner')
+      var box = document.getElementById('box')
       var title = document.getElementById('title')
+      var body = document.getElementById('body')
+      var wait = document.getElementById('wait')
       var message = document.getElementById('message')
+      var what = document.getElementById('what')
+      var why = document.getElementById('why')
+      var RETRY = 'Try again in Lumia (Settings › Uploads).'
+      var CLOSE = 'You can close this tab.'
 
-      function setError(t, m) {
-        spinner.style.display = 'none'
-        title.textContent = t
-        title.className = 'error'
-        message.textContent = m
+      // The body paragraph: lines that stand apart follow a blank line.
+      // Text only (the folder name comes from Drive), `strong` marks a name.
+      function setBody(parts) {
+        body.textContent = ''
+        parts.forEach(function (part, i) {
+          if (i > 0) { body.appendChild(document.createElement('br')); body.appendChild(document.createElement('br')) }
+          ;(Array.isArray(part) ? part : [part]).forEach(function (bit) {
+            if (typeof bit === 'string') body.appendChild(document.createTextNode(bit))
+            else { var s = document.createElement('strong'); s.textContent = bit.strong; body.appendChild(s) }
+          })
+        })
+        body.hidden = false
       }
-      function setSuccess(t, m) {
-        spinner.style.display = 'none'
+      function show(t, parts, error) {
+        box.hidden = false
+        wait.hidden = true
         title.textContent = t
-        title.className = 'success'
-        message.innerHTML = m + '<div class="hint">You can close this tab.</div>'
+        document.title = t
+        setBody(parts)
+        message.hidden = !error
+        if (error) {
+          what.textContent = error.message
+          why.textContent = error.detail || ''
+          why.hidden = !error.detail
+        }
       }
+      function failed(parts, error) { show("Couldn't open folder picker", parts, error) }
 
       var params = new URLSearchParams(location.search)
       var nonce = params.get('nonce')
-      if (!nonce) { setError('Invalid request', 'Open this picker from Lumia.'); return }
+      if (!nonce) { failed(['Open it from Lumia (Settings › Uploads).']); return }
 
       function postResult(result) {
         return fetch('/result?nonce=' + encodeURIComponent(nonce), {
@@ -54,18 +75,22 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(result),
           keepalive: true
-        }).catch(function () { /* server may be closed already — ignore */ })
+        }).catch(function () { /* server may be closed already, ignore */ })
       }
 
       fetch('/config?nonce=' + encodeURIComponent(nonce))
         .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json() })
         .then(function (cfg) {
-          if (!cfg.token) { setError('Not connected', 'Connect Google Drive in Lumia first, then try again.'); return }
+          if (!cfg.token) { failed(['Connect Google Drive in Lumia first (Settings › Uploads).']); return }
           if (!cfg.apiKey || !cfg.appId) {
-            setError('Picker credentials missing', 'Set MAIN_VITE_GDRIVE_API_KEY and MAIN_VITE_GDRIVE_PROJECT_NUMBER, then rebuild Lumia.')
+            failed([CLOSE], { message: 'Not available in this version of Lumia' })
             return
           }
 
+          if (typeof gapi === 'undefined') {
+            failed([RETRY], { message: "Google's picker didn't load", detail: 'Couldn\'t reach apis.google.com' })
+            return
+          }
           gapi.load('picker', {
             callback: function () {
               try {
@@ -84,25 +109,26 @@
                       var doc = data.docs && data.docs[0]
                       var result = doc ? { id: doc.id, name: doc.name } : null
                       postResult(result).then(function () {
-                        if (doc) setSuccess('Folder selected', '<strong>' + doc.name + '</strong> is now your default Drive folder.')
-                        else setSuccess('Done', 'Selection sent to Lumia.')
+                        if (doc) show('Folder chosen', [['Uploads go to ', { strong: doc.name }, '.'], CLOSE])
+                        else show('No folder chosen', ['Your upload folder didn\'t change.', CLOSE])
                       })
                     } else if (data.action === google.picker.Action.CANCEL) {
-                      postResult(null).then(function () { setSuccess('Cancelled', 'No folder was selected.') })
+                      postResult(null).then(function () { show('No folder chosen', ['Your upload folder didn\'t change.', CLOSE]) })
                     }
                   })
                   .build()
                 picker.setVisible(true)
-                card.style.display = 'none'
+                // Google's picker draws its own dialog over the page.
+                box.hidden = true
               } catch (err) {
-                setError('Picker failed to load', (err && err.message) ? err.message : String(err))
+                failed([RETRY], { message: "Google's picker didn't load", detail: (err && err.message) ? err.message : String(err) })
               }
             },
-            onerror: function (err) { setError('Failed to load Google Picker', String(err)) }
+            onerror: function (err) { failed([RETRY], { message: "Google's picker didn't load", detail: String(err) }) }
           })
         })
         .catch(function (err) {
-          setError('Session expired', 'Close this tab and click Browse in Lumia again. (' + err.message + ')')
+          failed(['Choose Browse again in Lumia (Settings › Uploads).'], { message: 'Link expired', detail: err.message })
         })
     })()
   </script>

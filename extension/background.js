@@ -2,7 +2,7 @@
 //
 // Connects to the Lumia desktop app over a localhost WebSocket (see
 // electron/extension-bridge.ts) and, on request, captures the active tab as
-// a full-page screenshot: scroll in exact viewport steps, capture each
+// a full page: scroll in exact viewport steps, capture each
 // viewport with chrome.tabs.captureVisibleTab, and stream frames + exact
 // scroll offsets back to the app, which stitches them without any overlap
 // guessing.
@@ -54,10 +54,14 @@ function browserName() {
   return 'Chrome'
 }
 
-// Connection status is a colored dot drawn onto the toolbar icon itself —
-// green when the Lumia app is reachable, red when it isn't. (No badge text:
-// a text badge covers a third of the icon.)
-const STATUS_COLORS = { on: '#22c55e', off: '#ef4444' }
+// Connection status is a colored dot drawn onto the toolbar icon itself:
+// green (the app's success-text) when the Lumia app is reachable, orange
+// (warning-text, as the popup's "Lumia isn't open") when it isn't. (No badge
+// text: a text badge covers a third of the icon.)
+// The dot sits inside a dark rim on whatever toolbar the browser has, so
+// it takes the dark theme's values in both themes, read from DEFAULT_ROLES
+// below (2026-11-27; the two hex values were repeated here).
+const statusColor = (key) => DEFAULT_ROLES.dark[key === 'on' ? 'success-text' : 'warning-text']
 const ICON_SIZES = [16, 32, 48]
 const statusIconCache = {}
 
@@ -79,26 +83,62 @@ async function buildStatusIcons(color) {
     ctx.fillStyle = color
     ctx.fill()
     ctx.lineWidth = Math.max(1, Math.round(size / 16))
-    ctx.strokeStyle = 'rgba(15,23,42,0.9)'
+    ctx.strokeStyle = 'rgba(19, 19, 19, 0.9)' // the app's dark background
     ctx.stroke()
     imageData[String(size)] = ctx.getImageData(0, 0, size, size)
   }
   return imageData
 }
 
+// Tells an open popup the connection or theme changed (2026-11-26; it only
+// asked once when it opened). Nobody listening is fine.
+function notifyStatus() {
+  const t = pageTheme()
+  chrome.runtime.sendMessage({
+    type: 'lumia-status',
+    connected: !!(ws && ws.readyState === WebSocket.OPEN),
+    theme: t.roles ? t : null,
+  }).catch(() => { /* no popup open */ })
+}
+
+// Calls overlap (the icons are built async on first use, after every
+// service-worker start): only the newest call sets the icon, so a slow
+// "off" build can't land after the "on" one (2026-11-27: orange dot while
+// connected).
+let badgeSeq = 0
 async function updateBadge() {
+  notifyStatus()
+  const seq = ++badgeSeq
   const connected = !!(ws && ws.readyState === WebSocket.OPEN)
   try {
     const key = connected ? 'on' : 'off'
-    if (!statusIconCache[key]) statusIconCache[key] = await buildStatusIcons(STATUS_COLORS[key])
-    chrome.action.setIcon({ imageData: statusIconCache[key] })
+    if (!statusIconCache[key]) {
+      // A failed build isn't kept: the next call tries again.
+      statusIconCache[key] = buildStatusIcons(statusColor(key)).catch((e) => { delete statusIconCache[key]; throw e })
+    }
+    const imageData = await statusIconCache[key]
+    if (seq !== badgeSeq) return // a newer call sets it
+    chrome.action.setIcon({ imageData })
     chrome.action.setBadgeText({ text: '' }) // clear any leftover badge from older versions
     chrome.action.setTitle({
       title: connected
-        ? 'Lumia Scroll Capture — capture this page'
-        : 'Lumia Scroll Capture — Lumia app not running'
+        ? 'Lumia Scroll Capture'
+        : "Lumia Scroll Capture (Lumia isn't open)"
     })
   } catch { /* action API unavailable — ignore */ }
+}
+
+// While Lumia isn't there, try again every 2 s (2026-11-26, Jasper): the
+// 30 s alarm alone made a started Lumia wait up to half a minute for the
+// browser. Timers don't keep the service worker alive, so this runs while
+// it's up anyway (an event, the alarm, a popup), and each alarm wakes it
+// for another ~30 s of tries: close to always trying. Measured cost at 1 s
+// (three refused localhost connects): ~0.5% of one core; 2 s halves it.
+const RETRY_MS = 2000
+let retryTimer = null
+function retrySoon() {
+  if (retryTimer) return
+  retryTimer = setTimeout(() => { retryTimer = null; connect() }, RETRY_MS)
 }
 
 function connect() {
@@ -112,6 +152,7 @@ function tryPort(i) {
   if (i >= PORTS.length) {
     connecting = false
     updateBadge()
+    retrySoon()
     return
   }
   let opened = false
@@ -125,7 +166,8 @@ function tryPort(i) {
   }
   sock.onmessage = (ev) => handleMessage(sock, ev.data)
   sock.onclose = () => {
-    if (ws === sock) { ws = null; updateBadge() }
+    // Lumia quit (or restarts): look for it again right away.
+    if (ws === sock) { ws = null; updateBadge(); retrySoon() }
     if (!opened) tryPort(i + 1)
   }
   sock.onerror = () => { /* onclose follows and advances the probe */ }
@@ -133,6 +175,52 @@ function tryPort(i) {
 
 function send(obj) {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj))
+}
+
+// ── Theme ───────────────────────────────────────────────────────────────────
+// The popup, the status pill and the Region picker draw in the Lumia app's
+// theme (2026-11-26): the app sends its role colours ({ mode, roles }, the
+// app's --color-<role> values) on connect and on every change. Kept in
+// storage so the last one survives a service-worker restart and the app
+// being closed. Before the first one arrives, they follow the system's
+// light / dark with the app's default roles below (src/index.css).
+const DEFAULT_ROLES = {
+  dark: {
+    'elevated': '#1d1d1d', 'elevated-hover': '#282828', 'toolbar': '#151515', 'line': 'rgba(231, 231, 231, 0.12)',
+    'fg': '#e7e7e7', 'fg-secondary': '#b4b4b4', 'fg-tertiary': '#888888', 'fg-disabled': '#535353',
+    'kind-image': 'oklch(0.66 0.175 255)',
+    'accent': '#7440d5', 'accent-hover': '#6931c8', 'on-accent': '#ffffff',
+    'success-text': '#6dd797', 'warning-subtle': '#421e00', 'warning-text': '#e67a2a',
+    'danger-subtle': '#371210', 'danger-text': '#e84b50',
+  },
+  light: {
+    'elevated': '#ffffff', 'elevated-hover': '#f4f4f4', 'toolbar': '#f7f7f7', 'line': 'rgba(29, 29, 29, 0.14)',
+    'fg': '#1d1d1d', 'fg-secondary': '#575757', 'fg-tertiary': '#6a6a6a', 'fg-disabled': '#b1b1b1',
+    'kind-image': 'oklch(0.55 0.175 255)',
+    'accent': '#7440d5', 'accent-hover': '#6931c8', 'on-accent': '#ffffff',
+    'success-text': '#007742', 'warning-subtle': '#ffead9', 'warning-text': '#b95a00',
+    'danger-subtle': '#ffecea', 'danger-text': '#c21725',
+  },
+}
+let appTheme = null // { mode: 'light' | 'dark', roles }
+const themeLoaded = chrome.storage.local.get('appTheme')
+  .then((v) => { if (v && v.appTheme && !appTheme) appTheme = v.appTheme })
+  .catch(() => {})
+
+function setAppTheme(msg) {
+  if (msg.mode !== 'light' && msg.mode !== 'dark') return
+  if (!msg.roles || typeof msg.roles !== 'object') return
+  appTheme = { mode: msg.mode, roles: msg.roles }
+  chrome.storage.local.set({ appTheme }).catch(() => {})
+  notifyStatus()
+}
+
+/** What the injected page UI draws with: the app's theme, or both defaults
+ *  for the page to pick by the system's light / dark. */
+function pageTheme() {
+  return appTheme
+    ? { mode: appTheme.mode, roles: { ...DEFAULT_ROLES[appTheme.mode], ...appTheme.roles } }
+    : { defaults: DEFAULT_ROLES }
 }
 
 chrome.alarms.create('lumia-reconnect', { periodInMinutes: 0.5 })
@@ -165,7 +253,7 @@ async function startFromUI(mode) {
     // ('lumia-region-picked') once the user picks, and THAT starts the
     // capture (see the onMessage handler below). Do NOT await it — the
     // injected picker's promise only settles after the user interacts.
-    chrome.scripting.executeScript({ target: { tabId: tab.id }, func: lumiaPickElement })
+    chrome.scripting.executeScript({ target: { tabId: tab.id }, func: lumiaPickElement, args: [pageTheme()] })
       .catch(() => {})
     return { ok: true }
   }
@@ -183,8 +271,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   // Popup → status query.
   if (msg.type === 'lumia-get-status') {
-    sendResponse({ connected: !!(ws && ws.readyState === WebSocket.OPEN) })
-    return // synchronous response
+    themeLoaded.then(() => {
+      const t = pageTheme()
+      sendResponse({ connected: !!(ws && ws.readyState === WebSocket.OPEN), theme: t.roles ? t : null })
+    })
+    return true // async response (waits for the stored theme)
   }
   // Popup → start a capture in the chosen mode.
   if (msg.type === 'lumia-ui-start') {
@@ -227,12 +318,25 @@ async function handleMessage(sock, data) {
     sock.send('{"type":"pong"}')
     return
   }
+  if (msg.type === 'theme') {
+    setAppTheme(msg)
+    return
+  }
   if (msg.type === 'capture-cancel') {
     if (activeCapture && activeCapture.id === msg.id) activeCapture.cancelled = true
     return
   }
   if (msg.type === 'preview') {
     void sendPreview(msg.id)
+    return
+  }
+  // The app's scroll hotkey asks whether this browser is in front
+  // (2026-11-27): `focused` is the OS's active window, false while another
+  // app is in front.
+  if (msg.type === 'focus') {
+    chrome.windows.getLastFocused({ windowTypes: ['normal'] })
+      .then(win => send({ type: 'focus-result', id: msg.id, focused: !!(win && win.focused) }))
+      .catch(() => send({ type: 'focus-result', id: msg.id, focused: false }))
     return
   }
   if (msg.type === 'capture-start') {
@@ -250,7 +354,7 @@ async function handleMessage(sock, data) {
         send({
           type: 'capture-error',
           id: msg.id,
-          error: 'One-time browser permission needed — click the Lumia extension icon in the browser toolbar and press "Allow captures from the app"'
+          error: 'Click the Lumia extension in the browser toolbar, then Allow'
         })
         return
       }
@@ -365,7 +469,7 @@ async function runCapture(id, target, mode) {
     // Interaction lock + status pill with Stop. The full-screen blocker is
     // transparent (never hidden, never flickers); only the small pill is
     // hidden for the instant each frame is photographed.
-    await exec(lumiaShowOverlay)
+    await exec(lumiaShowOverlay, pageTheme())
 
     // Silent abort (user switched away) — tell the app to drop the session
     // without surfacing an error toast.
@@ -1201,40 +1305,80 @@ async function lumiaPrep(maxFrames, mode) {
   }
 }
 
-function lumiaShowOverlay() {
+function lumiaShowOverlay(theme) {
   const st = window.__lumiaCap
   if (!st || document.getElementById('__lumia-cap-blocker')) return
   // Transparent click-blocker: stays up for the whole capture. Deliberately
   // INVISIBLE — it never needs hiding around shots, so nothing full-screen
   // ever flickers. (An earlier full-screen dim toggled around every frame
-  // and strobed painfully.)
+  // and strobed painfully.) The arrow cursor: macOS draws its own wait.
   const blocker = document.createElement('div')
   blocker.id = '__lumia-cap-blocker'
-  blocker.style.cssText = 'position:fixed;inset:0;z-index:2147483646;background:transparent;cursor:wait;'
+  blocker.style.cssText = 'position:fixed;inset:0;z-index:2147483646;background:transparent;cursor:default;'
   const swallow = (e) => e.preventDefault()
   blocker.addEventListener('wheel', swallow, { passive: false })
   blocker.addEventListener('touchmove', swallow, { passive: false })
 
-  // The only VISIBLE element is a small status pill at the bottom — hidden
-  // for the instant each frame is photographed. A tiny corner blink is far
-  // gentler on the eyes than a whole-page dim pulsing on and off.
-  const pill = document.createElement('div')
-  pill.id = '__lumia-cap-dim'
-  pill.style.cssText = 'position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:2147483647;display:flex;align-items:center;gap:12px;padding:10px 14px 10px 18px;border-radius:999px;background:rgba(15,23,42,0.92);color:#e2e8f0;box-shadow:0 6px 24px rgba(0,0,0,0.4);font-family:system-ui,sans-serif;'
-  const label = document.createElement('span')
-  label.id = '__lumia-cap-label'
-  label.textContent = 'Lumia is capturing this page…'
-  label.style.cssText = 'font-size:13px;font-weight:600;white-space:nowrap;'
-  const btn = document.createElement('button')
-  btn.textContent = 'Stop & save'
-  btn.style.cssText = 'padding:6px 16px;border-radius:999px;border:0;background:#ef4444;color:#fff;font-size:12px;font-weight:700;cursor:pointer;'
+  // The only VISIBLE element: a Lumia wait toast (2026-11-26, the app's
+  // ToastBox with an action: elevated, a line edge, the grey spinner, 12px
+  // medium text, a 24px accent button, 40px tall), centred 8px from the top
+  // like the app's toasts. In the app's theme (`theme` from the service
+  // worker; before the app sent one, the system's light / dark), in a
+  // shadow root so the page's CSS can't reach it. Hidden for the instant
+  // each frame is photographed.
+  const t = theme && theme.roles
+    ? theme
+    : (matchMedia('(prefers-color-scheme: dark)').matches
+      ? { mode: 'dark', roles: theme.defaults.dark }
+      : { mode: 'light', roles: theme.defaults.light })
+  try {
+    if (!window.__lumiaFont) {
+      window.__lumiaFont = true
+      for (const w of ['500', '600']) {
+        const f = new FontFace('LumiaManrope', `url(${chrome.runtime.getURL(`fonts/manrope-${w}.woff2`)})`, { weight: w })
+        document.fonts.add(f)
+        f.load().catch(() => {})
+      }
+    }
+  } catch { /* system font */ }
+  const host = document.createElement('div')
+  host.id = '__lumia-cap-dim'
+  host.style.cssText = 'all:initial;position:fixed;left:50%;top:8px;transform:translateX(-50%);z-index:2147483647;display:block;'
+  for (const [k, v] of Object.entries(t.roles)) host.style.setProperty(`--${k}`, v)
+  const root = host.attachShadow({ mode: 'open' })
+  root.innerHTML = `<style>
+    .toast { box-sizing: border-box; min-height: 40px; max-width: 420px; padding: 0 8px 0 12px; display: flex; align-items: center; gap: 8px;
+      border: 1px solid var(--line); border-radius: 8px; background: var(--elevated);
+      font-family: LumiaManrope, Manrope, -apple-system, BlinkMacSystemFont, sans-serif; cursor: default; user-select: none; }
+    svg { width: 14px; height: 14px; flex-shrink: 0; fill: none; stroke: var(--fg-secondary); stroke-width: ${t.mode === 'light' ? '1.35px' : '1px'};
+      stroke-linecap: round; stroke-linejoin: round; animation: spin 1s linear infinite; }
+    svg * { vector-effect: non-scaling-stroke; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @media (prefers-reduced-motion: reduce) { svg { animation: none; } }
+    .msg { font-size: 12px; line-height: 16px; font-weight: 500; color: var(--fg); white-space: nowrap; font-variant-numeric: tabular-nums; }
+    button { height: 24px; padding: 0 12px; margin: 0; border: 0; border-radius: 6px; background: var(--accent); color: var(--on-accent);
+      font: inherit; font-size: 12px; font-weight: 500; white-space: nowrap; cursor: default; }
+    button:hover { background: var(--accent-hover); }
+    button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+    .toast.saving { padding-right: 12px; min-height: 32px; }
+    .toast.saving button { display: none; }
+  </style>
+  <div class="toast" role="status">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>
+    <span class="msg">Capturing page…</span>
+    <button type="button">Stop and save</button>
+  </div>`
+  const toast = root.querySelector('.toast')
+  const btn = root.querySelector('button')
+  st.pillLabel = root.querySelector('.msg')
   btn.addEventListener('click', () => {
-    btn.disabled = true
-    btn.textContent = 'Stopping…'
+    // What's captured so far is saved; the toast says so until it's done.
+    st.pillLabel.textContent = 'Saving…'
+    toast.classList.add('saving')
+    st.pillSaving = true
     try { chrome.runtime.sendMessage({ type: 'lumia-stop-clicked' }) } catch { /* ignore */ }
   })
-  pill.append(label, btn)
-  document.documentElement.append(blocker, pill)
+  document.documentElement.append(blocker, host)
 
   // Block keyboard scrolling too (arrows, space, page keys) — programmatic
   // scrollTop writes from the capture loop are unaffected.
@@ -1261,7 +1405,7 @@ function lumiaSetDimVisible(visible) {
   // "dim" id kept for the toggle target, but the element is now the small
   // status pill — the only visible UI that must stay out of the frames.
   const dim = document.getElementById('__lumia-cap-dim')
-  if (dim) dim.style.display = visible ? 'flex' : 'none'
+  if (dim) dim.style.display = visible ? 'block' : 'none'
   // Resolve only after the compositor has repainted, so captureVisibleTab
   // right after this never photographs a half-hidden overlay.
   return new Promise((resolve) => {
@@ -1272,9 +1416,11 @@ function lumiaSetDimVisible(visible) {
 function lumiaScrollTo(y, index, isLast, total) {
   const st = window.__lumiaCap
   if (!st) return null
-  const label = document.getElementById('__lumia-cap-label')
-  if (label && typeof total === 'number') {
-    label.textContent = `Lumia capturing ${index + 1}/${total}…`
+  // The toast's count, the app's "(1 of 2)" form; it stays on "Saving…"
+  // once Stop and save was pressed.
+  const label = st.pillLabel
+  if (label && !st.pillSaving && typeof total === 'number') {
+    label.textContent = `Capturing page (${index + 1} of ${total})…`
   }
   if (index === 1) {
     for (const f of st.fixed) {
@@ -1351,14 +1497,17 @@ function lumiaRestore() {
   }
 }
 
-// Interactive element picker for the 'region' mode. Hovering highlights the
-// element under the cursor (green outline = it scrolls, cyan = static) and the
-// tip shows what it is. A d-pad (or ↑ ↓ ← → keys) refines the selection along
-// the DOM tree: ▲/↑ parent, ▼/↓ child, ◀▶/←→ same-level siblings — so you can
-// reach a scroll pane covered by children without hunting for a bare spot.
-// Click / Enter captures exactly that element; Esc / right-click / switching
-// away cancels. On pick it stashes the element on window.__lumiaPickedEl and
-// messages the service worker.
+// Interactive element picker for the 'region' mode (2026-11-27, the path
+// bar; design/REGION-PICKER.md). Drawn like the app's capture
+// overlay: a 1px image-blue line around the part, an 18% dim outside it,
+// the size under it, and one bar 32px from the top. The bar shows where
+// the part sits in the page as a Segmented control (Page › Main › Article
+// › List); the pill is the level the outline is on, the parts at that level
+// are outlined faintly, and the keys are listed under it. Hover picks the
+// part under the pointer; a click on a step, or ↑ / ↓, moves the outline
+// out and back in along that path; ← / → move to the part before / after. Click / Enter captures, Esc / right-click /
+// switching away cancels. On pick it stashes the element on
+// window.__lumiaPickedEl and messages the service worker.
 //
 // Same-origin iframes (e.g. AWS console embeds content in a frame): the picker
 // attaches its listeners to every reachable same-origin child document too and
@@ -1366,51 +1515,130 @@ function lumiaRestore() {
 // the frame can be highlighted and picked. Cross-origin frames can't be
 // scripted, so hovering inside one keeps the last highlight (the frame itself
 // is still pickable from its edges).
-function lumiaPickElement() {
+function lumiaPickElement(theme) {
   return new Promise((resolve) => {
     if (window.__lumiaPicking) { resolve({ ok: false }); return }
     window.__lumiaPicking = true
+    const t = theme && theme.roles
+      ? theme
+      : (matchMedia('(prefers-color-scheme: dark)').matches
+        ? { mode: 'dark', roles: theme.defaults.dark }
+        : { mode: 'light', roles: theme.defaults.light })
+    const R = t.roles
+    const dark = t.mode !== 'light'
+    // Apps before 2026-11-27 don't send the image clip colour: the app's
+    // value for the mode.
+    const KIND = R['kind-image'] || (dark ? 'oklch(0.66 0.175 255)' : 'oklch(0.55 0.175 255)')
+    const TOOLBAR = R.toolbar || (dark ? '#151515' : '#f7f7f7')
+    try {
+      if (!window.__lumiaFont) {
+        window.__lumiaFont = true
+        for (const w of ['500', '600']) {
+          const f = new FontFace('LumiaManrope', `url(${chrome.runtime.getURL(`fonts/manrope-${w}.woff2`)})`, { weight: w })
+          document.fonts.add(f)
+          f.load().catch(() => {})
+        }
+      }
+    } catch { /* system font */ }
+
+    // The outline: the capture overlay's pick. A 1px line in the image clip
+    // colour, never a tint inside, the 18% dim outside (a spread shadow).
     const hl = document.createElement('div')
-    hl.style.cssText = 'position:fixed;z-index:2147483647;pointer-events:none;border:2px solid #00e3fd;background:rgba(0,227,253,0.12);box-sizing:border-box;transition:all .04s;'
-    const tip = document.createElement('div')
-    tip.style.cssText = 'position:fixed;z-index:2147483647;pointer-events:none;top:12px;left:50%;transform:translateX(-50%);background:rgba(15,23,42,0.96);color:#e2e8f0;font:600 12px system-ui,sans-serif;padding:8px 14px;border-radius:9px;box-shadow:0 4px 20px rgba(0,0,0,0.45);text-align:center;'
-    const tipInfo = document.createElement('div')
-    tipInfo.textContent = 'Click an element to capture'
-    // A d-pad to refine the selection along the DOM tree without moving the
-    // mouse: ▲ out a level (parent) · ▼ in a level (child) · ◀ ▶ same-level
-    // siblings · centre ⏎ captures the current selection. Buttons + the
-    // ↑ ↓ ← → / Enter keys both drive this.
-    const pad = document.createElement('div')
-    pad.style.cssText = 'display:grid;grid-template-columns:repeat(3,24px);grid-template-rows:repeat(3,20px);gap:3px;justify-content:center;margin:6px 0 4px;'
-    const mkBtn = (dir, glyph, title) => {
-      const b = document.createElement('button')
-      b.setAttribute('data-lumia-nav', dir)
-      b.title = title
-      b.textContent = glyph
-      b.style.cssText = 'pointer-events:auto;cursor:pointer;border:1px solid rgba(255,255,255,0.18);background:rgba(255,255,255,0.06);color:#e2e8f0;border-radius:5px;font:600 11px system-ui,sans-serif;line-height:1;padding:0;display:flex;align-items:center;justify-content:center;'
-      return b
+    hl.style.cssText = `all:initial;position:fixed;z-index:2147483646;pointer-events:none;box-sizing:border-box;border:1px solid ${KIND};box-shadow:0 0 0 100vmax rgba(0,0,0,.18);display:none;`
+
+    // The bar and the size label live in one shadow root so the page's CSS
+    // can't reach them. Open, so a press's composedPath reaches the steps.
+    const ui = document.createElement('div')
+    ui.style.cssText = 'all:initial;position:fixed;inset:0;z-index:2147483647;pointer-events:none;display:block;'
+    for (const [k, v] of Object.entries(R)) ui.style.setProperty(`--${k}`, v)
+    ui.style.setProperty('--kind-image', KIND)
+    ui.style.setProperty('--toolbar', TOOLBAR)
+    const root = ui.attachShadow({ mode: 'open' })
+    // Lucide ArrowUp / ArrowDown / ArrowLeft / ArrowRight / CornerDownLeft /
+    // ChevronRight.
+    const svg = (d) => `<svg viewBox="0 0 24 24" aria-hidden="true">${d}</svg>`
+    const ICON = {
+      up: svg('<path d="m5 12 7-7 7 7"/><path d="M12 19V5"/>'),
+      down: svg('<path d="M12 5v14"/><path d="m19 12-7 7-7-7"/>'),
+      left: svg('<path d="m12 19-7-7 7-7"/><path d="M19 12H5"/>'),
+      right: svg('<path d="M5 12h14"/><path d="m12 5 7 7-7 7"/>'),
+      enter: svg('<path d="M20 4v7a4 4 0 0 1-4 4H4"/><path d="m9 10-5 5 5 5"/>'),
+      chevron: svg('<path d="m9 18 6-6-6-6"/>'),
     }
-    const spacer = () => document.createElement('span')
-    const bEnter = mkBtn('enter', '⏎', 'Capture this element')
-    // Accent the capture button so the centre reads as the confirm action.
-    bEnter.style.background = 'rgba(0,227,253,0.18)'
-    bEnter.style.borderColor = 'rgba(0,227,253,0.5)'
-    bEnter.style.color = '#7dd3fc'
-    pad.append(
-      spacer(), mkBtn('up', '▲', 'Parent — out a level'), spacer(),
-      mkBtn('left', '◀', 'Previous sibling'), bEnter, mkBtn('right', '▶', 'Next sibling'),
-      spacer(), mkBtn('down', '▼', 'Child — in a level'), spacer()
-    )
-    const tipMain = document.createElement('div')
-    tipMain.style.cssText = 'margin-top:2px;font-weight:500;font-size:11px;opacity:.9;max-width:520px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;'
-    const legend = document.createElement('div')
-    legend.textContent = '↑ parent · ↓ child · ← → sibling · ⏎ Enter capture · Esc cancel'
-    legend.style.cssText = 'margin-top:4px;font-weight:500;font-size:10px;opacity:.55;'
-    tip.append(tipInfo, pad, tipMain, legend)
-    // Hover styling for the nav buttons (inline styles can't do :hover).
-    const styleTag = document.createElement('style')
-    styleTag.textContent = '[data-lumia-nav]:hover{background:rgba(0,227,253,0.25)!important;border-color:rgba(0,227,253,0.6)!important}'
-    document.documentElement.append(hl, tip, styleTag)
+    root.innerHTML = `<style>
+      * { box-sizing: border-box; }
+      .bar { position: fixed; top: 32px; left: 50%; transform: translateX(-50%); padding: 10px; border-radius: 8px;
+        width: 480px; max-width: calc(100vw - 32px); box-sizing: border-box;
+        background: var(--toolbar); box-shadow: inset 0 0 0 1px var(--line); pointer-events: auto;
+        display: flex; flex-direction: column; align-items: center; gap: 8px;
+        font-family: LumiaManrope, Manrope, -apple-system, BlinkMacSystemFont, sans-serif; user-select: none; cursor: default; }
+      svg { width: 14px; height: 14px; flex-shrink: 0; fill: none; stroke: currentColor; stroke-width: ${dark ? '1px' : '1.35px'};
+        stroke-linecap: round; stroke-linejoin: round; }
+      svg * { vector-effect: non-scaling-stroke; }
+      /* The path (2026-11-27, a breadcrumb): plain steps, the current one
+         on the image-blue pill, a chevron between steps. */
+      .seg { height: 32px; width: 100%; display: flex; align-items: center; justify-content: center; gap: 2px; overflow: hidden; }
+      .seg > * { flex-shrink: 0; }
+      .seg button { all: unset; height: 28px; padding: 0 10px; display: inline-flex; align-items: center; border-radius: 6px;
+        font-size: 12px; line-height: 16px; font-weight: 500; color: var(--fg-secondary); white-space: nowrap; cursor: default; }
+      .seg button:hover { color: var(--fg); }
+      .seg button.on { background: var(--kind-image); color: #fff; }
+      .seg button.more { padding: 0 6px; color: var(--fg-tertiary); }
+      .seg button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+      .seg .sep { display: inline-flex; color: var(--fg-tertiary); }
+      /* The keys (Settings › Wallpapers' keycap: 20px, line edge, 14px
+         icon), each with a Meta-rank label. */
+      .keys { display: flex; align-items: center; gap: 12px; }
+      .key { display: inline-flex; align-items: center; gap: 4px; font-size: 10px; line-height: 14px; font-weight: 500; color: var(--fg-secondary); white-space: nowrap; }
+      kbd { all: unset; height: 20px; min-width: 24px; padding: 0 4px; box-sizing: border-box; display: inline-flex; align-items: center; justify-content: center;
+        border-radius: 6px; border: 1px solid var(--line); color: var(--fg-secondary); font-size: 10px; font-weight: 500; }
+      /* The capture overlay's size label (Overlay.tsx: h-6 px-2 rounded-md),
+         24px tall, 8px sides (2026-11-27; it was 5px / 7px padding, ~21px). */
+      .size { position: fixed; height: 24px; padding: 0 8px; border-radius: 6px; background: var(--toolbar); box-shadow: inset 0 0 0 1px var(--line);
+        display: none; align-items: center; gap: 6px; white-space: nowrap; color: var(--fg);
+        font: 500 11px/1 LumiaManrope, Manrope, -apple-system, BlinkMacSystemFont, sans-serif; font-variant-numeric: tabular-nums; }
+      .tag { font-size: 10px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; color: var(--success-text); }
+    </style>
+    <div class="bar" role="toolbar" aria-label="Part of the page">
+      <div class="seg"></div>
+      <div class="keys" aria-hidden="true">
+        <span class="key"><kbd>${ICON.up}</kbd><kbd>${ICON.down}</kbd>Out / in</span>
+        <span class="key"><kbd>${ICON.left}</kbd><kbd>${ICON.right}</kbd>Previous / next</span>
+        <span class="key"><kbd>${ICON.enter}</kbd>Capture</span>
+        <span class="key"><kbd>esc</kbd>Cancel</span>
+      </div>
+    </div>
+    <div class="size"><span class="dims"></span><span class="tag" hidden>Scrolls</span></div>`
+    const seg = root.querySelector('.seg')
+    const sizeBox = root.querySelector('.size')
+    const sizeDims = root.querySelector('.dims')
+    const sizeTag = root.querySelector('.tag')
+    // Every part at the outline's level, the ones ← / → go to (2026-11-27,
+    // Jasper): a faint blue line, under the dim (they're not the pick).
+    // See-through (20%) rather than a lighter colour: the page under it can
+    // be any colour, and a tint toward white glared and read as a second
+    // pick. Drawn from a pool of boxes, at most NEAR_MAX.
+    const NEAR = `color-mix(in srgb, ${KIND} 20%, transparent)`
+    const NEAR_MAX = 300
+    const nearLayer = document.createElement('div')
+    nearLayer.style.cssText = 'all:initial;position:fixed;inset:0;z-index:2147483645;pointer-events:none;display:block;'
+    const nearPool = []
+    const drawNear = (rects) => {
+      while (nearPool.length < Math.min(rects.length, NEAR_MAX)) {
+        const d = document.createElement('div')
+        d.style.cssText = `all:initial;position:fixed;pointer-events:none;box-sizing:border-box;border:1px solid ${NEAR};display:none;`
+        nearLayer.append(d)
+        nearPool.push(d)
+      }
+      nearPool.forEach((d, k) => {
+        const q = rects[k]
+        if (!q) { d.style.display = 'none'; return }
+        d.style.display = 'block'
+        d.style.left = q.left + 'px'; d.style.top = q.top + 'px'
+        d.style.width = q.width + 'px'; d.style.height = q.height + 'px'
+      })
+    }
+    document.documentElement.append(nearLayer, hl, ui)
 
     // Collect same-origin documents (top + descendant frames) and each one's
     // offset into TOP-viewport coords. Cross-origin frames throw on
@@ -1437,10 +1665,20 @@ function lumiaPickElement() {
     }
     addDoc(document, 0, 0)
 
-    let current = null     // highlighted element (may live in a child frame doc)
+    // The path: the hovered element and the parts around it, outermost
+    // (body, "Page") first. `level` is the step the outline is on; the
+    // steps after it stay until the pointer picks another part, so ↓ goes
+    // back in. A step is a run of nested parts with the same edges
+    // (2026-11-27, Jasper: five same-size boxes read as five steps that
+    // capture the same picture): { members (outer to inner), el (what the
+    // outline and the capture use: the one that scrolls, else the
+    // outermost), name (the first real one, else "Box") }.
+    let path = []
+    let level = -1
     let armed = false      // set on first real move; guards blur/tab-hide cancel
     let finished = false
     let lastX = -1, lastY = -1
+    const current = () => (level >= 0 && path[level] ? path[level].el : null)
 
     const offOf = (doc) => offsets.get(doc) || { ox: 0, oy: 0 }
     const viewOf = (el) => (el.ownerDocument && el.ownerDocument.defaultView) || window
@@ -1450,42 +1688,244 @@ function lumiaPickElement() {
       return (oy === 'auto' || oy === 'scroll' || oy === 'overlay') &&
         el.scrollHeight - el.clientHeight > 8
     }
-    const shortName = (el) => {
-      let s = el.tagName.toLowerCase()
-      if (el.id) s += '#' + el.id
-      else if (typeof el.className === 'string' && el.className.trim()) {
-        s += '.' + el.className.trim().split(/\s+/)[0]
+    // A step's name: what the page says the part is, else "Box".
+    const ROLE_NAMES = { main: 'Main', navigation: 'Navigation', banner: 'Header', contentinfo: 'Footer', complementary: 'Sidebar',
+      article: 'Article', region: 'Section', dialog: 'Dialog', list: 'List', listitem: 'Item', table: 'Table', grid: 'Table',
+      form: 'Form', search: 'Search', feed: 'Feed', tabpanel: 'Panel', menu: 'Menu', toolbar: 'Toolbar', figure: 'Figure', img: 'Image' }
+    const TAG_NAMES = { body: 'Page', main: 'Main', nav: 'Navigation', header: 'Header', footer: 'Footer', aside: 'Sidebar',
+      article: 'Article', section: 'Section', ul: 'List', ol: 'List', dl: 'List', li: 'Item', table: 'Table', thead: 'Table head',
+      tbody: 'Rows', tr: 'Row', td: 'Cell', th: 'Cell', form: 'Form', fieldset: 'Group', p: 'Paragraph', blockquote: 'Quote',
+      h1: 'Heading', h2: 'Heading', h3: 'Heading', h4: 'Heading', h5: 'Heading', h6: 'Heading', figure: 'Figure', img: 'Image',
+      picture: 'Image', svg: 'Graphic', canvas: 'Canvas', video: 'Video', iframe: 'Frame', pre: 'Code', code: 'Code',
+      button: 'Button', a: 'Link', input: 'Field', textarea: 'Field', select: 'Menu', dialog: 'Dialog', details: 'Details' }
+    const nameOf = (el) => {
+      const role = el.getAttribute && el.getAttribute('role')
+      if (role && ROLE_NAMES[role]) return ROLE_NAMES[role]
+      const tag = TAG_NAMES[el.tagName.toLowerCase()]
+      if (tag) return tag
+      // A box holding only text (a span, a label) reads as Text.
+      if (el.childElementCount === 0 && (el.textContent || '').trim()) return 'Text'
+      return 'Box'
+    }
+    const sameBox = (a, b) => {
+      const r = a.getBoundingClientRect(), q = b.getBoundingClientRect()
+      return Math.abs(r.left - q.left) <= 1 && Math.abs(r.top - q.top) <= 1 &&
+        Math.abs(r.width - q.width) <= 1 && Math.abs(r.height - q.height) <= 1
+    }
+    const makeStep = (members) => {
+      const named = members.map(nameOf).find((n) => n !== 'Box')
+      return { members, el: members.find(isScrollable) || members[0], name: named || 'Box' }
+    }
+    // n and the parts inside it with its edges, one level each.
+    const groupDown = (n) => {
+      const members = [n]
+      for (;;) {
+        const m = members[members.length - 1]
+        // Not into an empty layer (a same-size decoration div): it has
+        // nothing to step into, so ↓ died there (Google's question rows).
+        const c = kidsOf(m).find((k) => !isEmptyLayer(k) && sameBox(k, m))
+        if (!c) break
+        members.push(c)
       }
+      return members
+    }
+    const pathOf = (el) => {
+      const raw = []
+      for (let n = el; n && n.nodeType === 1 && n !== n.ownerDocument.documentElement; n = n.parentElement) raw.unshift(n)
+      const steps = []
+      let run = []
+      for (const n of raw) {
+        if (run.length && !sameBox(n, run[run.length - 1])) { steps.push(run); run = [] }
+        run.push(n)
+      }
+      if (run.length) steps.push([...run, ...groupDown(run[run.length - 1]).slice(1)])
+      return steps.map(makeStep)
+    }
+
+    // The bar keeps one width (2026-11-27, Jasper): the path fills its row
+    // outward from the current step, one step each side in turn, as far as
+    // it fits; what doesn't goes into "…" at that end, a click on which
+    // steps past the fold.
+    const mkStep = (i) => {
+      const b = document.createElement('button')
+      b.textContent = path[i].name
+      b.dataset.lumiaStep = String(i)
+      if (i === level) { b.className = 'on'; b.setAttribute('aria-pressed', 'true') }
+      return b
+    }
+    const mkSep = () => {
+      const s = document.createElement('span')
+      s.className = 'sep'; s.innerHTML = ICON.chevron
       return s
     }
-    const paint = (el) => {
-      current = el
-      if (!el) { hl.style.display = 'none'; tipMain.textContent = ''; return }
+    const mkMore = (step, label) => {
+      const b = document.createElement('button')
+      b.className = 'more'; b.textContent = '…'
+      b.dataset.lumiaStep = String(step)
+      b.setAttribute('aria-label', label)
+      return b
+    }
+    const renderBar = () => {
+      seg.textContent = ''
+      if (!path.length) return
+      // Measure every step, a chevron and a "…" in place.
+      const steps = path.map((_, i) => mkStep(i))
+      const probeSep = mkSep(), probeMore = mkMore(0, '')
+      seg.append(...steps, probeSep, probeMore)
+      const gap = 2
+      const w = steps.map((b) => b.offsetWidth)
+      const sepW = probeSep.offsetWidth + gap, moreW = probeMore.offsetWidth + gap
+      const avail = seg.clientWidth
+      seg.textContent = ''
+      const width = (a, b) => {
+        let t = 0
+        for (let i = a; i <= b; i++) t += w[i] + (i > a ? sepW + gap : 0)
+        if (a > 0) t += moreW + sepW
+        if (b < path.length - 1) t += moreW + sepW
+        return t
+      }
+      let a = level, b = level
+      for (let side = 0, stuck = 0; stuck < 2; side ^= 1) {
+        if (side === 0 && a > 0 && width(a - 1, b) <= avail) { a--; stuck = 0 }
+        else if (side === 1 && b < path.length - 1 && width(a, b + 1) <= avail) { b++; stuck = 0 }
+        else stuck++
+      }
+      if (a > 0) seg.append(mkMore(a - 1, 'Outer parts'), mkSep())
+      for (let i = a; i <= b; i++) {
+        if (i > a) seg.append(mkSep())
+        seg.append(steps[i])
+      }
+      if (b < path.length - 1) seg.append(mkSep(), mkMore(b + 1, 'Inner parts'))
+    }
+
+    const paint = () => {
+      const el = current()
+      if (!el) { hl.style.display = 'none'; drawNear([]); sizeBox.style.display = 'none'; renderBar(); return }
       const { ox, oy } = offOf(el.ownerDocument)
       const r = el.getBoundingClientRect()
+      const L = r.left + ox, T = r.top + oy
       hl.style.display = 'block'
-      hl.style.left = (r.left + ox) + 'px'; hl.style.top = (r.top + oy) + 'px'
+      hl.style.left = L + 'px'; hl.style.top = T + 'px'
       hl.style.width = r.width + 'px'; hl.style.height = r.height + 'px'
-      const scr = isScrollable(el)
-      hl.style.borderColor = scr ? '#22c55e' : '#00e3fd'
-      hl.style.background = scr ? 'rgba(34,197,94,0.16)' : 'rgba(0,227,253,0.12)'
-      tipMain.textContent = (scr ? '✓ scrolls · ' : 'static · ') + shortName(el) +
-        '  ' + Math.round(r.width) + '×' + Math.round(r.height)
+      // The size under the pick (above it near the bottom edge, inside it
+      // when neither fits), centred on it.
+      // Its place among the parts at this level ("2 of 5"), and the others
+      // outlined faintly (those on screen).
+      const { list, i } = siblingsOf(path[level])
+      sizeDims.textContent = `${Math.round(r.width)} × ${Math.round(r.height)}` + (list.length > 1 ? `, ${i + 1} of ${list.length}` : '')
+      const rects = []
+      for (const n of list) {
+        if (n === list[i]) continue
+        const q = n.getBoundingClientRect()
+        const nl = q.left + ox, nt = q.top + oy
+        if (nt + q.height < 0 || nt > innerHeight || nl + q.width < 0 || nl > innerWidth) continue
+        rects.push({ left: nl, top: nt, width: q.width, height: q.height })
+        if (rects.length >= NEAR_MAX) break
+      }
+      drawNear(rects)
+      sizeTag.hidden = !isScrollable(el)
+      sizeBox.style.display = 'flex'
+      const bw = sizeBox.offsetWidth, bh = sizeBox.offsetHeight
+      let top = T + r.height + 8
+      if (top + bh > innerHeight - 8) top = T - 8 - bh
+      if (top < 8) top = Math.min(innerHeight - 8 - bh, T + r.height - 8 - bh)
+      const left = Math.min(Math.max(8, L + r.width / 2 - bw / 2), innerWidth - 8 - bw)
+      sizeBox.style.top = top + 'px'; sizeBox.style.left = left + 'px'
+      renderBar()
     }
-    // D-pad / arrow-key navigation: walk the DOM tree from the current element
-    // (staying within its own document — never crosses a frame boundary).
-    const isElem = (n) => !!n && n.nodeType === 1
-    const navigate = (dir) => {
-      if (!current) return
-      let next = null
-      if (dir === 'up') { const p = current.parentElement; if (p && p !== current.ownerDocument.documentElement) next = p }
-      else if (dir === 'down') { if (isElem(current.firstElementChild)) next = current.firstElementChild }
-      else if (dir === 'left') { if (isElem(current.previousElementSibling)) next = current.previousElementSibling }
-      else if (dir === 'right') { if (isElem(current.nextElementSibling)) next = current.nextElementSibling }
-      if (!next) return
+
+    // The steps ↓ would take from the last one (its first child that
+    // shows, each level), so the bar shows what's inside the outlined part
+    // too (2026-11-27, Jasper). At most DOWN_STEPS.
+    const DOWN_STEPS = 3
+    const extendDown = (p) => {
+      const out = [...p]
+      for (let i = 0; i < DOWN_STEPS; i++) {
+        const last = out[out.length - 1]
+        const c = last && kidsOf(last.members[last.members.length - 1]).find(shows)
+        if (!c) break
+        out.push(makeStep(groupDown(c)))
+      }
+      return out
+    }
+    let hovered = null
+    const pickFromPointer = (el) => {
+      if (el === hovered) return
+      hovered = el
+      const p = pathOf(el)
+      level = p.length - 1
+      path = extendDown(p)
+      paint()
+    }
+    const stepTo = (i) => {
+      if (i < 0 || i >= path.length || i === level) return
       armed = true
-      try { next.scrollIntoView({ block: 'nearest', inline: 'nearest' }) } catch { /* ignore */ }
-      paint(next)
+      level = i
+      try { path[level].el.scrollIntoView({ block: 'nearest', inline: 'nearest' }) } catch { /* ignore */ }
+      paint()
+    }
+    // ← / → move to the part before / after at the same level (a sibling;
+    // 2026-11-27, Jasper), skipping ones that take no space (scripts,
+    // hidden parts). The steps after the level belonged to the old part
+    // and go.
+    const shows = (el) => { if (isEmptyLayer(el)) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 }
+    // The parts at a step's level that show, and where the step's own
+    // (outermost) part sits among them.
+    const siblingsOf = (step) => {
+      const own = step.members[0]
+      const parent = own.parentElement
+      const list = parent ? kidsOf(parent).filter((k) => k === own || shows(k)) : [own]
+      return { list, i: Math.max(0, list.indexOf(own)) }
+    }
+    const stepSide = (dir) => {
+      if (!path[level]) return
+      const { list, i } = siblingsOf(path[level])
+      const n = list[i + dir]
+      if (!n) return
+      armed = true
+      path = extendDown([...path.slice(0, level), makeStep(groupDown(n))])
+      try { path[level].el.scrollIntoView({ block: 'nearest', inline: 'nearest' }) } catch { /* ignore */ }
+      paint()
+    }
+    // ↓ at the innermost step goes into its first child that shows.
+    const stepIn = () => {
+      if (level < path.length - 1) { stepTo(level + 1); return }
+      const step = path[level]
+      if (!step) return
+      const c = kidsOf(step.members[step.members.length - 1]).find(shows)
+      if (c) { path = extendDown([...path, makeStep(groupDown(c))]); stepTo(level + 1) }
+    }
+
+    const KEEP = new Set(['img', 'svg', 'video', 'canvas', 'picture', 'iframe', 'input', 'textarea', 'select', 'button', 'hr'])
+    const isEmptyLayer = (n) => n.childElementCount === 0 && !KEEP.has(n.tagName.toLowerCase()) && !(n.textContent || '').trim()
+    // A part's children as laid out: display:contents wrappers have no box,
+    // their children stand in for them.
+    const kidsOf = (n) => {
+      const out = []
+      for (const k of n.children) {
+        let disp = ''
+        try { disp = viewOf(k).getComputedStyle(k).display } catch { /* ignore */ }
+        if (disp === 'contents') out.push(...kidsOf(k))
+        else out.push(k)
+      }
+      return out
+    }
+    // The browser's hit test skips parts with pointer-events: none (Google's
+    // result cards turn them off so clicks reach a whole-card link), so walk
+    // down from the hit by hand: the last child whose box holds the point
+    // (later ones paint on top), skipping empty layers. x / y in n's
+    // document's viewport.
+    const deepestAt = (n, x, y) => {
+      for (let guard = 0; guard < 200; guard++) {
+        const inside = kidsOf(n).filter((k) => {
+          if (isEmptyLayer(k)) return false
+          const r = k.getBoundingClientRect()
+          return r.width > 0 && r.height > 0 && x >= r.left && x < r.right && y >= r.top && y < r.bottom
+        })
+        if (!inside.length) return n
+        n = inside[inside.length - 1]
+      }
+      return n
     }
     // Each doc gets its own mousemove; e.currentTarget is that doc and
     // e.clientX/Y are in its viewport — convert to top coords via its offset.
@@ -1496,10 +1936,16 @@ function lumiaPickElement() {
       const tx = e.clientX + ox, ty = e.clientY + oy
       if (lastX >= 0 && Math.abs(tx - lastX) < 4 && Math.abs(ty - lastY) < 4) return
       lastX = tx; lastY = ty
-      const el = doc.elementFromPoint(e.clientX, e.clientY)
-      // null over a scrollbar → keep the current highlight; ignore our overlay.
-      if (!el || el === tip || el === hl || tip.contains(el)) return
-      paint(el)
+      // Everything under the pointer, top first; skip our own UI and empty
+      // layers stretched over content (a card's whole-card link, a fade),
+      // which would hide the parts under them (2026-11-27: Google's result
+      // cards). None left (over a scrollbar) → keep the current outline.
+      const all = doc.elementsFromPoint(e.clientX, e.clientY)
+      if (all[0] === ui) return // over the bar
+      const stack = all.filter((n) => n !== ui && n !== hl)
+      const hit = stack.find((n) => !isEmptyLayer(n)) || stack[0]
+      if (!hit) return
+      pickFromPointer(deepestAt(hit, e.clientX, e.clientY))
     }
     const finish = (targetEl, viaMouse) => {
       if (finished) return
@@ -1514,8 +1960,9 @@ function lumiaPickElement() {
         } catch { /* frame gone */ }
       }
       window.removeEventListener('blur', onBlur)
+      window.removeEventListener('scroll', onScroll, true)
       document.removeEventListener('visibilitychange', onVis)
-      hl.remove(); tip.remove(); styleTag.remove()
+      hl.remove(); ui.remove(); nearLayer.remove()
       delete window.__lumiaPicking
       // We commit on mousedown, so a mouseup (and maybe a click) still trail the
       // pick gesture — swallow them across every doc briefly so the page (or a
@@ -1534,37 +1981,33 @@ function lumiaPickElement() {
       }
       if (targetEl) {
         window.__lumiaPickedEl = targetEl
-        // Tell the service worker to start the region capture. (The popup has
-        // already closed, so we can't return this up the executeScript chain.)
         try { chrome.runtime.sendMessage({ type: 'lumia-region-picked' }) } catch { /* ignore */ }
       }
       resolve({ ok: !!targetEl })
     }
-    // Commit the HIGHLIGHTED element on mousedown — more reliable than waiting
-    // for a click (native scrollbars fire no DOM click, and some widgets change
-    // target between down and up so the click never lands on the pane). A press
-    // on a d-pad button adjusts the selection instead of committing.
+    // Commit the OUTLINED element on mousedown (native scrollbars fire no
+    // click). A press on a step of the bar moves the outline instead; a
+    // press elsewhere on the bar does nothing.
     const onDown = (e) => {
-      const navBtn = e.target && e.target.closest ? e.target.closest('[data-lumia-nav]') : null
-      if (navBtn) {
+      const p = e.composedPath ? e.composedPath() : [e.target]
+      const step = p.find((n) => n && n.nodeType === 1 && n.dataset && n.dataset.lumiaStep !== undefined)
+      if (step || p.includes(ui)) {
         e.preventDefault(); e.stopPropagation()
-        const dir = navBtn.getAttribute('data-lumia-nav')
-        if (dir === 'enter') { if (current) finish(current, true) }
-        else navigate(dir)
+        if (step && e.button === 0) stepTo(Number(step.dataset.lumiaStep))
         return
       }
       e.preventDefault(); e.stopPropagation()
       if (e.button !== 0) return // right = contextmenu cancels; ignore middle
-      if (!current) { const el = e.currentTarget.elementFromPoint(e.clientX, e.clientY); if (el) paint(el) }
-      finish(current || null, true)
+      if (!current()) { const el = e.currentTarget.elementFromPoint(e.clientX, e.clientY); if (el) pickFromPointer(el) }
+      finish(current() || null, true)
     }
     const key = (e) => {
       if (e.key === 'Escape') { e.preventDefault(); finish(null) }
-      else if (e.key === 'Enter' && current) { e.preventDefault(); finish(current) }
-      else if (e.key === 'ArrowUp') { e.preventDefault(); navigate('up') }
-      else if (e.key === 'ArrowDown') { e.preventDefault(); navigate('down') }
-      else if (e.key === 'ArrowLeft') { e.preventDefault(); navigate('left') }
-      else if (e.key === 'ArrowRight') { e.preventDefault(); navigate('right') }
+      else if (e.key === 'Enter' && current()) { e.preventDefault(); finish(current()) }
+      else if (e.key === 'ArrowUp') { e.preventDefault(); stepTo(level - 1) }
+      else if (e.key === 'ArrowDown') { e.preventDefault(); stepIn() }
+      else if (e.key === 'ArrowLeft') { e.preventDefault(); stepSide(-1) }
+      else if (e.key === 'ArrowRight') { e.preventDefault(); stepSide(1) }
     }
     const ctx = (e) => { e.preventDefault(); finish(null) }
     // Switching away from the whole tab/window cancels the pick. Defer + check
@@ -1575,6 +2018,8 @@ function lumiaPickElement() {
       setTimeout(() => { if (!finished && !document.hasFocus()) finish(null) }, 0)
     }
     const onVis = () => { if (document.hidden && armed) finish(null) }
+    // The page (or a pane) scrolled: the outline follows its part.
+    const onScroll = () => { if (current()) paint() }
 
     for (const d of listenerDocs) {
       try {
@@ -1586,6 +2031,8 @@ function lumiaPickElement() {
       } catch { /* frame gone */ }
     }
     window.addEventListener('blur', onBlur)
+    window.addEventListener('scroll', onScroll, true)
     document.addEventListener('visibilitychange', onVis)
+    renderBar()
   })
 }

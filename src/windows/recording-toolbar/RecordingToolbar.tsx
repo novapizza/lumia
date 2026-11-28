@@ -1,61 +1,48 @@
 import { useEffect, useRef, useState } from 'react'
+import { swatchClass, swatchFill, SWATCH_ROW } from '../../lib/swatch'
 
-// In-DOM tooltip rendered as a child of each button. Native HTML title
-// tooltips can't be used here — Windows renders them as a separate
-// top-level HWND (tooltips_class32) and macOS as a separate NSWindow via
-// NSToolTipManager; neither inherits the toolbar's content protection, so
-// the tooltip would leak into the recording. Rendering it inside the
-// React tree keeps it in the same HWND/NSWindow that already has
-// WDA_EXCLUDEFROMCAPTURE / NSWindowSharingNone applied.
-function Tip({ text, show }: { text: string; show: boolean }) {
-  return (
-    <span
-      className="absolute left-1/2 top-full -translate-x-1/2 mt-2 px-2 py-1 rounded-md text-[11px] whitespace-nowrap pointer-events-none transition-opacity"
-      style={{
-        background: 'rgba(20,20,28,0.95)',
-        border: '1px solid rgba(255,255,255,0.1)',
-        color: 'white',
-        opacity: show ? 1 : 0,
-        WebkitAppRegion: 'no-drag',
-        // Keep above the pill for layering, in case any sibling has its
-        // own paint order assumption. Within the tooltip's own HWND.
-        zIndex: 10,
-      } as React.CSSProperties}
-    >
-      {text}
-    </span>
-  )
-}
+import { Icon } from '../../components/Icon'
+import { Segmented } from '../../components/Segmented'
+import { TooltipLayer } from '../../components/TooltipLayer'
+import { ToastBox } from '../../components/Toast'
+import { ICON_BUTTON, DANGER_ICON_BUTTON } from '../../components/button-classes'
+import { OnStrip } from '../../components/OnStrip'
+import { DEFAULT_ANNOTATION_COLOR } from '../../../shared/annotation'
+import { SELECT_TOOLS, DRAW_TOOLS, EXTRA_TOOLS, COLORS, type Tool } from '../../components/AnnotationCanvas/tools'
+import { StrokeControl, COLOR_NAMES, toolTip } from '../../components/AnnotationCanvas/ToolBar'
+import { resolveKeymap, type Keymap } from '../../lib/editor-keys'
+
+// Style review 2026-11-24: solid bars like the editor toolbar and the capture
+// overlay, framed 32px icon buttons, colour-only hovers, one-word tooltips
+// through TooltipLayer (mounted here: standalone windows don't get App's).
+// It renders inside this window, so the window's content protection keeps
+// tooltips out of the recording too (a native `title` tooltip is a window of
+// its own and would leak). The recording itself wears the video colour
+// (kind-video), as the border and the clip cards do.
 
 type Phase = 'init' | 'countdown' | 'recording' | 'paused' | 'stopping' | 'saving' | 'done' | 'error'
 
-type Tool = 'none' | 'select' | 'pen' | 'arrow' | 'rect' | 'ellipse' | 'highlighter'
+/** The image editor's tools in its order, without Sticker and Blur
+ *  (2026-11-24, Jasper): the drawing layer is the editor's canvas. 'none'
+ *  is the cursor: clicks pass through to the recorded app, a click on a
+ *  shape selects it. */
+const ANNOTATE_TOOLS = [...SELECT_TOOLS, ...DRAW_TOOLS, ...EXTRA_TOOLS].filter(t => t.id !== 'blur')
 
-const ANNOTATE_TOOLS: { id: Tool; icon: string; label: string }[] = [
-  // 'none' doubles as the select mode now — clicks pass through to the
-  // recorded app on empty area, but clicking an existing stroke's outline
-  // selects it for delete/drag. Picking any of the drawing tools below
-  // re-locks the overlay for ink.
-  { id: 'none',        icon: 'arrow_selector_tool', label: 'Cursor (interact / select)' },
-  { id: 'pen',         icon: 'draw',          label: 'Pen' },
-  { id: 'arrow',       icon: 'arrow_forward', label: 'Arrow' },
-  { id: 'rect',        icon: 'crop_square',   label: 'Rectangle' },
-  { id: 'ellipse',     icon: 'circle',        label: 'Ellipse' },
-  { id: 'highlighter', icon: 'highlight',     label: 'Highlighter' },
-]
+/** The bars: solid toolbar fill, inset line edge, 10px padding. */
+const BAR = 'relative flex items-center p-2.5 rounded-lg bg-toolbar ring-1 ring-inset ring-line select-none'
+/** Stop: the main action, in the video colour; under the pointer
+ *  kind-video-hover, the accent's own hover step (2026-11-27; a colour-mix
+ *  written in place before). */
+const STOP_BUTTON =
+  'w-8 h-8 inline-flex items-center justify-center rounded-lg border flex-shrink-0 enabled:bg-kind-video enabled:border-kind-video enabled:text-on-accent enabled:hover:bg-kind-video-hover disabled:bg-elevated disabled:border-line disabled:text-fg-disabled'
+/** Clear all: the image editor's eraser (the shared DANGER_ICON_BUTTON;
+ *  Discard wears it too, 2026-11-27: every delete is grey at rest and
+ *  danger-text under the pointer). */
+const CLEAR_BUTTON = DANGER_ICON_BUTTON
+const NO_DRAG = { WebkitAppRegion: 'no-drag' } as React.CSSProperties
 
-const ANNOTATE_COLORS = [
-  '#f87171', // red
-  '#fbbf24', // amber
-  '#34d399', // emerald
-  '#60a5fa', // blue
-  '#a78bfa', // violet
-  '#ffffff', // white
-  '#000000', // black
-]
-
-const ANNOTATE_STROKE_PRESETS = [2, 4, 8, 14] as const
-
+// Settings › General › Countdown (0, 3 or 5); main sends it with the
+// countdown signal. 3 until told.
 const COUNTDOWN_START = 3
 
 function formatTime(ms: number): string {
@@ -66,7 +53,10 @@ function formatTime(ms: number): string {
 }
 
 export default function RecordingToolbar() {
-  const [phase, setPhase] = useState<Phase>('init')
+  // The page opens on "Starting in 3" (2026-11-24): main builds the toolbar
+  // ahead, hidden, and sends `countdown` as it shows it; the count runs from
+  // then, while the recorder host acquires its stream.
+  const [phase, setPhase] = useState<Phase>('countdown')
   const [elapsed, setElapsed] = useState(0)
   const [countdown, setCountdown] = useState(COUNTDOWN_START)
   const [micEnabled, setMicEnabled] = useState(false)
@@ -81,10 +71,12 @@ export default function RecordingToolbar() {
   // the recording toolbar — main process is still the source of truth, we
   // just mirror it for instant button-state feedback.
   const [tool, setTool] = useState<Tool>('none')
-  const [annotateColor, setAnnotateColor] = useState('#f87171')
+  const [annotateColor, setAnnotateColor] = useState(DEFAULT_ANNOTATION_COLOR)
   const [strokeWidth, setStrokeWidth] = useState<number>(4)
 
   const countdownTimer = useRef<ReturnType<typeof setInterval> | null>(null)
+  // The countdown has started (signal or the late is-shown ask), once.
+  const countdownStartedRef = useRef(false)
 
   // Refs on each visible pill so the hover hit-test below can ask the OS
   // window to capture clicks only when the cursor is actually over a pill.
@@ -129,24 +121,27 @@ export default function RecordingToolbar() {
 
   // Listen for state updates from main
   useEffect(() => {
+    const startCountdown = (seconds = COUNTDOWN_START) => {
+      countdownStartedRef.current = true
+      setPhase('countdown')
+      setCountdown(seconds)
+      if (countdownTimer.current) clearInterval(countdownTimer.current)
+      // Off: recording starts as soon as the host's stream is ready.
+      if (seconds <= 0) { window.electronAPI?.toolbarBegin?.(); return }
+      let c = seconds
+      countdownTimer.current = setInterval(() => {
+        c -= 1
+        setCountdown(c)
+        if (c <= 0) {
+          if (countdownTimer.current) { clearInterval(countdownTimer.current); countdownTimer.current = null }
+          // Main starts recording now, or once the host's stream is ready.
+          window.electronAPI?.toolbarBegin?.()
+        }
+      }, 1000)
+    }
     const handler = (s: { phase?: Phase; elapsedMs?: number; countdown?: number; micEnabled?: boolean; micAvailable?: boolean; annotationOn?: boolean; error?: string }) => {
       if (typeof s.micAvailable === 'boolean') setMicAvailable(s.micAvailable)
-      if (s.phase === 'countdown') {
-        // Start local countdown (main just kicks it off)
-        setPhase('countdown')
-        setCountdown(COUNTDOWN_START)
-        if (countdownTimer.current) clearInterval(countdownTimer.current)
-        let c = COUNTDOWN_START
-        countdownTimer.current = setInterval(() => {
-          c -= 1
-          setCountdown(c)
-          if (c <= 0) {
-            if (countdownTimer.current) { clearInterval(countdownTimer.current); countdownTimer.current = null }
-            window.electronAPI?.toolbarBegin?.()
-          }
-        }, 1000)
-        return
-      }
+      if (s.phase === 'countdown') { startCountdown(s.countdown); return }
       // Any non-countdown phase means the countdown is over (begin fired, or
       // the session errored / was cancelled): stop the local countdown timer
       // so it can't call toolbarBegin() and start a recording the user was
@@ -167,6 +162,15 @@ export default function RecordingToolbar() {
       if (s.error) setError(s.error)
     }
     window.electronAPI?.onToolbarState?.(handler)
+    // Shown before this page was listening: the countdown signal was missed.
+    window.electronAPI?.toolbarIsShown?.().then(async shown => {
+      if (!shown) return
+      const s = await window.electronAPI?.getSettings?.().catch(() => null)
+      // The signal, a begin or a cancel may have come meanwhile: start only
+      // if nothing has.
+      if (countdownStartedRef.current || phaseRef.current !== 'countdown') return
+      startCountdown(s?.recordCountdown)
+    }).catch(() => { /* signal comes */ })
     return () => { window.electronAPI?.removeAllListeners?.('toolbar:state') }
   }, [])
 
@@ -190,6 +194,34 @@ export default function RecordingToolbar() {
       setStrokeWidth(s.strokeWidth)
     })
     return () => { window.electronAPI?.removeAllListeners?.('annotation:state') }
+  }, [])
+
+  // The overlay's selection and Undo / Redo availability (as the image
+  // editor's toolbar has them).
+  const [edit, setEdit] = useState<{ selectedKind: string | null; canUndo: boolean; canRedo: boolean }>({ selectedKind: null, canUndo: false, canRedo: false })
+  useEffect(() => {
+    window.electronAPI?.annotationGetEditState?.().then(s => { if (s) setEdit(s) }).catch(() => { /* ignore */ })
+    window.electronAPI?.onAnnotationEditState?.(s => setEdit(s))
+    return () => { window.electronAPI?.removeAllListeners?.('annotation:edit-state') }
+  }, [])
+
+  // The editor's keys, for the tools' tooltips (they work while drawing).
+  const [keymap, setKeymap] = useState<Keymap | undefined>(undefined)
+  useEffect(() => {
+    const mac = navigator.platform.toLowerCase().includes('mac')
+    window.electronAPI?.getSettings?.().then(s => setKeymap(resolveKeymap('image', s?.editorKeys?.image, mac))).catch(() => { /* names only */ })
+  }, [])
+
+  // Esc during the countdown cancels, like the X (2026-11-24; the toolbar
+  // has focus then).
+  const phaseRef = useRef(phase)
+  phaseRef.current = phase
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && phaseRef.current === 'countdown') { e.preventDefault(); window.electronAPI?.toolbarCancel?.() }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
   }, [])
 
   // Cleanup countdown interval on unmount
@@ -217,318 +249,195 @@ export default function RecordingToolbar() {
   const pickColor = (c: string) => { setAnnotateColor(c); window.electronAPI?.annotationSetColor?.(c) }
   const pickStroke = (n: number) => { setStrokeWidth(n); window.electronAPI?.annotationSetStroke?.(n) }
   const onAnnotateUndo = () => window.electronAPI?.annotationUndo?.()
+  const onAnnotateRedo = () => window.electronAPI?.annotationRedo?.()
   const onAnnotateClear = () => window.electronAPI?.annotationClear?.()
 
   const isRecording = phase === 'recording'
   const isPaused = phase === 'paused'
   const isBusy = phase === 'stopping' || phase === 'saving'
+  // Saving, saved and failed show as the app's toast (ToastBox, 2026-11-24)
+  // in the bar's place, not as text in the bar.
+  const asToast = isBusy || phase === 'done' || phase === 'error'
   const showAnnotationRow = annotationOn && (isRecording || isPaused)
+  // Options follow the tool, or the selected shape's kind (as in the image
+  // editor): stroke and colours for the drawing tools, none for the cursor
+  // with nothing selected.
+  // (The same rules as AnnotationCanvas/ToolBar.tsx: colours for the line
+  // tools and Text; a line width, a text size or a blur strength.)
+  const optionsOf = edit.selectedKind && edit.selectedKind !== 'none' ? edit.selectedKind : tool
+  const showColours = ['pen', 'highlighter', 'arrow', 'rect', 'ellipse', 'text'].includes(optionsOf)
+  const strokeKind: 'line' | 'size' | 'strength' | null =
+    optionsOf === 'text' ? 'size' : optionsOf === 'blur' ? 'strength'
+    : ['pen', 'highlighter', 'arrow', 'rect', 'ellipse'].includes(optionsOf) ? 'line' : null
+
+  const micButton = (
+    <button
+      type="button"
+      onClick={handleMic}
+      disabled={!micAvailable}
+      aria-pressed={micAvailable && micEnabled}
+      className={`${ICON_BUTTON} group/on relative`}
+      style={NO_DRAG}
+      data-tip={!micAvailable ? 'No microphone' : micEnabled ? 'Mute' : 'Microphone'}
+      aria-label={!micAvailable ? 'No microphone available' : micEnabled ? 'Mute microphone' : 'Turn on microphone'}
+    >
+      <Icon name={micAvailable && micEnabled ? 'mic' : 'mic_off'} className="text-[16px]" />
+      {micAvailable && micEnabled && <OnStrip />}
+    </button>
+  )
 
   return (
-    <div className="fixed inset-0 flex flex-col items-center justify-start pt-1.5 gap-1.5" style={{ fontFamily: 'Manrope, sans-serif' }}>
+    <div className="fixed inset-0 flex flex-col items-center justify-start pt-1.5 gap-1.5">
+      <TooltipLayer />
       <div
         ref={recordingPillRef}
-        className="relative flex items-center gap-2 px-3 py-2 glass-refractive rounded-full shadow-[0_8px_32px_rgba(0,0,0,0.5)]"
-        style={{
-          WebkitAppRegion: 'drag',
-          background: 'rgba(20,20,28,0.85)',
-          border: '1px solid rgba(255,255,255,0.08)',
-          // glass-refractive applies backdrop-filter, which creates a
-          // stacking context that traps Tip inside this pill. Bump the
-          // recording pill above the annotation pill (z:10) at the
-          // outer-wrapper level so tooltips dropping from this row paint
-          // over the annotation row instead of being hidden behind it.
-          zIndex: 20,
-        } as React.CSSProperties}
+        className={asToast ? '' : `${BAR} gap-10`}
+        // Above the annotation bar, so tooltips from this row paint over it.
+        style={{ WebkitAppRegion: 'drag', zIndex: 20 } as React.CSSProperties}
       >
-        {/* Countdown view */}
+        {/* Countdown */}
         {phase === 'countdown' && (
-          <div className="flex items-center gap-3 px-3">
-            <span className="text-xs font-bold uppercase tracking-widest text-red-400">Starting in</span>
-            <span
-              className="text-3xl font-black text-white tabular-nums"
-              style={{ minWidth: 36, textAlign: 'center' }}
-              key={countdown}
-            >
-              {countdown}
-            </span>
-            <div className="w-px h-6 bg-white/10" />
-            {/* Mic toggle — RecorderHost has already pre-acquired the mic
-                track during this countdown window, so flipping it here is
-                instant and stays in effect once recording begins. Disabled
-                when no mic was acquired (permission denied / no device). */}
-            <ToolbarBtn
-              icon={!micAvailable ? 'mic_off' : micEnabled ? 'mic' : 'mic_off'}
-              label={!micAvailable ? 'No microphone available' : micEnabled ? 'Mute microphone' : 'Enable microphone'}
-              onClick={handleMic}
-              active={micAvailable && micEnabled}
-              accent={micAvailable && micEnabled ? 'red' : 'neutral'}
-              disabled={!micAvailable}
-            />
-          </div>
+          <>
+            <div className="flex items-center gap-3 pl-1">
+              {/* At 0 (the count's end, or Countdown off) until recording
+                  starts: no number. */}
+              {countdown > 0 ? <>
+                <span className="text-xs font-medium text-fg-secondary">Starting in</span>
+                <span className="w-6 text-center text-[21px] font-semibold leading-none text-fg tabular-nums" key={countdown}>{countdown}</span>
+              </> : <span className="text-xs font-medium text-fg-secondary">Starting…</span>}
+            </div>
+            {/* The mic was acquired during the countdown, so this is instant
+                and carries into the recording. */}
+            {micButton}
+          </>
         )}
 
-        {/* Saving / done / error view */}
-        {(phase === 'stopping' || phase === 'saving') && (
-          <div className="flex items-center gap-3 px-4">
-            <div className="w-4 h-4 border-2 border-red-400 border-t-transparent rounded-full animate-spin" />
-            <span className="text-xs font-semibold text-slate-200">Saving…</span>
-          </div>
-        )}
-        {phase === 'done' && (
-          <div className="flex items-center gap-3 px-4">
-            <span className="material-symbols-outlined text-emerald-400">check_circle</span>
-            <span className="text-xs font-semibold text-slate-200">Saved</span>
-          </div>
-        )}
-        {phase === 'error' && (
-          <div className="flex items-center gap-3 px-4">
-            <span className="material-symbols-outlined text-red-400">error</span>
-            <span className="text-xs font-semibold text-red-300 max-w-[320px] truncate" title={error}>{error || 'Recording failed'}</span>
-          </div>
-        )}
+        {/* Saving / saved / failed: the app's toast */}
+        {isBusy && <ToastBox kind="progress" icon="progress_activity" message="Saving video…" />}
+        {phase === 'done' && <ToastBox kind="success" icon="check_circle" message="Video saved" />}
+        {phase === 'error' && <ToastBox kind="error" icon="error" message="Couldn't record video" detail={error || undefined} />}
 
-        {/* Recording / paused view */}
+        {/* Recording / paused */}
         {(isRecording || isPaused) && (
           <>
-            {/* LIVE indicator */}
-            <div className="flex items-center gap-2 pl-2 pr-1">
-              <span
-                className={`w-2.5 h-2.5 rounded-full bg-red-500 ${isRecording ? 'animate-pulse' : 'opacity-50'}`}
-                style={{ boxShadow: isRecording ? '0 0 10px rgba(239,68,68,0.8)' : 'none' }}
-              />
-              <span
-                className="text-sm font-black text-white tabular-nums"
-                style={{ minWidth: 56, textAlign: 'center' }}
-              >
-                {formatTime(elapsed)}
-              </span>
+            {/* Live: the video dot (grey while paused) and the time. */}
+            <div className="flex items-center gap-2 pl-1">
+              <span className={`w-2 h-2 rounded-full ${isRecording ? 'bg-kind-video' : 'bg-fg-tertiary'}`} />
+              <span className="min-w-[38px] text-xs font-medium text-fg tabular-nums">{formatTime(elapsed)}</span>
             </div>
 
-            <div className="w-px h-6 bg-white/10" />
+            <div className="flex items-center gap-3">
+              {micButton}
+              <button
+                type="button"
+                onClick={handleAnnotation}
+                aria-pressed={annotationOn}
+                className={`${ICON_BUTTON} group/on relative`}
+                style={NO_DRAG}
+                data-tip="Draw"
+                aria-label={annotationOn ? 'Stop drawing on screen' : 'Draw on screen'}
+              >
+                <Icon name="edit" className="text-[16px]" />
+                {annotationOn && <OnStrip />}
+              </button>
+            </div>
 
-            {/* Mic toggle */}
-            <ToolbarBtn
-              icon={!micAvailable ? 'mic_off' : micEnabled ? 'mic' : 'mic_off'}
-              label={!micAvailable ? 'No microphone available' : micEnabled ? 'Mute microphone' : 'Enable microphone'}
-              onClick={handleMic}
-              active={micAvailable && micEnabled}
-              accent={micAvailable && micEnabled ? 'red' : 'neutral'}
-              disabled={!micAvailable}
-            />
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                onClick={isRecording ? handlePause : handleResume}
+                disabled={isBusy}
+                className={ICON_BUTTON}
+                style={NO_DRAG}
+                data-tip={isRecording ? 'Pause' : 'Resume'}
+                aria-label={isRecording ? 'Pause recording' : 'Resume recording'}
+              >
+                <Icon name={isRecording ? 'pause' : 'play_arrow'} className="text-[16px]" />
+              </button>
+              <button
+                type="button"
+                onClick={handleStop}
+                disabled={isBusy}
+                className={STOP_BUTTON}
+                style={NO_DRAG}
+                data-tip="Stop"
+                aria-label="Stop and save the recording"
+              >
+                <Icon name="stop" className="text-[16px]" />
+              </button>
+            </div>
 
-            {/* Annotate (live drawing overlay on the recording display) */}
-            <ToolbarBtn
-              icon="edit"
-              label={annotationOn ? 'Stop annotating' : 'Annotate on screen'}
-              onClick={handleAnnotation}
-              active={annotationOn}
-            />
-
-            {/* Pause / Resume */}
-            {isRecording ? (
-              <ToolbarBtn
-                icon="pause"
-                label="Pause"
-                onClick={handlePause}
-              />
-            ) : (
-              <ToolbarBtn
-                icon="play_arrow"
-                label="Resume"
-                onClick={handleResume}
-                accent="red"
-                active
-              />
-            )}
-
-            {/* Stop */}
-            <ToolbarBtn
-              icon="stop"
-              label="Stop recording"
-              onClick={handleStop}
-              accent="red"
-              active
-              disabled={isBusy}
-            />
-
-            <div className="w-px h-6 bg-white/10" />
-
-            {/* Cancel */}
-            <ToolbarBtn
-              icon="close"
-              label="Cancel (discard)"
+            <button
+              type="button"
               onClick={handleCancel}
               disabled={isBusy}
-              compact
-            />
+              className={DANGER_ICON_BUTTON}
+              style={NO_DRAG}
+              data-tip="Discard"
+              aria-label="Discard the recording"
+            >
+              <Icon name="close" className="text-[16px]" />
+            </button>
           </>
         )}
       </div>
 
-      {/* Annotation row — same window, second pill below the recording
-          row. Used to live in its own BrowserWindow that visually anchored
-          to this one; merging eliminates an entire class of z-order bugs
-          where the recording toolbar's transparent bottom strip swallowed
-          clicks aimed at the palette's centre. */}
+      {/* Drawing row: the image editor's toolbar (tools, stroke, colours),
+          then Undo, Clear and Close. Same window as the row above (its own
+          window used to lose z-order fights with it). */}
       {showAnnotationRow && (
         <div
           ref={annotationPillRef}
-          className="relative flex items-center gap-1.5 px-2 py-1.5 rounded-full shadow-[0_8px_32px_rgba(0,0,0,0.5)]"
-          style={{
-            WebkitAppRegion: 'drag',
-            background: 'rgba(20,20,28,0.92)',
-            border: '1px solid rgba(255,255,255,0.08)',
-            backdropFilter: 'blur(20px)',
-            // Below the recording pill's z:20 so tooltips dropping from
-            // the row above paint over this pill's body.
-            zIndex: 10,
-          } as React.CSSProperties}
+          className={`${BAR} gap-10`}
+          style={{ WebkitAppRegion: 'drag', zIndex: 10 } as React.CSSProperties}
         >
-          {/* Tool buttons */}
-          {ANNOTATE_TOOLS.map(t => (
-            <AnnotateToolBtn key={t.id} icon={t.icon} label={t.label} active={tool === t.id} onClick={() => pickTool(t.id)} />
-          ))}
+          <div className="flex items-center gap-3" style={NO_DRAG}>
+            <Segmented<Tool>
+              value={tool}
+              onChange={pickTool}
+              options={ANNOTATE_TOOLS.map(t => ({ key: t.id, icon: t.icon, title: t.label, tip: toolTip(t.label, t.id, keymap) }))}
+            />
+            {strokeKind && <StrokeControl kind={strokeKind} value={strokeWidth} onChange={pickStroke} />}
+            {/* No Custom colour: left out while Custom opened macOS's colour
+                panel, a window of its own that would show in the recording.
+                The in-app picker (2026-11-24) has no such window, but the
+                row stays without Custom (decided 2026-11-25). */}
+            {showColours && <div className={`${SWATCH_ROW} p-1 -m-1`}>
+              {COLORS.map(c => {
+                const on = annotateColor.toLowerCase() === c
+                return (
+                  <button
+                    key={c}
+                    type="button"
+                    onClick={() => pickColor(c)}
+                    data-tip={COLOR_NAMES[c] ?? c}
+                    aria-label={COLOR_NAMES[c] ?? c}
+                    aria-pressed={on}
+                    className={swatchClass(on)}
+                    style={{ background: swatchFill(c) }}
+                  />
+                )
+              })}
+            </div>}
+          </div>
 
-          <Sep />
-
-          {/* Stroke size */}
-          {ANNOTATE_STROKE_PRESETS.map(n => (
-            <StrokeBtn key={n} size={n} active={strokeWidth === n} onClick={() => pickStroke(n)} />
-          ))}
-
-          <Sep />
-
-          {/* Color swatches */}
-          {ANNOTATE_COLORS.map(c => (
-            <ColorBtn key={c} color={c} active={annotateColor === c} onClick={() => pickColor(c)} />
-          ))}
-
-          <Sep />
-
-          {/* Undo + Clear + Close */}
-          <AnnotateToolBtn icon="undo"         label="Undo"             onClick={onAnnotateUndo} />
-          <AnnotateToolBtn icon="delete_sweep" label="Clear all"        onClick={onAnnotateClear} />
-          <AnnotateToolBtn icon="close"        label="Close annotation" onClick={handleAnnotation} accent="red" />
+          <div className="flex items-center gap-3" style={NO_DRAG}>
+            <button type="button" onClick={onAnnotateUndo} disabled={!edit.canUndo} className={ICON_BUTTON} data-tip="Undo" aria-label="Undo">
+              <Icon name="undo" className="text-[16px]" />
+            </button>
+            <button type="button" onClick={onAnnotateRedo} disabled={!edit.canRedo} className={ICON_BUTTON} data-tip="Redo" aria-label="Redo">
+              <Icon name="redo" className="text-[16px]" />
+            </button>
+            <button type="button" onClick={onAnnotateClear} className={CLEAR_BUTTON} data-tip="Clear" aria-label="Clear all drawings">
+              <Icon name="cleaning_services" className="text-[16px]" />
+            </button>
+            <button type="button" onClick={handleAnnotation} className={ICON_BUTTON} data-tip="Close" aria-label="Stop drawing on screen">
+              <Icon name="close" className="text-[16px]" />
+            </button>
+          </div>
         </div>
       )}
     </div>
   )
 }
 
-function ToolbarBtn({
-  icon, label, onClick, active = false, accent = 'neutral', disabled = false, compact = false,
-}: {
-  icon: string
-  label: string
-  onClick: () => void
-  active?: boolean
-  accent?: 'neutral' | 'red'
-  disabled?: boolean
-  compact?: boolean
-}) {
-  const [hover, setHover] = useState(false)
-  const base = 'relative flex items-center justify-center rounded-full transition-all disabled:opacity-40 disabled:cursor-not-allowed'
-  const size = compact ? 'w-7 h-7' : 'w-9 h-9'
-  let color: string
-  if (active && accent === 'red') {
-    color = 'bg-red-500/90 text-white hover:bg-red-500 shadow-[0_0_12px_rgba(239,68,68,0.5)]'
-  } else if (active) {
-    color = 'bg-white/15 text-white hover:bg-white/25'
-  } else {
-    color = 'text-slate-300 hover:text-white hover:bg-white/10'
-  }
-  return (
-    <button
-      onClick={onClick}
-      aria-label={label}
-      disabled={disabled}
-      onMouseEnter={() => setHover(true)}
-      onMouseLeave={() => setHover(false)}
-      className={`${base} ${size} ${color}`}
-      style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
-    >
-      <span className={`material-symbols-outlined ${compact ? 'text-[16px]' : 'text-[18px]'}`}>{icon}</span>
-      <Tip text={label} show={hover && !disabled} />
-    </button>
-  )
-}
-
-function Sep() {
-  return <div className="w-px h-5 bg-white/10 mx-0.5" />
-}
-
-function AnnotateToolBtn({
-  icon, label, onClick, active = false, accent,
-}: {
-  icon: string
-  label: string
-  onClick: () => void
-  active?: boolean
-  accent?: 'red'
-}) {
-  const [hover, setHover] = useState(false)
-  let cls = 'text-slate-300 hover:text-white hover:bg-white/10'
-  if (active) cls = 'bg-white/20 text-white'
-  if (accent === 'red') cls = 'text-slate-300 hover:text-white hover:bg-red-500/70'
-  return (
-    <button
-      onClick={onClick}
-      aria-label={label}
-      onMouseEnter={() => setHover(true)}
-      onMouseLeave={() => setHover(false)}
-      className={`relative w-8 h-8 rounded-full flex items-center justify-center transition-all ${cls}`}
-      style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
-    >
-      <span className="material-symbols-outlined text-[18px]">{icon}</span>
-      <Tip text={label} show={hover} />
-    </button>
-  )
-}
-
-function StrokeBtn({ size, active, onClick }: { size: number; active: boolean; onClick: () => void }) {
-  const [hover, setHover] = useState(false)
-  return (
-    <button
-      onClick={onClick}
-      aria-label={`Stroke ${size}px`}
-      onMouseEnter={() => setHover(true)}
-      onMouseLeave={() => setHover(false)}
-      className={`relative w-7 h-7 rounded-full flex items-center justify-center transition-all ${
-        active ? 'bg-white/20' : 'hover:bg-white/10'
-      }`}
-      style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
-    >
-      <span
-        className="rounded-full bg-white"
-        style={{
-          width: Math.min(18, Math.max(3, size * 1.2)),
-          height: Math.min(18, Math.max(3, size * 1.2)),
-        }}
-      />
-      <Tip text={`Stroke ${size}px`} show={hover} />
-    </button>
-  )
-}
-
-function ColorBtn({ color, active, onClick }: { color: string; active: boolean; onClick: () => void }) {
-  const [hover, setHover] = useState(false)
-  return (
-    <button
-      onClick={onClick}
-      aria-label={`Color ${color}`}
-      onMouseEnter={() => setHover(true)}
-      onMouseLeave={() => setHover(false)}
-      className={`relative w-6 h-6 rounded-full transition-all ${
-        active ? 'ring-2 ring-white ring-offset-2 ring-offset-[rgb(20,20,28)]' : 'hover:scale-110'
-      }`}
-      style={{
-        WebkitAppRegion: 'no-drag',
-        backgroundColor: color,
-        border: color === '#ffffff' || color === '#000000' ? '1px solid rgba(255,255,255,0.2)' : 'none',
-      } as React.CSSProperties}
-    >
-      <Tip text={color} show={hover} />
-    </button>
-  )
-}

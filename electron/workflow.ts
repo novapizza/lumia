@@ -1,7 +1,6 @@
 import { clipboard, dialog, nativeImage, shell } from 'electron'
 import { writeFile, mkdir, copyFile } from 'fs/promises'
 import { dirname, join } from 'path'
-import { homedir } from 'os'
 import type { TemplateStore } from './templates'
 import type { WorkflowResult, UploadResult, UploadDestination } from './types'
 import { uploadImageDataUrlToDrive } from './google-drive-service'
@@ -10,7 +9,7 @@ import { HistoryStore } from './history'
 import { resolveSaveStartDir, rememberSaveDir } from './settings'
 import { localTimestamp } from './utils'
 import { writeThumbnailFromDataUrl } from './thumbnail'
-import { getMainWindow, openHistoryItemInEditor, isMainDismissed } from './index'
+import { getMainWindow, openHistoryItemInEditor } from './index'
 import { showNotification } from './notify'
 import { v4 as uuidv4 } from 'uuid'
 
@@ -101,17 +100,25 @@ export class WorkflowEngine {
       if (step.type === 'notify') {
         const uploaded = result.uploads.filter(u => u.success).length
         const failed = result.uploads.filter(u => !u.success).length
-        const parts: string[] = []
-        if (result.copiedToClipboard) parts.push('Copied to clipboard')
-        if (result.savedPath) parts.push('Saved to disk')
-        if (uploaded > 0) parts.push(`Uploaded to ${uploaded} destination${uploaded > 1 ? 's' : ''}`)
-        if (failed > 0) parts.push(`${failed} upload${failed > 1 ? 's' : ''} failed`)
+        // One sentence (toast text standard, src/lib/toast.ts): "Image
+        // copied, saved and uploaded", "…, link copied". A failed upload
+        // says only that, the failed count in parentheses when some places
+        // worked: "Couldn't upload image (1 of 2)" (Jasper, 2026-11-24).
+        const done: string[] = []
+        if (result.copiedToClipboard) done.push('copied')
+        if (result.savedPath) done.push('saved')
+        if (uploaded > 0) done.push('uploaded')
+        let body = done.length ? `Image ${joinAnd(done)}` : ''
+        if (uploaded > 0 && template.afterUpload.some(s => s.type === 'copyUrl')) body += ', link copied'
+        if (failed > 0) body = `Couldn't upload image${uploaded > 0 ? ` (${failed} of ${uploaded + failed})` : ''}`
 
-        const fromTray = isMainDismissed()
         showNotification({
-          body: parts.join(' · ') || 'Capture complete',
+          body: body || 'Image captured',
+          kind: failed > 0 ? 'error' : 'success',
+          // Runs come from the editor, which shows its own toast.
+          onlyWhenClosed: true,
           thumbnailDataUrl: imageData,
-          onClick: () => { void openHistoryItemInEditor(clickHistoryId, fromTray) },
+          onClick: () => { void openHistoryItemInEditor(clickHistoryId) },
           launchId: clickHistoryId || undefined,
         })
       }
@@ -242,4 +249,9 @@ export class WorkflowEngine {
   private async uploadToGoogleDrive(imageData: string, folderId?: string): Promise<UploadResult> {
     return uploadImageDataUrlToDrive(imageData, folderId)
   }
+}
+
+/** "a", "a and b", "a, b and c". */
+function joinAnd(words: string[]): string {
+  return words.length <= 1 ? (words[0] ?? '') : `${words.slice(0, -1).join(', ')} and ${words[words.length - 1]}`
 }

@@ -3,75 +3,192 @@
 <head>
   <meta charset="utf-8" />
   <style>
-    :root { color-scheme: light dark; }
-    * { box-sizing: border-box; }
+    /* Lumia's look (2026-11-26, design/STYLEGUIDE.md): drawn as one of the
+       app's menus (the Upload menu: elevated box, 4px in, 28px rows) with
+       its messages drawn like toasts. Colours are the app's roles: the
+       values below (src/index.css) by the system's light / dark until the
+       app has sent its theme, then the app's (popup.js applyTheme).
+       Manrope ships in fonts/ (OFL). */
+    @font-face { font-family: 'Manrope'; font-weight: 400; src: url('fonts/manrope-400.woff2') format('woff2'); }
+    @font-face { font-family: 'Manrope'; font-weight: 500; src: url('fonts/manrope-500.woff2') format('woff2'); }
+    @font-face { font-family: 'Manrope'; font-weight: 600; src: url('fonts/manrope-600.woff2') format('woff2'); }
+
+    :root {
+      color-scheme: dark;
+      --elevated: #1d1d1d;
+      --elevated-hover: #282828;
+      --line: rgba(231, 231, 231, 0.12);
+      --fg: #e7e7e7;
+      --fg-secondary: #b4b4b4;
+      --fg-disabled: #535353;
+      --accent: #7440d5;
+      --accent-hover: #6931c8;
+      --on-accent: #ffffff;
+      --success-text: #6dd797;
+      --warning-subtle: #421e00;
+      --warning-text: #e67a2a;
+      --danger-subtle: #371210;
+      --danger-text: #e84b50;
+      /* Icon lines: 1px at 14 / 16px. */
+      --icon-line: 1px;
+    }
+    @media (prefers-color-scheme: light) {
+      :root {
+        color-scheme: light;
+        --elevated: #ffffff;
+        --elevated-hover: #f4f4f4;
+        --line: rgba(29, 29, 29, 0.14);
+        --fg: #1d1d1d;
+        --fg-secondary: #575757;
+        --fg-disabled: #b1b1b1;
+        --success-text: #007742;
+        --warning-subtle: #ffead9;
+        --warning-text: #b95a00;
+        --danger-subtle: #ffecea;
+        --danger-text: #c21725;
+        /* Dark icons on a light ground get the 0.35px boost. */
+        --icon-line: 1.35px;
+      }
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
-      width: 260px; margin: 0; padding: 14px;
-      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-      background: #0f172a; color: #e2e8f0;
+      width: 240px;
+      /* 10px from the popup's sides and bottom to the rows' and messages'
+         boxes (2026-11-26; the menu's 4px before, with the messages
+         indented to 10px), the header's 4px above. */
+      padding: 4px 10px 10px;
+      background: var(--elevated);
+      color: var(--fg);
+      font-family: 'Manrope', sans-serif;
+      user-select: none;
+      cursor: default;
     }
-    .head { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
-    .head img { width: 20px; height: 20px; border-radius: 5px; }
-    .head .title { font-size: 13px; font-weight: 700; }
-    .status { display: flex; align-items: center; gap: 6px; margin-left: auto; font-size: 10px; font-weight: 600; }
-    .dot { width: 8px; height: 8px; border-radius: 50%; background: #64748b; }
-    .dot.on { background: #22c55e; } .dot.off { background: #ef4444; }
-    button.mode {
-      display: flex; align-items: center; gap: 10px; width: 100%;
-      padding: 10px 12px; margin-top: 8px; border: 1px solid rgba(255,255,255,0.08);
-      border-radius: 10px; background: rgba(255,255,255,0.03); color: inherit;
-      cursor: pointer; text-align: left; transition: background .15s, border-color .15s;
+    /* The same page in a tab (popup.html?tab, 2026-11-27): Arc can't show
+       the site access prompt over its popup ("Could not find an active
+       window"), so the popup opens this and the grant is asked from here.
+       The box in the middle of the tab, only the header and the Allow
+       message (the capture rows would capture this tab). */
+    html.tab { min-height: 100%; background: var(--elevated); }
+    html.tab body { margin: 120px auto 0; border-radius: 8px; box-shadow: inset 0 0 0 1px var(--line); }
+    html.tab .row { display: none; }
+    svg { flex-shrink: 0; fill: none; stroke: currentColor; stroke-width: var(--icon-line); stroke-linecap: round; stroke-linejoin: round; }
+    svg * { vector-effect: non-scaling-stroke; }
+    [hidden] { display: none !important; }
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+    /* Header: the logo and the extension's name, the connection's check on
+       the right; its contents line up with the rows' icons (10px into a
+       row). */
+    .head { height: 40px; padding: 0 10px; display: flex; align-items: center; gap: 6px; }
+    .head img { width: 20px; height: 20px; }
+    .head .name { font-size: 14px; line-height: 20px; font-weight: 600; color: var(--fg); }
+    /* "Scroll Capture" a colour step down (2026-11-26, a try). */
+    .head .name .sub { color: var(--fg-secondary); }
+    .status { margin-left: auto; display: flex; color: var(--success-text); }
+    .status svg { width: 14px; height: 14px; }
+
+    /* Rows: the Upload menu's (h-7 px-2.5 rounded-md, 12px medium,
+       elevated-hover under the pointer), with a 16px icon. Text and icon
+       in fg (2026-11-26; the menu's fg-secondary read as disabled here). */
+    .row {
+      width: 100%; height: 28px; padding: 0 10px;
+      display: flex; align-items: center; gap: 8px;
+      border: 0; border-radius: 6px; background: none;
+      font: inherit; font-size: 12px; font-weight: 500; color: var(--fg);
+      text-align: left; cursor: default;
     }
-    button.mode:hover:not(:disabled) { background: rgba(0,227,253,0.10); border-color: rgba(0,227,253,0.35); }
-    button.mode:disabled { opacity: .45; cursor: not-allowed; }
-    .ic { width: 30px; height: 30px; flex: 0 0 auto; border-radius: 8px; display: flex; align-items: center; justify-content: center; background: rgba(0,227,253,0.12); }
-    .ic svg { width: 17px; height: 17px; stroke: #00e3fd; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
-    .lbl { min-width: 0; display: flex; flex-direction: column; }
-    .lbl .t { display: block; font-size: 12.5px; font-weight: 650; }
-    .lbl .d { display: block; font-size: 10.5px; color: #94a3b8; margin-top: 1px; }
-    .hint { margin-top: 12px; font-size: 10.5px; color: #94a3b8; line-height: 1.45; }
-    .hint a { color: #00e3fd; cursor: pointer; text-decoration: none; }
-    .perm {
-      display: none; margin-top: 12px; padding: 10px 12px; border-radius: 10px;
-      border: 1px solid rgba(250,204,21,0.25); background: rgba(250,204,21,0.07);
-      font-size: 10.5px; color: #e2e8f0; line-height: 1.45;
+    .row svg { width: 16px; height: 16px; }
+    .row:not(:disabled):hover { background: var(--elevated-hover); }
+    .row:disabled { color: var(--fg-disabled); }
+
+    /* Messages, drawn like a toast of their kind: rounded-lg, a line
+       edge, py-2, the kind's fill, a 14px icon centred, 12px medium fg, the
+       reason in 11px medium fg-secondary. Blockers and failures under the
+       header like the app's toasts under its bar (2026-11-26), 12px above
+       the rows (gap-3, related); the site access offer under the rows. The edge is inset (ring, counted in the
+       padding) and the sides 10px (px-2.5, not the toast's px-3) so the
+       icon lines up with the rows' icons, 20px from the popup's edge. The
+       title stays on one line (the copy fits, the ellipsis is a guard);
+       the reason may wrap. */
+    .msg {
+      margin: 0 0 12px;
+      padding: 8px 10px;
+      display: flex; align-items: center; gap: 8px;
+      box-shadow: inset 0 0 0 1px var(--line); border-radius: 8px;
+      background: var(--elevated);
     }
-    .perm button {
-      display: block; width: 100%; margin-top: 8px; padding: 7px 10px;
-      border: 0; border-radius: 8px; background: #00e3fd; color: #0f172a;
-      font-size: 11.5px; font-weight: 700; cursor: pointer;
+    /* Below the rows (the site access offer): 12px under them, the body's
+       10px below. */
+    .row ~ .msg { margin: 12px 0 0; }
+    .msg svg { width: 14px; height: 14px; }
+    .msg .text { min-width: 0; flex: 1; }
+    .msg .what { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .msg .what { font-size: 12px; line-height: 16px; font-weight: 500; color: var(--fg); }
+    .msg .why { margin-top: 2px; font-size: 11px; line-height: 16px; font-weight: 500; color: var(--fg-secondary); }
+    .msg.warning { background: var(--warning-subtle); }
+    .msg.warning svg { color: var(--warning-text); }
+    .msg.error { background: var(--danger-subtle); }
+    .msg.error svg { color: var(--danger-text); }
+    .msg.info svg { color: var(--accent); }
+    /* A toast's text button: 24px accent, px-3, 8px from the box's edge. */
+    .msg.with-action { padding-right: 8px; }
+    .msg button {
+      height: 24px; padding: 0 12px; flex-shrink: 0;
+      border: 0; border-radius: 6px; background: var(--accent); color: var(--on-accent);
+      font: inherit; font-size: 12px; font-weight: 500; cursor: default;
     }
+    .msg button:hover { background: var(--accent-hover); }
   </style>
 </head>
 <body>
   <div class="head">
-    <img src="icon48.png" alt="" />
-    <span class="title">Lumia Scroll Capture</span>
-    <span class="status"><span id="dot" class="dot"></span><span id="statusText">…</span></span>
+    <img src="logo.svg" alt="" />
+    <span class="name">Lumia <span class="sub">Scroll Capture</span></span>
+    <!-- Connected: the check alone (2026-11-26; "Connected" beside it
+         before), named for screen readers. -->
+    <span class="status" id="status" role="img" aria-label="Connected" hidden>
+      <!-- Lucide CircleCheck -->
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="m16 9-5.5 5.5L8 12"/></svg>
+    </span>
   </div>
 
-  <button class="mode" id="viewport">
-    <span class="ic"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/></svg></span>
-    <span class="lbl"><span class="t">Visible area</span><span class="d">Just what's on screen now</span></span>
-  </button>
-
-  <button class="mode" id="fullpage">
-    <span class="ic"><svg viewBox="0 0 24 24"><rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 8h8M8 12h8M8 16h5"/></svg></span>
-    <span class="lbl"><span class="t">Full page</span><span class="d">Scroll and stitch the whole page</span></span>
-  </button>
-
-  <button class="mode" id="region">
-    <span class="ic"><svg viewBox="0 0 24 24"><path d="M4 8V5a1 1 0 0 1 1-1h3M16 4h3a1 1 0 0 1 1 1v3M20 16v3a1 1 0 0 1-1 1h-3M8 20H5a1 1 0 0 1-1-1v-3"/></svg></span>
-    <span class="lbl"><span class="t">Select area</span><span class="d">Pick an element or pane to capture</span></span>
-  </button>
-
-  <div class="perm" id="perm">
-    Captures started from the <b>Lumia app</b> (and live tab previews) need
-    one extra permission. Captures started from this menu always work.
-    <button id="grant">Allow captures from the app</button>
+  <!-- Lumia isn't running: a warning (nothing broke). -->
+  <div class="msg warning" id="offline" hidden>
+    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="12" x2="12" y1="8" y2="12"/><line x1="12" x2="12.01" y1="16" y2="16"/></svg>
+    <div class="text"><div class="what">Lumia isn't open</div><div class="why">Open the app to capture</div></div>
   </div>
 
-  <div class="hint" id="hint"></div>
+  <!-- A capture that couldn't start. -->
+  <div class="msg error" id="error" role="alert" hidden>
+    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="12" x2="12" y1="8" y2="12"/><line x1="12" x2="12.01" y1="16" y2="16"/></svg>
+    <div class="text"><div class="what">Couldn't start capture</div><div class="why" id="errorWhy" hidden></div></div>
+  </div>
+
+  <!-- The capture overlay's icons for the same captures: Lucide AppWindow
+       (a window's view), ScrollText (Scroll), the app's RectDashed (Region). -->
+  <button class="row" id="viewport" disabled>
+    <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M10 4v4"/><path d="M2 8h20"/><path d="M6 4v4"/></svg>
+    Capture visible area
+  </button>
+  <button class="row" id="fullpage" disabled>
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 12h-5"/><path d="M15 8h-5"/><path d="M19 17V5a2 2 0 0 0-2-2H4"/><path d="M8 21h12a2 2 0 0 0 2-2v-1a1 1 0 0 0-1-1H11a1 1 0 0 0-1 1v1a2 2 0 1 1-4 0V5a2 2 0 1 0-4 0v2a1 1 0 0 0 1 1h3"/></svg>
+    Capture full page
+  </button>
+  <button class="row" id="region" disabled>
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 3a2 2 0 0 0-2 2"/><path d="M20 3a2 2 0 0 1 2 2"/><path d="M22 19a2 2 0 0 1-2 2"/><path d="M4 21a2 2 0 0 1-2-2"/><path d="M8.5 3h1"/><path d="M14.5 3h1"/><path d="M8.5 21h1"/><path d="M14.5 21h1"/><path d="M2 9v1"/><path d="M2 14v1"/><path d="M22 9v1"/><path d="M22 14v1"/></svg>
+    Capture part of page
+  </button>
+
+  <!-- The optional <all_urls> grant, offered while Lumia is connected: an
+       info message with its action, like the update toast's Restart. Under
+       the rows (2026-11-26; at the top it read as a blocker, and the rows
+       work without it). -->
+  <div class="msg info with-action" id="perm" hidden>
+    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>
+    <div class="text"><div class="what">Allow site access</div><div class="why">For Lumia's hotkey and tab previews</div></div>
+    <button id="grant">Allow</button>
+  </div>
 
   <script src="popup.js"></script>
 </body>

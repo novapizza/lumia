@@ -9,6 +9,7 @@ import { focusWindowByTitlePrefix } from './native-input'
 import { sendCaptureToEditor } from './capture'
 import { showNotification } from './notify'
 import { getDisplayIcc } from './display-icc'
+import { macAppForPeerPort } from './socket-peer-app'
 import { convertBgraToSrgbInPlace } from './icc-to-srgb'
 
 /**
@@ -31,6 +32,8 @@ import { convertBgraToSrgbInPlace } from './icc-to-srgb'
 // developer running two Lumia instances (or an unlucky port collision)
 // still gets a binding; the extension probes them in order.
 const BRIDGE_PORTS = [51763, 51764, 51765]
+/** Name shown for a browser that didn't say what it is (the picker's card). */
+const UNKNOWN_BROWSER = 'Browser'
 
 const IDLE_WATCHDOG_MS = 20_000 // per-message inactivity limit during a capture
 const MAX_OUTPUT_PIXELS = 256_000_000 // same stitched-size cap as scroll-capture.ts
@@ -99,6 +102,10 @@ type ExtMessage =
   /** Reply to our 'preview' request — a downscaled JPEG of the client's
    *  active tab, for the multi-browser picker. */
   | { type: 'preview-result'; id: string; dataUrl?: string | null; title?: string; url?: string }
+  /** Reply to our 'focus' request: whether the browser's window is the one
+   *  in front (the OS's active window). Extensions before 2026-11-27 don't
+   *  answer. */
+  | { type: 'focus-result'; id: string; focused?: boolean }
   /** User picked a mode in the extension popup — start a capture session in
    *  THAT browser targeting the given tab, in the chosen mode. */
   | { type: 'capture-request'; target?: { windowId: number; tabId: number }; mode?: 'viewport' | 'fullpage' | 'region' }
@@ -108,7 +115,12 @@ type ExtMessage =
 interface ClientInfo {
   /** Stable per-connection id the renderer uses to target a specific browser. */
   id: number
+  /** The browser's name: the app on the socket's other end on macOS
+   *  (`macApp`), else what the extension reports. */
   browser: string
+  /** macOS: the app owning the connection (socket-peer-app.ts), e.g. "Arc",
+   *  which the extension reports as "Chrome". Used for the focus assist. */
+  macApp?: string
   version: string
   lastSeen: number
 }
@@ -209,10 +221,6 @@ export function getExtensionStatus(): ExtensionStatus {
   }
 }
 
-export function isExtensionConnected(): boolean {
-  return getExtensionStatus().connected
-}
-
 function broadcastStatus() {
   const main = getMain?.()
   if (main && !main.isDestroyed()) {
@@ -262,7 +270,18 @@ function listenOn(portIdx: number) {
       ws.close(4003, 'forbidden origin')
       return
     }
-    clients.set(ws, { id: nextClientId++, browser: 'browser', version: '', lastSeen: Date.now() })
+    clients.set(ws, { id: nextClientId++, browser: UNKNOWN_BROWSER, version: '', lastSeen: Date.now() })
+    const peerPort = req.socket.remotePort
+    if (peerPort) {
+      void macAppForPeerPort(peerPort).then(name => {
+        const info = clients.get(ws)
+        if (!info || !name) return
+        info.macApp = name
+        info.browser = name
+        console.log(`[ext-bridge] client=${info.id} is ${name}`)
+        broadcastStatus()
+      })
+    }
 
     ws.on('message', (raw) => {
       let msg: ExtMessage
@@ -297,8 +316,18 @@ export function setupExtensionBridge(getMainWindow: () => BrowserWindow | null) 
     }
   }, 20_000)
 
-  app.on('will-quit', () => {
+  // Quitting drops the browsers at once (2026-11-26): ws 8's server.close()
+  // leaves open connections alone, so the extension only saw the socket
+  // close when the process finally exited, seconds later, and its popup
+  // and toolbar dot kept saying "connected" until then. before-quit, not
+  // will-quit: the earliest point of a real quit (closing the window only
+  // hides it). A quit called off later costs nothing lasting: the
+  // extension reconnects on its next try.
+  app.on('before-quit', () => {
     clearInterval(pingTimer)
+    for (const ws of clients.keys()) {
+      try { ws.terminate() } catch { /* already gone */ }
+    }
     wss?.close()
   })
 
@@ -314,10 +343,10 @@ export function setupExtensionBridge(getMainWindow: () => BrowserWindow | null) 
   ipcMain.handle('scroll-extension:previews', () => requestAllPreviews())
   ipcMain.handle('scroll-extension:start-with', (_e, clientId: number) => {
     const entry = openClients().find(([, info]) => info.id === clientId)
-    if (!entry) return { ok: false, error: 'That browser is no longer connected' }
-    // Fire-and-forget: the session reports progress/result/errors through the
-    // scroll-capture:* events (ScrollCaptureDialog), so the picker can close
-    // as soon as the session kicks off instead of blocking until it finishes.
+    if (!entry) return { ok: false, error: "Couldn't start capture", detail: 'Browser disconnected' }
+    // Fire-and-forget: the session delivers through sendCaptureToEditor (or
+    // a toast on failure), so the picker can close as soon as the session
+    // kicks off instead of blocking until it finishes.
     void runExtensionSession(entry[0])
     return { ok: true }
   })
@@ -359,6 +388,51 @@ function requestAllPreviews(): Promise<BrowserPreview[]> {
   ))
 }
 
+// ── Browser in front ────────────────────────────────────────────────────────
+
+/** How long the scroll hotkey waits for the browsers to say whether they're
+ *  in front. A current extension answers in a few ms; an older one never
+ *  does, and the hotkey then falls back to the screen scroll. */
+const FOCUS_TIMEOUT_MS = 250
+const pendingFocus = new Map<string, (focused: boolean) => void>()
+
+/** The connected browser whose window is in front, or null (2026-11-27: the
+ *  scroll hotkey captures that browser's page through the extension, else
+ *  runs the screen scroll). Each extension reports its own window's focus
+ *  (chrome.windows `focused`, the OS's active window), so no app-name
+ *  matching per platform. */
+export async function focusedExtensionClient(): Promise<WebSocket | null> {
+  const open = openClients()
+  if (open.length === 0) return null
+  const answers = await Promise.all(open.map(([ws]) => new Promise<boolean>(resolve => {
+    const id = randomUUID()
+    const timer = setTimeout(() => { pendingFocus.delete(id); resolve(false) }, FOCUS_TIMEOUT_MS)
+    pendingFocus.set(id, focused => { clearTimeout(timer); pendingFocus.delete(id); resolve(focused) })
+    try { ws.send(JSON.stringify({ type: 'focus', id })) } catch { pendingFocus.get(id)?.(false) }
+  })))
+  const i = answers.indexOf(true)
+  console.log(`[ext-bridge] focus: ${open.map(([, info], j) => `${info.browser}=${answers[j]}`).join(', ')}`)
+  return i < 0 ? null : open[i][0]
+}
+
+// ── Theme ───────────────────────────────────────────────────────────────────
+
+/** The app's theme for the extension's own UI (2026-11-26): its popup, the
+ *  in-page status pill and the Region picker draw with these role values
+ *  (`--color-<role>` names without the prefix), so they match the app's
+ *  light / dark mode and the user's custom picks. Sent to every client on
+ *  `hello` and again on every change; the extension keeps the last one. */
+type ExtensionTheme = { mode: 'light' | 'dark'; roles: Record<string, string> }
+let extensionTheme: ExtensionTheme | null = null
+
+export function setExtensionTheme(theme: ExtensionTheme) {
+  extensionTheme = theme
+  const msg = JSON.stringify({ type: 'theme', ...theme })
+  for (const ws of clients.keys()) {
+    if (ws.readyState === WebSocket.OPEN) ws.send(msg)
+  }
+}
+
 // ── Message routing ─────────────────────────────────────────────────────────
 
 function handleMessage(ws: WebSocket, msg: ExtMessage) {
@@ -366,9 +440,11 @@ function handleMessage(ws: WebSocket, msg: ExtMessage) {
     case 'hello': {
       const info = clients.get(ws)
       if (info) {
-        info.browser = msg.browser || 'browser'
+        info.browser = info.macApp ?? (msg.browser || UNKNOWN_BROWSER)
         info.version = msg.version || ''
+        console.log(`[ext-bridge] hello client=${info.id} browser=${info.browser} version=${info.version}`)
       }
+      if (extensionTheme) ws.send(JSON.stringify({ type: 'theme', ...extensionTheme }))
       broadcastStatus()
       break
     }
@@ -379,12 +455,13 @@ function handleMessage(ws: WebSocket, msg: ExtMessage) {
       resetWatchdog()
       const { type: _t, id: _id, ...meta } = msg
       session.meta = meta
+      console.log(`[ext-bridge] meta frames=${(meta as { totalFrames?: number }).totalFrames} title=${JSON.stringify(msg.title ?? '')}`)
       // Focus assist: the extension already called
       // chrome.windows.update({focused:true}), but Windows denies foreground
       // to a background process — while Lumia, holding foreground right now,
       // is always allowed to hand it over. macOS gets an AppleScript
       // `activate` for the same reason. Best-effort on both.
-      focusBrowserWindow(clients.get(ws)?.browser, msg.title)
+      focusBrowserWindow(clients.get(ws), msg.title)
       break
     }
     case 'frame': {
@@ -401,12 +478,18 @@ function handleMessage(ws: WebSocket, msg: ExtMessage) {
       const s = session
       clearSessionWatchdog()
       session = null
+      console.log(`[ext-bridge] done frames=${s.frames.length}`)
       s.resolve({ frames: s.frames, meta: s.meta })
       break
     }
     case 'capture-error': {
       if (!session || session.id !== msg.id) break
+      console.log(`[ext-bridge] extension error: ${msg.error}`)
       failSession(new Error(msg.error || 'Extension capture failed'))
+      break
+    }
+    case 'focus-result': {
+      pendingFocus.get(msg.id)?.(msg.focused === true)
       break
     }
     case 'preview-result': {
@@ -426,6 +509,7 @@ function handleMessage(ws: WebSocket, msg: ExtMessage) {
     case 'capture-request': {
       // Popup action in a browser: capture in THAT browser, on the given tab,
       // in the chosen mode. Ignore while another session is running.
+      console.log(`[ext-bridge] capture-request mode=${msg.mode} target=${JSON.stringify(msg.target)} busy=${!!session}`)
       if (session) break
       void runExtensionSession(ws, msg.target, msg.mode)
       break
@@ -446,14 +530,19 @@ const MAC_APP_NAMES: Record<string, string> = {
 
 /** Bring the capturing browser to the foreground so the user watches the
  *  capture (behind its interaction-blocking overlay) and can hit Stop. */
-function focusBrowserWindow(browser: string | undefined, tabTitle: string | undefined) {
+function focusBrowserWindow(info: ClientInfo | undefined, tabTitle: string | undefined) {
   try {
     if (process.platform === 'win32') {
       if (tabTitle) focusWindowByTitlePrefix(tabTitle)
-    } else if (process.platform === 'darwin' && browser) {
-      const appName = MAC_APP_NAMES[browser]
-      if (appName) {
-        execFile('osascript', ['-e', `tell application "${appName}" to activate`], () => { /* best effort */ })
+    } else if (process.platform === 'darwin' && info) {
+      // The app that owns the connection; the name map is only a fallback
+      // when that lookup failed. Never launch an app: activate it only if
+      // it's running (activating Google Chrome for Arc launched Chrome, Arc
+      // lost focus and the extension cancelled the capture, 2026-11-25).
+      const appName = info.macApp ?? MAC_APP_NAMES[info.browser]
+      console.log(`[ext-bridge] focus assist browser=${info.browser} activate=${appName ?? '(none)'}`)
+      if (appName && !/["\\]/.test(appName)) {
+        execFile('osascript', ['-e', `if application "${appName}" is running then tell application "${appName}" to activate`], () => { /* best effort */ })
       }
     }
   } catch { /* focus is best-effort — capture works without it */ }
@@ -467,6 +556,7 @@ function resetWatchdog() {
     if (session && session.ws.readyState === WebSocket.OPEN) {
       session.ws.send(JSON.stringify({ type: 'capture-cancel', id: session.id }))
     }
+    console.log('[ext-bridge] watchdog: no message for 20s')
     failSession(new Error('Browser extension stopped responding'))
   }, IDLE_WATCHDOG_MS)
 }
@@ -483,16 +573,6 @@ function failSession(err: Error) {
   s.reject(err)
 }
 
-export function cancelExtensionCapture() {
-  if (!session) return
-  const s = session
-  s.cancelled = true
-  if (s.ws.readyState === WebSocket.OPEN) {
-    s.ws.send(JSON.stringify({ type: 'capture-cancel', id: s.id }))
-  }
-  failSession(new Error('cancelled'))
-}
-
 // ── Capture orchestration ───────────────────────────────────────────────────
 
 /**
@@ -501,12 +581,13 @@ export function cancelExtensionCapture() {
  * the browser picker (with live tab previews) and the session starts later
  * via the `scroll-extension:start-with` IPC.
  */
-export async function startExtensionCapture(): Promise<{ ok: boolean; error?: string }> {
+export async function startExtensionCapture(client?: WebSocket): Promise<{ ok: boolean; error?: string }> {
   const main = getMain?.()
   if (!main || main.isDestroyed()) return { ok: false, error: 'Main window unavailable' }
-  const open = openClients()
-  if (open.length === 0) return { ok: false, error: 'Browser extension not connected' }
   if (session) return { ok: false, error: 'A scroll capture is already running' }
+  if (client) return runExtensionSession(client)
+  const open = openClients()
+  if (open.length === 0) return { ok: false, error: 'extension-not-connected' }
   if (open.length === 1) return runExtensionSession(open[0][0])
 
   // Multiple browsers connected — let the user pick one. Dashboard is the
@@ -544,7 +625,9 @@ async function runExtensionSession(
   // Hide the app while the browser captures — same as every other mode. No
   // dialog, no app-side progress. (Started from the Dashboard card the window
   // is visible; from the toolbar icon it may already be in the tray.)
-  if (main.isVisible()) main.hide()
+  // Only a window we hid comes back if the session ends without a capture.
+  const hidByUs = main.isVisible()
+  if (hidByUs) main.hide()
 
   const id = randomUUID()
   let wasCancelled = false
@@ -563,6 +646,7 @@ async function runExtensionSession(
       }
       resetWatchdog()
       ws.send(JSON.stringify({ type: 'capture-start', id, target, mode: mode || 'fullpage' }))
+      console.log(`[ext-bridge] capture-start sent mode=${mode || 'fullpage'}`)
     })
 
     if (!result.meta) throw new Error('Extension did not report page metrics')
@@ -582,13 +666,27 @@ async function runExtensionSession(
     const { dataUrl, srgb } = stitchExtensionFrames(result.frames, result.meta, icc)
     // Deliver like a normal capture: this surfaces the editor (or, if the
     // app was dismissed to tray, just a notification) and handles history.
-    await sendCaptureToEditor(dataUrl, 'scrolling', srgb ? undefined : displayId)
+    // Source: the browser and the page title the extension reported.
+    const browser = clients.get(ws)?.browser
+    await sendCaptureToEditor(dataUrl, 'scrolling', srgb ? undefined : displayId, {
+      source: { app: browser && browser !== UNKNOWN_BROWSER ? browser : undefined, title: result.meta.title },
+    })
     return { ok: true }
   } catch (err) {
-    if (wasCancelled) return { ok: false, error: 'cancelled' }
     const message = err instanceof Error ? err.message : String(err)
+    console.log(`[ext-bridge] session ended without a capture: ${wasCancelled ? 'cancelled' : message}`)
+    // The window we hid comes back (2026-11-25: it stayed hidden, so the
+    // error toast went to a hidden window and nothing seemed to happen).
+    // Cancelled (the user switched tab or window): behind the browser,
+    // without taking focus. An error: in front, with the toast, like the
+    // screen scroll's failure path (restoreFromOverlayCancel).
+    if (wasCancelled) {
+      if (hidByUs && !main.isDestroyed()) main.showInactive()
+      return { ok: false, error: 'cancelled' }
+    }
     // No dialog to show the error in — surface it as a toast instead.
-    showNotification({ body: `Scroll capture failed — ${message}` })
+    showNotification({ body: `Couldn't capture page\n${message}`, kind: 'error' })
+    if (hidByUs && !main.isDestroyed()) { main.show(); main.focus() }
     return { ok: false, error: message }
   }
 }
@@ -658,7 +756,7 @@ function stitchCroppedRegion(
   const lastY = Math.round(ordered[ordered.length - 1].scrollY * scale)
   const totalHeight = lastY + cropH
   if (totalHeight * cropW > MAX_OUTPUT_PIXELS) {
-    throw new Error('Selection is too tall to stitch — try a shorter area')
+    throw new Error('Selection is too tall, try a shorter area')
   }
   const outBuf = Buffer.alloc(totalHeight * rowBytes)
   let lastIdx = images.length - 1
@@ -696,7 +794,7 @@ function stitchDocumentScroller(
   const lastY = Math.round(ordered[ordered.length - 1].scrollY * scale)
   const totalHeight = lastY + rawH
   if (totalHeight * rawW > MAX_OUTPUT_PIXELS) {
-    throw new Error('Page is too tall to stitch — try capturing a shorter section')
+    throw new Error('Page is too tall, try a shorter section')
   }
   const outBuf = Buffer.alloc(totalHeight * rowBytes)
   let lastIdx = images.length - 1
@@ -753,7 +851,7 @@ function stitchElementScroller(
   const contentH = Math.max(bandH, lastYOff + bandH)
   const outH = top + contentH + (rawH - bottom)
   if (outH * rawW > MAX_OUTPUT_PIXELS) {
-    throw new Error('Page is too tall to stitch — try capturing a shorter section')
+    throw new Error('Page is too tall, try a shorter section')
   }
 
   const out = Buffer.alloc(outH * rowBytes)

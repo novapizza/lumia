@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import type { WorkflowResult, WorkflowTemplate } from '../types'
 
+import { Icon } from './Icon'
 interface Props {
   imageDataUrl: string
   templateId?: string
@@ -85,15 +86,15 @@ export default function ShareDialog({ imageDataUrl, templateId, onClose }: Props
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-md"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-scrim backdrop-blur-md"
       onClick={onClose}
     >
       <div
-        className="relative w-[400px] rounded-3xl overflow-hidden shadow-2xl liquid-glass"
+        className="relative w-[400px] rounded-3xl overflow-hidden liquid-glass"
         onClick={e => e.stopPropagation()}
       >
         {/* ── Image preview ── */}
-        <div className="relative bg-black/30" style={{ maxHeight: 280, overflow: 'hidden' }}>
+        <div className="relative bg-canvas" style={{ maxHeight: 280, overflow: 'hidden' }}>
           <img
             src={imageDataUrl}
             className="w-full h-auto block"
@@ -108,9 +109,9 @@ export default function ShareDialog({ imageDataUrl, templateId, onClose }: Props
           {/* close button */}
           <button
             onClick={onClose}
-            className="absolute top-3 right-3 w-7 h-7 rounded-full bg-black/40 hover:bg-black/70 flex items-center justify-center text-white/60 hover:text-white transition-all"
+            className="absolute top-3 right-3 w-7 h-7 rounded-md bg-black/40 hover:bg-black/70 flex items-center justify-center text-white/60 hover:text-white transition-all"
           >
-            <span className="material-symbols-outlined text-[16px]">close</span>
+            <Icon name="close" className="text-[14px]" />
           </button>
         </div>
 
@@ -124,14 +125,14 @@ export default function ShareDialog({ imageDataUrl, templateId, onClose }: Props
                 <button
                   onClick={handleRunWorkflow}
                   className="w-full flex items-center gap-3 px-4 py-3.5 rounded-2xl transition-all hover:brightness-110 active:scale-[0.98] primary-gradient"
-                  style={{ fontFamily: 'Manrope, sans-serif' }}
+                 
                 >
-                  <div className="w-8 h-8 rounded-xl bg-black/20 flex items-center justify-center flex-shrink-0">
-                    <span className="material-symbols-outlined text-[18px] text-white/90">{template.icon}</span>
+                  <div className="w-8 h-8 rounded-xl bg-on-accent/10 flex items-center justify-center flex-shrink-0">
+                    <Icon name={template.icon} className="text-[20px] text-on-accent" />
                   </div>
                   <div className="flex-1 text-left">
-                    <p className="text-xs font-black text-slate-900 leading-tight">{template.name}</p>
-                    <p className="text-[10px] text-slate-900 opacity-70 leading-tight mt-0.5">
+                    <p className="text-xs font-black text-on-accent leading-tight">{template.name}</p>
+                    <p className="text-[10px] text-on-accent opacity-70 leading-tight mt-0.5">
                       {[
                         template.afterCapture.length > 0 && `${template.afterCapture.length} pre-step`,
                         template.destinations.length > 0 && `${template.destinations.length} upload`,
@@ -139,16 +140,16 @@ export default function ShareDialog({ imageDataUrl, templateId, onClose }: Props
                       ].filter(Boolean).join(' · ')}
                     </p>
                   </div>
-                  <span className="material-symbols-outlined text-[20px] text-slate-900 opacity-70">chevron_right</span>
+                  <Icon name="chevron_right" className="text-[20px] text-on-accent opacity-70" />
                 </button>
               )}
 
               {/* Divider */}
               {templateId && (
                 <div className="flex items-center gap-3 py-1">
-                  <div className="flex-1 h-px bg-white/5" />
-                  <span className="text-[10px] font-semibold text-slate-600 uppercase tracking-widest">or</span>
-                  <div className="flex-1 h-px bg-white/5" />
+                  <div className="flex-1 h-px bg-fill" />
+                  <span className="text-[10px] font-semibold text-fg-tertiary uppercase tracking-widest">or</span>
+                  <div className="flex-1 h-px bg-fill" />
                 </div>
               )}
 
@@ -156,18 +157,18 @@ export default function ShareDialog({ imageDataUrl, templateId, onClose }: Props
               <div className="grid grid-cols-2 gap-2">
                 <button
                   onClick={handleCopy}
-                  className="flex items-center justify-center gap-2 py-3 rounded-xl text-xs font-semibold text-slate-300 hover:text-white transition-all bg-white/[0.04] border border-white/10"
-                  style={{ fontFamily: 'Manrope, sans-serif' }}
+                  className="flex items-center justify-center gap-2 py-3 rounded-xl text-xs font-semibold text-fg-secondary hover:text-fg transition-all bg-fill border border-line"
+                 
                 >
-                  <span className="material-symbols-outlined text-[16px] text-slate-400">content_copy</span>
+                  <Icon name="content_copy" className="text-[16px] text-fg-secondary" />
                   Copy
                 </button>
                 <button
                   onClick={handleSave}
-                  className="flex items-center justify-center gap-2 py-3 rounded-xl text-xs font-semibold text-slate-300 hover:text-white transition-all bg-white/[0.04] border border-white/10"
-                  style={{ fontFamily: 'Manrope, sans-serif' }}
+                  className="flex items-center justify-center gap-2 py-3 rounded-xl text-xs font-semibold text-fg-secondary hover:text-fg transition-all bg-fill border border-line"
+                 
                 >
-                  <span className="material-symbols-outlined text-[16px] text-slate-400">save</span>
+                  <Icon name="save" className="text-[16px] text-fg-secondary" />
                   Save
                 </button>
               </div>
@@ -176,8 +177,8 @@ export default function ShareDialog({ imageDataUrl, templateId, onClose }: Props
 
           {status === 'loading' && (
             <div className="flex items-center justify-center gap-3 py-5">
-              <div className="w-5 h-5 rounded-full border-2 border-primary border-t-transparent animate-spin" />
-              <span className="text-sm text-slate-400" style={{ fontFamily: 'Manrope, sans-serif' }}>Running…</span>
+              <div className="w-5 h-5 rounded-full border-2 border-accent border-t-transparent animate-spin" />
+              <span className="text-sm text-fg-secondary">Running…</span>
             </div>
           )}
 
@@ -185,9 +186,9 @@ export default function ShareDialog({ imageDataUrl, templateId, onClose }: Props
             <div className="space-y-1.5">
               {/* No-result fallback */}
               {!result && (
-                <div className="flex items-center gap-3 py-3 px-4 rounded-xl bg-secondary/10 border border-secondary/20">
-                  <span className="material-symbols-outlined text-secondary text-lg">check_circle</span>
-                  <span className="text-sm font-semibold text-white" style={{ fontFamily: 'Manrope, sans-serif' }}>Done!</span>
+                <div className="flex items-center gap-3 py-3 px-4 rounded-xl bg-accent/10 border border-accent/20">
+                  <Icon name="check_circle" className="text-accent-text text-[20px]" />
+                  <span className="text-sm font-semibold text-fg">Done!</span>
                 </div>
               )}
 
@@ -210,8 +211,8 @@ export default function ShareDialog({ imageDataUrl, templateId, onClose }: Props
 
               <button
                 onClick={onClose}
-                className="w-full mt-2 py-2.5 rounded-xl text-xs font-bold text-slate-400 hover:text-white transition-colors bg-white/[0.04] border border-white/10"
-                style={{ fontFamily: 'Manrope, sans-serif' }}
+                className="w-full mt-2 py-2.5 rounded-xl text-xs font-bold text-fg-secondary hover:text-fg transition-colors bg-fill border border-line"
+               
               >
                 Close
               </button>
@@ -220,14 +221,14 @@ export default function ShareDialog({ imageDataUrl, templateId, onClose }: Props
 
           {status === 'error' && (
             <div className="space-y-2">
-              <div className="flex items-start gap-3 p-3 rounded-xl bg-tertiary/10 border border-tertiary/20">
-                <span className="material-symbols-outlined text-tertiary text-lg flex-shrink-0">error</span>
-                <p className="text-xs text-tertiary leading-relaxed">{errorMsg}</p>
+              <div className="flex items-start gap-3 p-3 rounded-xl bg-danger-subtle border border-danger/25">
+                <Icon name="error" className="text-danger-text text-[20px] flex-shrink-0" />
+                <p className="text-xs text-danger-text leading-relaxed">{errorMsg}</p>
               </div>
               <button
                 onClick={() => setStatus('idle')}
-                className="w-full py-2.5 rounded-xl text-xs font-bold text-slate-400 hover:text-white transition-colors bg-white/[0.04] border border-white/10"
-                style={{ fontFamily: 'Manrope, sans-serif' }}
+                className="w-full py-2.5 rounded-xl text-xs font-bold text-fg-secondary hover:text-fg transition-colors bg-fill border border-line"
+               
               >
                 Try again
               </button>
@@ -247,21 +248,19 @@ function ResultRow({ icon, label, success, error, url }: {
   url?: string
 }) {
   return (
-    <div className="flex items-center gap-3 px-3 py-2.5 rounded-xl"
-      style={{ background: success ? 'rgba(0,227,253,0.06)' : 'rgba(255,108,149,0.06)', border: `1px solid ${success ? 'rgba(0,227,253,0.15)' : 'rgba(255,108,149,0.15)'}` }}
-    >
-      <span className={`material-symbols-outlined text-base flex-shrink-0 ${success ? 'text-secondary' : 'text-tertiary'}`}>{icon}</span>
-      <span className="flex-1 text-xs font-medium text-slate-200 truncate capitalize" style={{ fontFamily: 'Manrope, sans-serif' }}>
+    <div className={`flex items-center gap-3 px-3 py-2.5 rounded-xl border ${success ? 'bg-accent/[0.06] border-accent/15' : 'bg-danger-subtle border-danger/25'}`}>
+      <Icon name={icon} className={`text-[16px] flex-shrink-0 ${success ? 'text-accent-text' : 'text-danger-text'}`} />
+      <span className="flex-1 text-xs font-medium text-fg truncate capitalize">
         {error ?? label}
       </span>
       {url && (
         <button
           onClick={() => window.electronAPI?.openExternal(url)}
-          className="flex-shrink-0 flex items-center gap-1 text-[10px] font-bold text-primary hover:text-white transition-colors"
-          style={{ fontFamily: 'Manrope, sans-serif' }}
+          className="flex-shrink-0 flex items-center gap-1 text-[10px] font-bold text-accent-text hover:text-fg transition-colors cursor-pointer"
+         
         >
           Open
-          <span className="material-symbols-outlined text-[12px]">open_in_new</span>
+          <Icon name="open_in_new" className="text-[14px]" />
         </button>
       )}
     </div>

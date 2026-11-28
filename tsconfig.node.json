@@ -10,8 +10,9 @@
     "noUnusedLocals": false,
     "noUnusedParameters": false,
     "resolveJsonModule": true,
+    "allowImportingTsExtensions": true,
     "outDir": "out/main",
     "types": ["node"]
   },
-  "include": ["electron/**/*"]
+  "include": ["electron/**/*", "shared/**/*", "src/utils/captureLabels.ts"]
 }

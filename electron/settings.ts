@@ -1,4 +1,7 @@
 import Store from 'electron-store'
+import { validPick, type ThemePicks } from '../shared/theme-colors'
+import { DEFAULT_ANNOTATION_COLOR } from '../shared/annotation'
+import type { WallpaperPhoto, WallpaperSourceId } from '../shared/wallpapers'
 import { access } from 'fs/promises'
 import { homedir } from 'os'
 import { join } from 'path'
@@ -6,24 +9,34 @@ import { join } from 'path'
 export type CaptureKind = 'image' | 'video' | 'scroll'
 export type LastImageMode = 'region' | 'window' | 'all-screen' | 'screen' | 'scrolling'
 export type LastVideoMode = 'region' | 'window' | 'screen'
+/** How a scroll capture runs: 'extension' drives the companion browser
+ *  extension over the local WebSocket bridge (exact DOM offsets, no stitch
+ *  guessing); 'screen' is the classic synthetic-wheel + screen-grab + stitch
+ *  pipeline that works on any app. */
 export type ScrollCaptureMethod = 'extension' | 'screen'
+// OpenLumiaWhen and the countdown values: shared/capture-settings.ts (Settings
+// lists the same ones).
+import { OPEN_LUMIA_WHEN, type OpenLumiaWhen } from '../shared/capture-settings'
+export { OPEN_LUMIA_WHEN, RECORD_COUNTDOWNS, type OpenLumiaWhen } from '../shared/capture-settings'
 
-/** Deliberate remember policy: only explicit Region / Window picks update the
- *  IMAGE replay mode that "New Capture" / PrtSc re-run. Screen / all-screen
- *  are one-shots — they still flip lastCaptureKind, but New Capture should
- *  never replay an all-monitor grab. Scroll is a deliberate capture (Dashboard
- *  Scroll tab / browser extension) and is NEVER remembered — the renderer
- *  doesn't persist lastCaptureKind='scroll' and dispatchLastCapture ignores
- *  it, so New Capture / PrtSc replay the last image/video capture instead of a
- *  scroll. Enforced at every write site: the settings:set IPC handler (renderer
- *  writers — Dashboard, overlay ModeBar) and hotkeys' remember helpers, plus
- *  a load-time normalization below for values persisted by older builds. */
-export function isRememberedMode(mode: unknown): mode is 'region' | 'window' {
-  return mode === 'region' || mode === 'window'
+/** Remember policy (2026-11-27, a dev called the old one a bug): every
+ *  capture and recording tool the user picks last is what New capture /
+ *  PrintScreen replay: Region, Window, Screen, All screens and Scroll for
+ *  images, Region, Window and Screen for recordings. (Until then only Region
+ *  and Window were kept, Screen / All screens counting as one-shots and
+ *  Scroll never.) These check values written by the renderer (settings:set)
+ *  and persisted by older builds. */
+export function isImageMode(mode: unknown): mode is LastImageMode {
+  return mode === 'region' || mode === 'window' || mode === 'screen' || mode === 'all-screen' || mode === 'scrolling'
+}
+export function isVideoMode(mode: unknown): mode is LastVideoMode {
+  return mode === 'region' || mode === 'window' || mode === 'screen'
 }
 
 export interface AppSettings {
   defaultSavePath: string
+  /** 'system' only until first launch resolves it (see resolveFirstLaunchTheme);
+   *  after that always the user's last pick. */
   theme: 'dark' | 'light' | 'system'
   activeWorkflowId: string
   googleDriveRefreshToken: string
@@ -32,14 +45,17 @@ export interface AppSettings {
   googleDriveFolderId: string
   launchAtStartup: boolean
   historyRetentionDays: number
+  /** Thumbnail size generation of the history: TARGET_VERSION in
+   *  thumbnail-refresh.ts once every row has been re-rendered at
+   *  THUMB_MAX_WIDTH. */
+  thumbnailVersion: number
+  /** Launches on which the recordings' part of that refresh didn't finish
+   *  (a frame that couldn't be read). After a few, it's called done
+   *  (thumbnail-refresh.ts). */
+  thumbnailRefreshTries: number
   lastCaptureKind: CaptureKind
   lastImageMode: LastImageMode
   lastVideoMode: LastVideoMode
-  /** How the Scroll capture kind runs: 'extension' drives the companion
-   *  browser extension over the local WebSocket bridge (exact DOM offsets,
-   *  no stitch guessing); 'screen' is the classic synthetic-wheel +
-   *  screen-grab + stitch pipeline that works on any app. */
-  scrollCaptureMethod: ScrollCaptureMethod
   /** When true, captures include Lumia's own windows: the main window is NOT
    *  hidden before the screen freeze (screenshots) or the recording session
    *  (video), and the window picker offers Lumia's windows too (Win32 — on
@@ -48,35 +64,86 @@ export interface AppSettings {
    *  PID-filtered native snapshot). Scroll capture keeps hiding — it always
    *  captures another app. */
   captureSelfWindow: boolean
+  /** Screen scroll jumps the scrolled area to its top before the first
+   *  frame (Settings › General, 2026-11-23). The extension always captures
+   *  the whole page, so it ignores this. */
+  scrollCaptureToTop: boolean
+  /** The image editor keeps each image's edit steps after it's closed
+   *  (History › Edits, 2026-11-23): files under userData/edit-history/.
+   *  Off: steps last only while the image is open. */
+  saveEditHistory: boolean
+  /** Image editor: holding the pan key (`editorKeys.image.pan`, Space by default) and dragging pans, and
+   *  the Cursor tool's drag draws a selection box (2026-11-24). Off (default,
+   *  the behaviour before): the drag key does nothing and the Cursor tool
+   *  pans by dragging (the hand), with no selection box; shapes still select
+   *  and move. */
+  keyToDrag: boolean
+  /** Copy every image capture to the clipboard (2026-11-27, Settings ›
+   *  General; it always did). */
+  copyAfterCapture: boolean
+  /** Seconds the recording toolbar counts down before recording: 0 (off),
+   *  3 or 5 (2026-11-27, Settings › General; always 3 before). */
+  recordCountdown: number
+  /** Where captures and recordings are saved; '' = ~/Pictures/Lumia
+   *  (capture-folder.ts, 2026-11-27). Set only through the folder dialog. */
+  captureFolder: string
+  /** Save folders used before, kept so their files stay readable
+   *  (capture-folder.ts isAllowedPath). Not shown anywhere. */
+  pastCaptureFolders: string[]
+  /** When the editor opens after an image capture / a recording (see
+   *  OpenEditorWhen). Default 'open' for both. */
+  openLumiaAfter: OpenLumiaWhen
+  /** Capture actions in the menu-bar icon's menu, by hotkey id
+   *  (`RectangleRegion`, `ScreenRecorderScreen`…; a switch per row in
+   *  Settings › Hotkeys, 2026-11-27). Empty: only New Capture. */
+  trayActions: string[]
+  /** The app bar's light / dark button (2026-11-25, Settings › Appearance).
+   *  Off: hidden, and Appearance offers the mode instead. */
+  showThemeButton: boolean
+  /** The image and video editors' keys the user changed, per editor, as
+   *  { actionId: binding } (Settings › Hotkeys, 2026-11-24; replaces the
+   *  same day's `dragKey`). Only changed keys are stored; defaults live in
+   *  src/lib/editor-keys.ts. */
+  editorKeys: { image?: Record<string, string>; video?: Record<string, string> }
   /** When true, the physical PrintScreen key is bound to "New Capture" via a
    *  globalShortcut, and on Windows the "PrintScreen opens Snipping Tool"
    *  registry hijack is turned off so the keystroke reaches us. The binding
    *  is fixed (PrintScreen only) — toggle on/off only, no rebinding. */
   printScreenAsCapture: boolean
+  /** Opt-in silent updates (2026-11-22): found updates download on their
+   *  own and install while the main window sits hidden in the tray / menu
+   *  bar (after a grace period, never mid-recording or mid-capture). Off:
+   *  every step waits for the user (Update, then Restart). */
+  autoUpdateWhenHidden: boolean
+  /** Custom theme picks (design/CUSTOM-THEMES.md), raw hex as picked (the
+   *  clamping happens on apply, shared/theme-colors.ts); null = default. */
+  themeAccent: string | null
+  themeLightBase: string | null
+  themeDarkBase: string | null
   /** True once the first-run prompt asking the user whether to bind PrintScreen
    *  has been shown (and answered, either way). Used to suppress the prompt
    *  on subsequent launches. Also flipped to true whenever the user toggles
    *  printScreenAsCapture from Settings, so manual configuration counts as
    *  having been asked. */
   printScreenPromptShown: boolean
-  /** User-picked wallpaper category IDs. Matches either a built-in id from
-   *  the renderer's curated list or a custom id from `wallpaperCustomCategories`.
-   *  Empty = first run, show the picker. */
-  wallpaperCategories: string[]
-  /** User-defined wallpaper categories on top of the built-in curated set.
-   *  Each is just a label + free-text search query — no editorial topic
-   *  resolution since users wouldn't know Unsplash topic slugs. */
-  wallpaperCustomCategories: Array<{ id: string; label: string; query: string }>
-  /** Cached result of the last Unsplash random fetch — re-rendered on every
-   *  Wallpapers visit until the user explicitly clicks Refresh, so we don't
-   *  burn API quota on idle navigation. `photos` is the same shape as
-   *  `UnsplashPhoto` in `wallpapers.ts`; kept loosely typed here to avoid
-   *  pulling in the wallpapers module just for a type. */
-  wallpaperGrid: {
-    photos: unknown[]
-    pickId: string
+  /** Where wallpaper photos come from. */
+  wallpaperSource: WallpaperSourceId
+  /** The one category shown. null = the default (Landscapes). */
+  wallpaperCategory: string | null
+  /** Only photos of at least 3840x2160. */
+  wallpaper4kOnly: boolean
+  /** Cached batches of the last fetches, keyed `source:categoryId:uhd|any`
+   *  (at most 10, 24 hours), so a visit doesn't hit the sources again. */
+  wallpaperGrid: Record<string, {
+    photos: WallpaperPhoto[]
+    cursor?: string
     fetchedAt: number
-  } | null
+  }> | null
+  /** The desktop wallpaper before Lumia's first change, for Reset
+   *  (wallpapers.ts, 2026-11-27): per screen id on macOS, per monitor device
+   *  path on Windows (`all`, the registry's one path, when those can't be read).
+   *  null when there's nothing to put back. */
+  wallpaperBefore: { all?: string; screens?: Record<string, string>; monitors?: Record<string, string> } | null
   /** Last annotation style picked in the editor toolbar (color + stroke
    *  width — the latter also sizes text). Restored when the editor opens so
    *  the next edit starts where the last one left off. Written on user picks
@@ -108,17 +175,35 @@ const store = new Store<AppSettings>({
     googleDriveFolderId: '',
     launchAtStartup: true,
     historyRetentionDays: 0,
+    thumbnailVersion: 0,
+    thumbnailRefreshTries: 0,
     lastCaptureKind: 'image',
     lastImageMode: 'region',
     lastVideoMode: 'region',
-    scrollCaptureMethod: 'screen',
     captureSelfWindow: false,
+    scrollCaptureToTop: false,
+    saveEditHistory: true,
+    keyToDrag: false,
+    copyAfterCapture: true,
+    recordCountdown: 3,
+    captureFolder: '',
+    pastCaptureFolders: [],
+    openLumiaAfter: 'open',
+    trayActions: [],
+    showThemeButton: true,
+    editorKeys: {},
     printScreenAsCapture: PRINT_SCREEN_DEFAULT,
+    autoUpdateWhenHidden: false,
+    themeAccent: null,
+    themeLightBase: null,
+    themeDarkBase: null,
     printScreenPromptShown: PRINT_SCREEN_DEFAULT,
-    wallpaperCategories: [],
-    wallpaperCustomCategories: [],
+    wallpaperSource: 'commons',
+    wallpaperCategory: null,
+    wallpaper4kOnly: false,
     wallpaperGrid: null,
-    annotationStyle: { color: '#f87171', strokeWidth: 3 }
+    wallpaperBefore: null,
+    annotationStyle: { color: DEFAULT_ANNOTATION_COLOR, strokeWidth: 3 }
   }
 })
 
@@ -130,35 +215,97 @@ const store = new Store<AppSettings>({
   const raw = store.get('lastImageMode') as string
   if (raw === 'fullscreen') store.set('lastImageMode', 'all-screen')
   else if (raw === 'active-monitor') store.set('lastImageMode', 'screen')
-  // Remember policy (see isRememberedMode): older builds persisted screen /
-  // all-screen / scrolling here — normalize to the default so New Capture
-  // can't keep replaying a mode the policy no longer saves.
-  if (!isRememberedMode(store.get('lastImageMode'))) store.set('lastImageMode', 'region')
-  if (!isRememberedMode(store.get('lastVideoMode'))) store.set('lastVideoMode', 'region')
+  // Anything else (a hand edit) goes back to the default.
+  if (!isImageMode(store.get('lastImageMode'))) store.set('lastImageMode', 'region')
+  if (!isVideoMode(store.get('lastVideoMode'))) store.set('lastVideoMode', 'region')
+  // Open Lumia, earlier on 2026-11-27: the switch `openEditorAlways`, one
+  // dropdown `openEditor` (open / images / videos / always), then a row per
+  // kind (`openEditorAfterCapture` / `-Recording`: always / open / never).
+  // The old values carry over.
+  const legacy = store as unknown as Store<Record<string, unknown>>
+  let carried: OpenLumiaWhen | null = null
+  if (legacy.has('openEditorAlways')) {
+    if (legacy.get('openEditorAlways') === true) carried = 'success'
+    legacy.delete('openEditorAlways')
+  }
+  if (legacy.has('openEditor')) {
+    const old = legacy.get('openEditor')
+    carried = old === 'always' ? 'success' : old === 'images' ? 'captures' : old === 'videos' ? 'recordings' : 'open'
+    legacy.delete('openEditor')
+  }
+  if (legacy.has('openEditorAfterCapture') || legacy.has('openEditorAfterRecording')) {
+    const c = legacy.get('openEditorAfterCapture'), r = legacy.get('openEditorAfterRecording')
+    carried = c === 'never' && r === 'never' ? 'never'
+      : c === 'always' && r === 'always' ? 'success'
+      : c === 'always' ? 'captures' : r === 'always' ? 'recordings' : 'open'
+    legacy.delete('openEditorAfterCapture')
+    legacy.delete('openEditorAfterRecording')
+  }
+  if (carried) store.set('openLumiaAfter', carried)
+  // `scrollCaptureMethod` (Settings › General › Capture scroll with) is gone
+  // (2026-11-27): the scroll hotkey picks by the app in front.
+  legacy.delete('scrollCaptureMethod')
+  if (!OPEN_LUMIA_WHEN.includes(store.get('openLumiaAfter'))) store.set('openLumiaAfter', 'open')
+}
+
+/** First launch (or a settings file from a build that had a "System"
+ *  theme): take the OS appearance once and save it. From then on the theme
+ *  only changes when the user picks one. Call after app ready (nativeTheme). */
+export function resolveFirstLaunchTheme(osIsDark: boolean): void {
+  if (store.get('theme') === 'system') store.set('theme', osIsDark ? 'dark' : 'light')
+}
+
+/** The custom theme picks, in shared/theme-colors.ts's shape. */
+export function getThemePicks(): ThemePicks {
+  // A malformed value (hand edit) reads as the default.
+  return { accent: validPick(store.get('themeAccent')), lightBase: validPick(store.get('themeLightBase')), darkBase: validPick(store.get('themeDarkBase')) }
 }
 
 export function getSettings(): AppSettings {
+  // One read of settings.json for all keys. electron-store reads and parses
+  // the file on every `get`, so a get per key was 37 disk reads per call,
+  // and this is called per history row (captureFolder, isAllowedPath). The
+  // values are the same: `get(key)` returns this object's `key`.
+  const s = store.store
   return {
-    defaultSavePath: store.get('defaultSavePath'),
-    theme: store.get('theme'),
-    activeWorkflowId: store.get('activeWorkflowId'),
-    googleDriveRefreshToken: store.get('googleDriveRefreshToken'),
-    googleDriveAccessToken: store.get('googleDriveAccessToken'),
-    googleDriveTokenExpiresAt: store.get('googleDriveTokenExpiresAt'),
-    googleDriveFolderId: store.get('googleDriveFolderId'),
-    launchAtStartup: store.get('launchAtStartup'),
-    historyRetentionDays: store.get('historyRetentionDays'),
-    lastCaptureKind: store.get('lastCaptureKind'),
-    lastImageMode: store.get('lastImageMode'),
-    lastVideoMode: store.get('lastVideoMode'),
-    scrollCaptureMethod: store.get('scrollCaptureMethod'),
-    captureSelfWindow: store.get('captureSelfWindow'),
-    printScreenAsCapture: store.get('printScreenAsCapture'),
-    printScreenPromptShown: store.get('printScreenPromptShown'),
-    wallpaperCategories: store.get('wallpaperCategories'),
-    wallpaperCustomCategories: store.get('wallpaperCustomCategories'),
-    wallpaperGrid: store.get('wallpaperGrid'),
-    annotationStyle: store.get('annotationStyle')
+    defaultSavePath: s.defaultSavePath,
+    theme: s.theme,
+    activeWorkflowId: s.activeWorkflowId,
+    googleDriveRefreshToken: s.googleDriveRefreshToken,
+    googleDriveAccessToken: s.googleDriveAccessToken,
+    googleDriveTokenExpiresAt: s.googleDriveTokenExpiresAt,
+    googleDriveFolderId: s.googleDriveFolderId,
+    launchAtStartup: s.launchAtStartup,
+    historyRetentionDays: s.historyRetentionDays,
+    thumbnailVersion: s.thumbnailVersion,
+    thumbnailRefreshTries: s.thumbnailRefreshTries,
+    lastCaptureKind: s.lastCaptureKind,
+    lastImageMode: s.lastImageMode,
+    lastVideoMode: s.lastVideoMode,
+    captureSelfWindow: s.captureSelfWindow,
+    scrollCaptureToTop: s.scrollCaptureToTop,
+    saveEditHistory: s.saveEditHistory,
+    keyToDrag: s.keyToDrag,
+    copyAfterCapture: s.copyAfterCapture,
+    recordCountdown: s.recordCountdown,
+    captureFolder: s.captureFolder,
+    pastCaptureFolders: s.pastCaptureFolders,
+    openLumiaAfter: s.openLumiaAfter,
+    trayActions: s.trayActions,
+    showThemeButton: s.showThemeButton,
+    editorKeys: s.editorKeys,
+    printScreenAsCapture: s.printScreenAsCapture,
+    autoUpdateWhenHidden: s.autoUpdateWhenHidden,
+    themeAccent: s.themeAccent,
+    themeLightBase: s.themeLightBase,
+    themeDarkBase: s.themeDarkBase,
+    printScreenPromptShown: s.printScreenPromptShown,
+    wallpaperSource: s.wallpaperSource,
+    wallpaperCategory: s.wallpaperCategory,
+    wallpaper4kOnly: s.wallpaper4kOnly,
+    wallpaperGrid: s.wallpaperGrid,
+    wallpaperBefore: s.wallpaperBefore,
+    annotationStyle: s.annotationStyle
   }
 }
 

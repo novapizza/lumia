@@ -2,8 +2,10 @@ import { execFile } from 'child_process'
 
 export interface SnippingHijackResult {
   /** When set, the registry write failed and the caller should surface this
-   *  to the user — Snipping Tool will likely keep eating PrintScreen. */
+   *  to the user: the Snipping Tool likely keeps (or doesn't get back) the
+   *  PrintScreen key. Toast-style text; the raw error goes in `detail`. */
   warning?: string
+  detail?: string
 }
 
 // Windows 11 controls "PrintScreen opens Snipping Tool" via a per-user DWORD
@@ -29,7 +31,10 @@ export function setSnippingHijack(enabled: boolean): Promise<SnippingHijackResul
     ], { windowsHide: true }, (err) => {
       if (err) {
         resolve({
-          warning: 'Could not update Windows registry — Snipping Tool may still capture PrintScreen. ' + (err.message || ''),
+          warning: enabled
+            ? "Couldn't give the key back to the Snipping Tool"
+            : "Couldn't take the key from the Snipping Tool",
+          detail: err.message || undefined,
         })
       } else {
         resolve({})

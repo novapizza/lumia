@@ -1,31 +1,31 @@
+import { dockTrace } from './dock-trace'
 import { desktopCapturer, ipcMain, screen, nativeImage, clipboard, app } from 'electron'
-import { homedir } from 'os'
 import { join } from 'path'
-import { getMainWindow, createOverlayWindows, closeAllOverlays, getHistoryStore, getOverlayDisplayId, getOverlayWindow, broadcastToOverlays, restoreFromOverlayCancel, waitForViewMounted, openHistoryItemInEditor, isMainDismissed } from './index'
+import { randomUUID } from 'crypto'
+import { writeFile, mkdir } from 'fs/promises'
+import { captureFolder } from './capture-folder'
+import { getMainWindow, createOverlayWindows, closeAllOverlays, getHistoryStore, getOverlayDisplayId, broadcastToOverlays, restoreFromOverlayCancel, prepareMainOnRoute, openHistoryItemInEditor, claimEditorAfterCapture, sendFrozenToOverlays, setOpenOverlaysOpacity, overlaySessionOpen } from './index'
 import { getWindowAtPointPhysical, focusOwnWindowForeground, waitForDwmFrames } from './native-input'
 import { getMacWindowAtPoint } from './mac-window-pick'
 import { resolveWin32PickRect, resolveMacPickRect, getSinglePickTarget, getActivePickTarget, PickTarget } from './window-list'
-import { setOverlayMode, resetOverlayMode, getOverlayMode } from './scroll-capture'
+import { setOverlayMode, resetOverlayMode, getOverlayMode, launchScrollCapture } from './scroll-capture'
 import { localTimestamp } from './utils'
 import { writeThumbnail } from './thumbnail'
 import { showNotification } from './notify'
 import { applyWatermarkToImage } from './watermark'
 import { getSettings } from './settings'
-import { startVideoCapture, beginWindowRecording } from './video'
+import { startVideoCapture, beginWindowRecording, prepareVideoPick } from './video'
 import { getDisplayIcc, getDisplayConversionIcc } from './display-icc'
 import { convertBgraToSrgbInPlace } from './icc-to-srgb'
 import { tagPngWithIcc } from './png-icc'
 import { captureDisplayNative, type NativeCapture } from './native-screen'
-import { macSnapAvailable } from './mac-screen-snap'
+import { macSnapAvailable, captureMacWindow } from './mac-screen-snap'
 import { traceBegin, traceMark } from './capture-trace'
 import { pickCornerRadiusPhys, maskCornersInPlace } from './rounded-corners'
+import { resolveCaptureSource, globalRect, type SourceArea } from './capture-source'
+import type { ClipCaptureMode } from './types'
 
-/** Canonical folder for original captures (both images and videos). Not
- *  user-configurable — user-chosen locations are for the Save-As dialog only,
- *  which writes a separate file and never touches the original. */
-export const ORIGINALS_DIR = join(homedir(), 'Pictures', 'Lumia')
-
-/** Write the just-captured image to disk at {ORIGINALS_DIR}/capture-{ts}.{ext}.
+/** Write the just-captured image to disk at {captureFolder()}/capture-{ts}.{ext}.
  *  Best-effort — returns null if anything goes wrong so capture still completes.
  *
  *  `displayId` is the LUT-profile fallback: capture pixels are normally
@@ -36,11 +36,11 @@ export const ORIGINALS_DIR = join(homedir(), 'Pictures', 'Lumia')
  *  the watermark pass re-rasterizes every capture before it lands here. */
 async function saveOriginalImage(png: Buffer, displayId?: number): Promise<{ filePath: string; filename: string } | null> {
   try {
-    const { writeFile, mkdir } = await import('fs/promises')
-    await mkdir(ORIGINALS_DIR, { recursive: true })
+    const dir = captureFolder()
+    await mkdir(dir, { recursive: true })
     const ts = localTimestamp()
     const filename = `capture-${ts}.png`
-    const filePath = join(ORIGINALS_DIR, filename)
+    const filePath = join(dir, filename)
     // Annotate as the default Buffer<ArrayBufferLike> so reassigning the result
     // of tagPngWithIcc (also Buffer<ArrayBufferLike>) type-checks under @types/node 26.
     let buf: Buffer = png
@@ -60,7 +60,9 @@ async function saveOriginalImage(png: Buffer, displayId?: number): Promise<{ fil
 
 export type CaptureMode = 'all-screen' | 'region' | 'window' | 'screen'
 
-const HIDE_DELAY_MS = process.platform === 'darwin' ? 250 : 200
+/** How long a hidden window takes to leave the screen before a grab (also
+ *  the recordings' wait, video.ts). */
+export const HIDE_DELAY_MS = process.platform === 'darwin' ? 250 : 200
 
 // True when the last hideMainWindow() skipped the compositor-settle wait
 // because the macOS native snapshot excludes Lumia's windows anyway (PID
@@ -190,7 +192,7 @@ export function getFrozenBgrForDisplay(displayId: number): { buffer: Buffer; wid
   return { buffer: frame.image.toBitmap(), width: size.width, height: size.height }
 }
 
-function clearFrozenCache() {
+export function clearFrozenCache() {
   frozenImages.clear()
 }
 
@@ -279,6 +281,7 @@ function showMainWindow() {
   if (process.platform === 'darwin') {
     // macOS: the extension AppleScript-`activate`d the browser, so Lumia is a
     // background app — bring the whole app (not just the window) to the front.
+    dockTrace('app.focus steal (capture.ts, window to front)')
     app.focus({ steal: true })
   } else {
     // Windows: AttachThreadInput + SetForegroundWindow lifts the foreground
@@ -301,9 +304,6 @@ function findSourceForDisplay(
   return sources[0]
 }
 
-// Map webContentsId → source payload for overlay pull
-const overlaySourcePayloads = new Map<number, { sourceId: string; scaleFactor: number }>()
-
 // Cache last window-pick physical rect so confirm can crop in physical pixels
 // directly. Avoids the DIP round-trip which introduces sub-pixel drift and,
 // for maximized windows, can expose the ~8px invisible resize border that
@@ -311,6 +311,75 @@ const overlaySourcePayloads = new Map<number, { sourceId: string; scaleFactor: n
 let lastWindowPickPhysical: {
   x: number; y: number; width: number; height: number; displayId: number
 } | null = null
+
+/** macOS: the window under the pointer at the last hover lookup (its
+ *  CGWindowID and the frame the overlay drew). A confirm on that same frame
+ *  captures the window on its own (2026-11-24): its own pixels with
+ *  transparent corners, like macOS's window screenshot, instead of a cut-out
+ *  of the frozen screen that carried the desktop and overlapping windows. */
+let lastMacPick: { id: number; rect: { x: number; y: number; width: number; height: number } } | null = null
+const sameRect = (a: { x: number; y: number; width: number; height: number }, b: { x: number; y: number; width: number; height: number }) =>
+  a.x === b.x && a.y === b.y && a.width === b.width && a.height === b.height
+
+/** After Mission Control (index.ts steps the overlays aside while it's up):
+ *  in Image mode, a fresh snapshot, since windows may have been reordered.
+ *  The overlays are invisible meanwhile and the helper leaves Lumia out, so
+ *  no hide is needed. Returns false when a switch or the session's end
+ *  superseded it. */
+export async function refreezeAfterMissionControl(): Promise<boolean> {
+  const gen = ++refreezeGen
+  clearFrozenCache()
+  sendFrozenToOverlays()
+  if (getOverlayMode().startsWith('video-')) return true
+  hideWaitSkipped = false
+  await freezeAllDisplays()
+  if (gen !== refreezeGen || !overlaySessionOpen()) {
+    if (gen === refreezeGen) clearFrozenCache()
+    return false
+  }
+  sendFrozenToOverlays()
+  return true
+}
+
+/** Bumped per Image <-> Video switch; a re-freeze that finishes after a newer
+ *  switch is dropped. */
+let refreezeGen = 0
+
+/** Freeze while the overlay is up (Image <-> Video switch). macOS's helper
+ *  leaves Lumia's windows out of the grab; elsewhere (Windows, the macOS
+ *  fallback, "include Lumia's own window") the overlays fade out for it and
+ *  come back, which shows as a short flicker. */
+async function refreezeUnderOverlays(): Promise<void> {
+  const hide = !(process.platform === 'darwin' && macSnapAvailable()) || includeSelfInCapture()
+  hideWaitSkipped = false
+  if (hide) {
+    setOpenOverlaysOpacity(0)
+    if (process.platform === 'win32') {
+      await Promise.race([waitForDwmFrames(2), new Promise(r => setTimeout(r, HIDE_DELAY_MS))])
+    } else {
+      await new Promise(r => setTimeout(r, HIDE_DELAY_MS))
+    }
+  }
+  try {
+    await freezeAllDisplays()
+  } finally {
+    if (hide && overlaySessionOpen()) setOpenOverlaysOpacity(1)
+  }
+}
+
+/** A capture that failed (no screen source, a grab or an encode that threw):
+ *  end the session as a cancel would and say so (2026-11-27; several paths
+ *  left the main window hidden with nothing said). The window comes back by
+ *  the rule for a cancelled overlay (restoreFromOverlayCancel), and the
+ *  message is a toast when it does, a system notification when it doesn't. */
+function failCapture(what: string, err: unknown): void {
+  console.error(`[capture] ${what} failed`, err)
+  resetOverlayMode()
+  clearFrozenCache()
+  closeAllOverlays()
+  restoreFromOverlayCancel()
+  showNotification({ body: `Couldn't capture image\n${err instanceof Error ? err.message : String(err)}`, kind: 'error' })
+}
 
 export function dispatchCapture(mode: CaptureMode) {
   switch (mode) {
@@ -329,50 +398,53 @@ export async function dispatchLastCapture() {
     await startVideoCapture(s.lastVideoMode)
     return
   }
-  // Scroll is a deliberate capture — started from the Dashboard Scroll tab or
-  // the browser extension — never a remembered mode, so "New Capture" / PrtSc
-  // must not replay it. Fall back to a normal image capture (legacy 'scrolling'
-  // values from older builds → region).
-  dispatchCapture(s.lastImageMode === 'scrolling' ? 'region' : s.lastImageMode)
+  // Scroll is replayed like the scroll hotkey (2026-11-27): the browser in
+  // front through the extension, else the screen scroll overlay.
+  if (s.lastImageMode === 'scrolling') {
+    await launchScrollCapture()
+    return
+  }
+  dispatchCapture(s.lastImageMode)
 }
 
 export function setupCapture() {
   ipcMain.handle('capture:screenshot', async (_e, mode: CaptureMode) => dispatchCapture(mode))
 
-  // Re-entrancy guards matching the hotkey path (hotkeys.ts withLock): ignore
-  // the click while a previous dispatch is still setting up or an overlay
-  // session is already open — a double-click on "New Capture" would otherwise
-  // race two freeze/overlay sessions against each other.
-  let newCaptureInFlight = false
-  ipcMain.handle('capture:new', async () => {
-    if (newCaptureInFlight || getOverlayWindow()) return
-    newCaptureInFlight = true
-    try { await dispatchLastCapture() } finally { newCaptureInFlight = false }
-  })
-
   ipcMain.handle('region:confirm', async (e, payload: { dataUrl: string; rect: { x: number; y: number; width: number; height: number } }) => {
     const displayId = getOverlayDisplayId(e.sender)
     resetOverlayMode()
     closeAllOverlays()
-    // No overlay-gone wait — the crop comes from the frozen snapshot, not a
-    // fresh screen grab, so the overlay's residual presence doesn't matter.
-    const res = await captureRect(payload.rect, displayId)
-    clearFrozenCache()
-    return await sendCaptureToEditor(res.image, 'region', res.tagDisplayId)
-  })
-
-  ipcMain.handle('overlay:get-source', (e) => {
-    return overlaySourcePayloads.get(e.sender.id) ?? null
+    try {
+      // No overlay-gone wait — the crop comes from the frozen snapshot, not a
+      // fresh screen grab, so the overlay's residual presence doesn't matter.
+      const res = await captureRect(payload.rect, displayId)
+      clearFrozenCache()
+      return await sendCaptureToEditor(res.image, 'region', res.tagDisplayId, { rect: globalRect(payload.rect, displayId) })
+    } catch (err) {
+      failCapture('region capture', err)
+      return ''
+    }
   })
 
   // Window-pick mode: return window rect at screen coords.
   //
   // Windows: HWND lookup via WindowFromPoint, then DIP/physical conversions.
   // macOS:   delegated to the Swift CGWindowList helper (see mac-window-pick.ts).
-  ipcMain.handle('window-pick:get-window-at', async (e, x: number, y: number) => {
+  ipcMain.handle('window-pick:get-window-at', (e, x: number, y: number) => windowAtOverlayPoint(e.sender, x, y))
+
+  // The same, at the cursor: the overlay asks once when it opens, so the
+  // window under a still pointer is framed without waiting for a move.
+  ipcMain.handle('window-pick:get-window-at-cursor', (e) => {
+    const displayId = getOverlayDisplayId(e.sender, false)
+    const display = screen.getAllDisplays().find(d => d.id === displayId) ?? screen.getPrimaryDisplay()
+    const p = screen.getCursorScreenPoint()
+    return windowAtOverlayPoint(e.sender, p.x - display.bounds.x, p.y - display.bounds.y)
+  })
+
+  async function windowAtOverlayPoint(sender: Electron.WebContents, x: number, y: number) {
     if (process.platform === 'darwin') {
       try {
-        const displayId = getOverlayDisplayId(e.sender, false)
+        const displayId = getOverlayDisplayId(sender, false)
         const allDisplays = screen.getAllDisplays()
         const display = allDisplays.find(d => d.id === displayId) ?? screen.getPrimaryDisplay()
 
@@ -382,11 +454,15 @@ export function setupCapture() {
         const screenY = y + display.bounds.y
 
         const rect = await getMacWindowAtPoint(screenX, screenY)
-        if (!rect) return null
+        if (!rect) { lastMacPick = null; return null }
 
         // Clip to overlay's display so the highlight (and downstream crop)
         // never extends past the visible area when a window spans displays.
-        return resolveMacPickRect(rect, display)
+        const resolved = resolveMacPickRect(rect, display)
+        // Remember which window this frame is, so the confirm can capture
+        // that window on its own.
+        lastMacPick = resolved && rect.id ? { id: rect.id, rect: resolved } : null
+        return resolved
       } catch (err: any) {
         console.error('[window-pick mac] error:', err?.message ?? err)
         return null
@@ -395,7 +471,7 @@ export function setupCapture() {
 
     if (process.platform !== 'win32') return null
     try {
-      const displayId = getOverlayDisplayId(e.sender, false)
+      const displayId = getOverlayDisplayId(sender, false)
       const allDisplays = screen.getAllDisplays()
       const display = allDisplays.find(d => d.id === displayId) ?? screen.getPrimaryDisplay()
 
@@ -424,7 +500,7 @@ export function setupCapture() {
       console.error('[window-pick] error:', err?.message ?? err)
       return null
     }
-  })
+  }
 
   // Window-pick confirm: crop against the cached physical rect so we don't lose
   // pixels to the DIP→physical round-trip.
@@ -432,18 +508,32 @@ export function setupCapture() {
     const overlayId = getOverlayDisplayId(e.sender)
     const cached = lastWindowPickPhysical
     lastWindowPickPhysical = null
+    const macPick = lastMacPick && sameRect(lastMacPick.rect, rect) ? lastMacPick : null
+    lastMacPick = null
     resetOverlayMode()
     closeAllOverlays()
-    // Erase the window's rounded corners to transparency so the crop matches
-    // what was actually on screen (macOS always rounds; Win11 when unmaximized).
-    const displayId = cached?.displayId ?? overlayId
-    const display = screen.getAllDisplays().find(d => d.id === displayId) ?? screen.getPrimaryDisplay()
-    const cornerRadius = pickCornerRadiusPhys(rect, display)
-    const res = cached
-      ? await capturePhysicalRect(cached, cornerRadius)
-      : await captureRect(rect, overlayId, cornerRadius)
-    clearFrozenCache()
-    return await sendCaptureToEditor(res.image, 'window', res.tagDisplayId)
+    try {
+      if (macPick) {
+        const own = await captureMacWindow(macPick.id)
+        if (own) {
+          clearFrozenCache()
+          return await sendCaptureToEditor(own, 'window', undefined, { rect: globalRect(rect, overlayId) })
+        }
+      }
+      // Erase the window's rounded corners to transparency so the crop matches
+      // what was actually on screen (macOS always rounds; Win11 when unmaximized).
+      const displayId = cached?.displayId ?? overlayId
+      const display = screen.getAllDisplays().find(d => d.id === displayId) ?? screen.getPrimaryDisplay()
+      const cornerRadius = pickCornerRadiusPhys(rect, display)
+      const res = cached
+        ? await capturePhysicalRect(cached, cornerRadius)
+        : await captureRect(rect, overlayId, cornerRadius)
+      clearFrozenCache()
+      return await sendCaptureToEditor(res.image, 'window', res.tagDisplayId, { rect: globalRect(rect, overlayId) })
+    } catch (err) {
+      failCapture('window capture', err)
+      return ''
+    }
   })
 
   ipcMain.handle('window-pick:cancel', () => {
@@ -483,6 +573,9 @@ export function setupCapture() {
       resetOverlayMode()
       closeAllOverlays()
       return await captureWindowTarget(target)
+    } catch (err) {
+      failCapture('window capture', err)
+      return null
     } finally {
       confirmActiveInFlight = false
     }
@@ -498,12 +591,31 @@ export function setupCapture() {
   // Switch between overlay modes without closing the overlay. Works for both
   // screenshot (region/window-pick/monitor-pick) and video (video-*) intents —
   // the overlay renderer picks rendering + confirm-channel based on the prefix.
-  ipcMain.handle('overlay:switch-mode', (_e, mode:
-    | 'region' | 'window-pick' | 'monitor-pick'
+  // 'scroll-region' (2026-11-23): the overlay's Scroll tab, confirmed by
+  // scroll-region:confirm in scroll-capture.ts.
+  ipcMain.handle('overlay:switch-mode', async (_e, mode:
+    | 'region' | 'scroll-region' | 'window-pick' | 'monitor-pick'
     | 'video-region' | 'video-window' | 'video-screen'
   ) => {
+    const wasVideo = getOverlayMode().startsWith('video-')
     setOverlayMode(mode)
     broadcastToOverlays('overlay:mode-changed', mode)
+    // Image <-> Video (2026-11-24): drop the snapshot; back in Image, take a
+    // fresh one of the screen as it is now, so the picture is never from an
+    // earlier moment than the switch.
+    const isVideo = mode.startsWith('video-')
+    if (wasVideo === isVideo) return
+    const gen = ++refreezeGen
+    clearFrozenCache()
+    sendFrozenToOverlays()
+    if (isVideo) { prepareVideoPick(); return }
+    await refreezeUnderOverlays()
+    // A later switch or the session's end supersedes this grab.
+    if (gen !== refreezeGen || !overlaySessionOpen() || getOverlayMode().startsWith('video-')) {
+      if (gen === refreezeGen) clearFrozenCache()
+      return
+    }
+    sendFrozenToOverlays()
   })
 
   // Monitor-pick: user clicked an overlay → capture that display
@@ -513,9 +625,14 @@ export function setupCapture() {
     const target = allDisplays.find(d => d.id === displayId) ?? screen.getPrimaryDisplay()
     resetOverlayMode()
     closeAllOverlays()
-    const res = await captureDisplay(target, allDisplays)
-    clearFrozenCache()
-    return await sendCaptureToEditor(res.image, 'screen', res.tagDisplayId)
+    try {
+      const res = await captureDisplay(target, allDisplays)
+      clearFrozenCache()
+      return await sendCaptureToEditor(res.image, 'screen', res.tagDisplayId, { display: target })
+    } catch (err) {
+      failCapture('screen capture', err)
+      return ''
+    }
   })
 
   ipcMain.handle('monitor-pick:cancel', () => {
@@ -553,6 +670,15 @@ function compositeBGRA(items: CompositeItem[], totalW: number, totalH: number): 
 }
 
 async function captureAllScreen(): Promise<string> {
+  try {
+    return await captureAllScreenInner()
+  } catch (err) {
+    failCapture('all-screens capture', err)
+    return ''
+  }
+}
+
+async function captureAllScreenInner(): Promise<string> {
   const allDisplays = screen.getAllDisplays()
   await hideMainWindow()
 
@@ -561,7 +687,7 @@ async function captureAllScreen(): Promise<string> {
   if (allDisplays.length <= 1) {
     const d = allDisplays[0] ?? screen.getPrimaryDisplay()
     const res = await captureDisplay(d, allDisplays)
-    return await sendCaptureToEditor(res.image, 'all-screen', res.tagDisplayId)
+    return await sendCaptureToEditor(res.image, 'all-screen', res.tagDisplayId, { display: d })
   }
 
   // Multi-display: grab every display through the same native-first freeze the
@@ -646,13 +772,20 @@ async function captureAllScreen(): Promise<string> {
 /** Capture a resolved pick target from the frozen snapshot and hand it to the
  *  editor. Shared by the single-window fast path and Enter-to-confirm. */
 async function captureWindowTarget(target: PickTarget): Promise<string> {
+  if (target.windowId) {
+    const own = await captureMacWindow(target.windowId)
+    if (own) {
+      clearFrozenCache()
+      return await sendCaptureToEditor(own, 'window', undefined, { rect: globalRect(target.rect, target.displayId) })
+    }
+  }
   const display = screen.getAllDisplays().find(d => d.id === target.displayId) ?? screen.getPrimaryDisplay()
   const cornerRadius = pickCornerRadiusPhys(target.rect, display)
   const res = target.physRect
     ? await capturePhysicalRect(target.physRect, cornerRadius)
     : await captureRect(target.rect, target.displayId, cornerRadius)
   clearFrozenCache()
-  return await sendCaptureToEditor(res.image, 'window', res.tagDisplayId)
+  return await sendCaptureToEditor(res.image, 'window', res.tagDisplayId, { rect: globalRect(target.rect, target.displayId) })
 }
 
 async function captureWindow(): Promise<void> {
@@ -679,13 +812,10 @@ async function captureWindow(): Promise<void> {
     createOverlayWindows()
     // Capture happens after overlay fires window-pick:confirm
   } catch (err) {
-    // Freeze/overlay startup failed — without this restore the main window is
-    // left hidden with no way back (the confirm handlers never run).
-    console.error('[capture] window-pick startup failed', err)
-    resetOverlayMode()
-    clearFrozenCache()
-    closeAllOverlays()
-    showMainWindow()
+    // Freeze / overlay start-up failed, or the single window's capture did:
+    // without this the main window is left hidden with no way back (the
+    // confirm handlers never run).
+    failCapture('window capture', err)
   }
 }
 
@@ -698,11 +828,7 @@ async function captureRegion(): Promise<void> {
     traceMark('freeze')
     createOverlayWindows()
   } catch (err) {
-    console.error('[capture] region startup failed', err)
-    resetOverlayMode()
-    clearFrozenCache()
-    closeAllOverlays()
-    showMainWindow()
+    failCapture('region capture start', err)
   }
 }
 
@@ -858,8 +984,13 @@ async function captureActiveMonitor(): Promise<string | void> {
   if (allDisplays.length <= 1) {
     const activeDisplay = allDisplays[0] ?? screen.getPrimaryDisplay()
     await hideMainWindow()
-    const res = await captureDisplay(activeDisplay, allDisplays)
-    return await sendCaptureToEditor(res.image, 'screen', res.tagDisplayId)
+    try {
+      const res = await captureDisplay(activeDisplay, allDisplays)
+      return await sendCaptureToEditor(res.image, 'screen', res.tagDisplayId, { display: activeDisplay })
+    } catch (err) {
+      failCapture('screen capture', err)
+      return
+    }
   }
 
   // Multiple displays → show overlays, let the user click one.
@@ -872,11 +1003,7 @@ async function captureActiveMonitor(): Promise<string | void> {
     traceMark('freeze')
     createOverlayWindows()
   } catch (err) {
-    console.error('[capture] monitor-pick startup failed', err)
-    resetOverlayMode()
-    clearFrozenCache()
-    closeAllOverlays()
-    showMainWindow()
+    failCapture('screen capture start', err)
   }
 }
 
@@ -888,10 +1015,25 @@ async function captureActiveMonitor(): Promise<string | void> {
 export async function sendCaptureToEditor(
   input: Electron.NativeImage | string,
   source: string,
-  tagDisplayId?: number
+  tagDisplayId?: number,
+  /** What was captured, for the row's source app + window title
+   *  (capture-source.ts). Omitted (all screens): the frontmost window. */
+  area: SourceArea = null,
 ): Promise<string> {
   const mainWin = getMainWindow()
   if (!mainWin || mainWin.isDestroyed()) return ''
+  // A window or a scrolled page records where it came from; region / screen
+  // captures (old 'active-monitor' / 'fullscreen' tags included) only when
+  // they show a single window, else just their kind. The lookup starts now and is awaited just
+  // before the history row is written, so it runs alongside the watermark /
+  // encode / save.
+  const captureMode: ClipCaptureMode =
+    source === 'window' ? 'window' :
+    source === 'region' ? 'region' :
+    source === 'scrolling' ? 'scroll' : 'screen'
+  const captureSource = captureMode === 'window' || captureMode === 'scroll'
+    ? resolveCaptureSource(area)
+    : resolveCaptureSource(area, { onlyIfSingle: true })
 
   // Stamp the Lumia logo into the bottom-left before anything downstream
   // sees the image — clipboard, on-disk original, thumbnail, and the
@@ -902,13 +1044,19 @@ export async function sendCaptureToEditor(
   // capture, several hundred on 4K). `input` is a data URL only for callers
   // that already hold one (extension stitch).
   const base = typeof input === 'string' ? nativeImage.createFromDataURL(input) : input
-  const img = applyWatermarkToImage(base)
+  // The mark is a fixed size on screen: points × the scale of the display
+  // the capture came from (the cursor's display when it isn't known).
+  const scale = area && 'display' in area ? area.display.scaleFactor
+    : area && 'rect' in area ? screen.getDisplayMatching(area.rect).scaleFactor
+    : screen.getDisplayNearestPoint(screen.getCursorScreenPoint()).scaleFactor
+  const img = applyWatermarkToImage(base, scale)
   const png = img.toPNG()
   const dataUrl = `data:image/png;base64,${png.toString('base64')}`
 
-  try { clipboard.writeImage(img) } catch { /* silent */ }
+  const copied = getSettings().copyAfterCapture !== false
+  if (copied) { try { clipboard.writeImage(img) } catch { /* silent */ } }
 
-  // Always save the original capture to ~/Pictures/Lumia/ (fixed location).
+  // Always save the original capture to the save folder (capture-folder.ts).
   // Editor's Save button is a separate flow that writes to a user-chosen path.
   const saved = await saveOriginalImage(png, tagDisplayId)
 
@@ -920,7 +1068,7 @@ export async function sendCaptureToEditor(
     const historyStore = getHistoryStore()
     if (historyStore) {
       const ts = localTimestamp()
-      const id: string = require('crypto').randomUUID()
+      const id: string = randomUUID()
       historyStore.add({
         id,
         timestamp: Date.now(),
@@ -928,14 +1076,20 @@ export async function sendCaptureToEditor(
         filePath: saved?.filePath,
         thumbnailFile: writeThumbnail(id, img),
         type: 'screenshot',
+        source: await captureSource,
+        captureMode,
         uploads: []
       })
       historyId = id
     }
-  } catch { /* silent */ }
+  } catch (err) {
+    // The image is saved and on its way to the editor; only its row is missing.
+    console.error('[capture] could not add the capture to history', err)
+  }
 
   // Tray-only state: user dismissed the main window before triggering this
-  // capture (hotkey or tray menu). Honor that — surface the toast and stop.
+  // capture (hotkey or tray menu), and Settings › General › Open editor
+  // after every capture is off. Honor that — surface the toast and stop.
   // The notification's onClick still calls openHistoryItemInEditor, so a
   // tap on the toast brings them back into the editor on demand.
   //
@@ -945,30 +1099,19 @@ export async function sendCaptureToEditor(
   // processes the navigation. The renderer was alive throughout the capture
   // so we expect the ack within a frame; the helper has a generous timeout
   // fallback.
-  if (!isMainDismissed()) {
-    mainWin.webContents.send('navigate', '/editor', { dataUrl, source, historyId })
-    await waitForViewMounted('/editor')
+  if (claimEditorAfterCapture('image')) {
+    await prepareMainOnRoute('/editor', () => mainWin.webContents.send('navigate', '/editor', { dataUrl, source, historyId }))
     showMainWindow()
+  } else {
+    // No editor: the window stays away (closed before, or Never) and focus
+    // goes back to the app the overlay took over from.
+    restoreFromOverlayCancel()
   }
 
-  // 'active-monitor' / 'fullscreen' are legacy source tags from older
-  // builds — preserved here so notifications for existing history items
-  // still render correctly.
-  const label =
-    source === 'region' ? 'Region' :
-    source === 'window' ? 'Window' :
-    source === 'screen' || source === 'active-monitor' ? 'Screen' :
-    source === 'scrolling' ? 'Scrolling page' :
-    'All Screens'
-  // Snapshot tray state at notification fire time. The user clicking the
-  // toast later (banner or Action Center) should produce the same
-  // X-close behavior regardless of what's happened to the window in
-  // between — capturing this value here makes the decision deterministic.
-  const fromTray = isMainDismissed()
   showNotification({
-    body: `${label} captured — copied to clipboard`,
+    body: copied ? 'Image captured and copied' : 'Image captured',
     thumbnailDataUrl: dataUrl,
-    onClick: historyId ? () => { void openHistoryItemInEditor(historyId!, fromTray) } : undefined,
+    onClick: historyId ? () => { void openHistoryItemInEditor(historyId!) } : undefined,
     launchId: historyId ?? undefined,
   })
   return dataUrl

@@ -1,4 +1,11 @@
 import { useEffect, useRef } from 'react'
+import { THUMBNAIL_WIDTH } from '../../lib/video-frame'
+import { RECORDING_FPS } from '../../../shared/recording'
+import { TileSampler, RecordedClock } from '../../lib/filmstrip'
+import { drawTile, stripFromTiles, encodeStrip } from '../../lib/filmstrip-build'
+import {
+  WATERMARK_PT, WATERMARK_MARGIN_PT, WATERMARK_OPACITY, WATERMARK_MAX_W, WATERMARK_MAX_H, WATERMARK_MIN_PX, WATERMARK_INK_THRESHOLD,
+} from '../../../shared/watermark'
 
 interface RecordingTarget {
   kind: 'region' | 'window' | 'screen'
@@ -10,10 +17,12 @@ interface RecordingTarget {
   outputSize?: { width: number; height: number }
 }
 
-// 30 fps is plenty for screen content, and the desktop-capture → canvas
-// pipeline only delivered ~34 fps in practice when asked for 60 — so the old
-// 60 fps target sized the bitrate for frames that never arrived.
-const TARGET_FPS = 30
+// The rate recordings are made at (shared/recording.ts: 30 fps is plenty for
+// screen content, and the desktop-capture → canvas pipeline only delivered
+// ~34 fps in practice when asked for 60 — so the old 60 fps target sized the
+// bitrate for frames that never arrived). It goes onto the recording's
+// history row with the save, and the video editor steps by it.
+const TARGET_FPS = RECORDING_FPS
 // Bits-per-pixel-per-frame quality factor. The previous 0.25 @ 60 fps asked
 // for ~28 Mbps on a 1932×970 region and produced ~250 MB per 2 min of
 // mostly-static UI. 0.08 @ 30 fps puts 1920×1080 at ≈5 Mbps and 2560×1440 at
@@ -81,15 +90,20 @@ export default function RecorderHost() {
   // requestVideoFrameCallback (preferred) or requestAnimationFrame (fallback).
   const drawLoopRef      = useRef<(() => void) | null>(null)
 
-  // Timing
-  const runStartRef      = useRef<number>(0)
-  const accumulatedMsRef = useRef<number>(0)
+  // Timing: recorded time, which stops in a pause (RecordedClock). The
+  // recording's length, the toolbar's timer and the filmstrip tiles' times
+  // all read this one clock.
+  const clockRef         = useRef(new RecordedClock())
   const tickTimerRef     = useRef<ReturnType<typeof setInterval> | null>(null)
   // Set while paused so the canvas draw loop can skip the expensive
   // composite (and the watermark blend) for the entire pause duration —
   // otherwise it keeps compositing every source frame the paused recorder
   // just discards.
   const pausedRef        = useRef(false)
+  // The video editor's filmstrip, collected while recording (2026-11-27): a
+  // small tile of the frame just drawn, every so often, so the strip is
+  // there the moment the recording stops and the editor needn't decode it.
+  const stripRef         = useRef<TileSampler<HTMLCanvasElement> | null>(null)
 
   useEffect(() => {
     let mounted = true
@@ -146,12 +160,12 @@ export default function RecorderHost() {
           check()
         })
 
-        // Decode the watermark logo once. Failure here is non-fatal — the
-        // recording still proceeds, just without the corner stamp.
-        let logoImg: HTMLImageElement | null = null
+        // Decode the watermark (both inks) once. Failure here is non-fatal —
+        // the recording still proceeds, just without the corner stamp.
+        let logoImg: Marks | null = null
         try {
-          const logoDataUrl = await window.electronAPI?.recorderGetWatermark?.()
-          if (logoDataUrl) logoImg = await loadImage(logoDataUrl)
+          const marks = await window.electronAPI?.recorderGetWatermark?.()
+          if (marks) logoImg = { light: await loadImage(marks.light), dark: await loadImage(marks.dark) }
         } catch {
           logoImg = null
         }
@@ -168,6 +182,7 @@ export default function RecorderHost() {
           canvasElRef,
           drawLoopRef,
           pausedRef,
+          sampleStripTile,
         )
         outStreamRef.current = outStream
 
@@ -195,6 +210,18 @@ export default function RecorderHost() {
         window.electronAPI?.recorderReady?.(false, err?.message ?? String(err))
       }
     })()
+
+    // A tile for the filmstrip, from the frame just drawn. Only while the
+    // recorder runs, on the recorder's own clock (the file's timeline: it
+    // stops during a pause), so tiles and file line up.
+    function sampleStripTile(canvas: HTMLCanvasElement) {
+      const sampler = stripRef.current
+      const r = recorderRef.current
+      if (!sampler || !r || r.state !== 'recording' || !clockRef.current.running) return
+      const ms = clockRef.current.at(Date.now())
+      if (!sampler.due(ms)) return
+      try { sampler.add(ms, drawTile(canvas, canvas.width, canvas.height)) } catch { /* no tile for this frame */ }
+    }
 
     // ── Listen for control signals from main ────────────────────────────
 
@@ -242,8 +269,8 @@ export default function RecorderHost() {
       recorderRef.current = recorder
       pausedRef.current = false
 
-      runStartRef.current = Date.now()
-      accumulatedMsRef.current = 0
+      clockRef.current.start(Date.now())
+      stripRef.current = new TileSampler<HTMLCanvasElement>()
       if (tickTimerRef.current) clearInterval(tickTimerRef.current)
       // The toolbar timer only renders whole seconds, so only emit a tick when
       // the displayed second changes — a quarter of the IPC/re-render traffic
@@ -253,7 +280,7 @@ export default function RecorderHost() {
         const r = recorderRef.current
         if (!r) return
         if (r.state === 'recording') {
-          const ms = accumulatedMsRef.current + (Date.now() - runStartRef.current)
+          const ms = clockRef.current.at(Date.now())
           const sec = Math.floor(ms / 1000)
           if (sec !== lastSentSec) {
             lastSentSec = sec
@@ -268,22 +295,22 @@ export default function RecorderHost() {
       if (!r || r.state !== 'recording') return
       pausedRef.current = true
       r.pause()
-      accumulatedMsRef.current += Date.now() - runStartRef.current
+      clockRef.current.pause(Date.now())
     }
 
     const onResume = () => {
       const r = recorderRef.current
       if (!r || r.state !== 'paused') return
       pausedRef.current = false
-      runStartRef.current = Date.now()
+      clockRef.current.resume(Date.now())
       r.resume()
     }
 
     const onStopRequest = () => {
       const r = recorderRef.current
       if (!r) return
-      if (r.state === 'paused') accumulatedMsRef.current += 0
-      else if (r.state === 'recording') accumulatedMsRef.current += Date.now() - runStartRef.current
+      // Stopped (from a pause the clock already stands still).
+      clockRef.current.pause(Date.now())
       if (r.state !== 'inactive') r.stop()   // triggers onstop → finalizeRecording
     }
 
@@ -295,6 +322,7 @@ export default function RecorderHost() {
         try { r.stop() } catch { /* ignore */ }
       }
       chunksRef.current = []
+      stripRef.current = null
       teardownStreams()
     }
 
@@ -342,7 +370,11 @@ export default function RecorderHost() {
   async function finalizeRecording() {
     const chunks = chunksRef.current
     chunksRef.current = []
-    const durationMs = accumulatedMsRef.current
+    const durationMs = clockRef.current.at(Date.now())
+    // This recording's tiles, taken now: the thumbnail below is awaited, and
+    // the ref mustn't be read after that.
+    const sampler = stripRef.current
+    stripRef.current = null
     const blob = new Blob(chunks, { type: 'video/webm' })
     teardownStreams()
 
@@ -354,6 +386,13 @@ export default function RecorderHost() {
 
     let thumbnail = ''
     try { thumbnail = await extractThumbnail(blob) } catch { /* ignore */ }
+    // The filmstrip from the tiles taken along the way ('' when there are
+    // none: the editor then decodes it once, as for older recordings).
+    let strip = ''
+    try {
+      const tiles = sampler?.pick(durationMs) ?? []
+      if (tiles.length > 0) strip = encodeStrip(stripFromTiles(tiles))
+    } catch { /* '' */ }
 
     window.electronAPI?.recorderStateChange?.('saving')
     try {
@@ -367,7 +406,7 @@ export default function RecorderHost() {
         const buf = await slice.arrayBuffer()
         await window.electronAPI?.recorderSaveChunk?.(buf)
       }
-      await window.electronAPI?.recorderSaveEnd?.(thumbnail, durationMs)
+      await window.electronAPI?.recorderSaveEnd?.(thumbnail, durationMs, TARGET_FPS, strip)
     } catch (err: any) {
       window.electronAPI?.recorderStateChange?.('error', { error: err?.message ?? String(err) })
     }
@@ -384,11 +423,12 @@ export default function RecorderHost() {
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
-// Watermark constants. Mirror electron/watermark.ts so the corner stamp on
-// recorded frames matches the one applied to still images.
-const WATERMARK_SIZE_PCT = 0.025
-const WATERMARK_OPACITY = 0.2
-const WATERMARK_MARGIN_PCT = 0.15
+// The watermark's numbers are shared/watermark.ts, the same ones
+// electron/watermark.ts stamps images with (the mark + name, 10%, ink by the
+// brightness under it).
+/** Frames between brightness checks under the mark (~1s at 30fps). */
+const WATERMARK_INK_EVERY = 30
+type Marks = { light: HTMLImageElement; dark: HTMLImageElement }
 
 function loadImage(src: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
@@ -411,11 +451,13 @@ function loadImage(src: string): Promise<HTMLImageElement> {
 function buildOutputStream(
   desktopStream: MediaStream,
   target: RecordingTarget,
-  logoImg: HTMLImageElement | null,
+  logoImg: Marks | null,
   videoRef: React.MutableRefObject<HTMLVideoElement | null>,
   canvasRef: React.MutableRefObject<HTMLCanvasElement | null>,
   loopRef: React.MutableRefObject<(() => void) | null>,
   pausedRef: React.MutableRefObject<boolean>,
+  /** Called with the output canvas after every drawn frame. */
+  onFrame: (canvas: HTMLCanvasElement) => void,
 ): MediaStream {
   const video = videoRef.current!
   const canvas = canvasRef.current!
@@ -465,12 +507,23 @@ function buildOutputStream(
   // Pre-compute watermark placement off the output canvas dims, not the
   // source stream — the logo follows the recorded frame even if the stream
   // is larger (region crop) or matches it (screen).
-  const logoW = Math.max(12, Math.round(Math.min(outW, outH) * WATERMARK_SIZE_PCT))
-  const logoAspect = logoImg ? logoImg.naturalHeight / logoImg.naturalWidth : 1
-  const logoH = Math.round(logoW * logoAspect)
-  const logoMargin = Math.max(2, Math.round(logoW * WATERMARK_MARGIN_PCT))
+  // A fixed size on screen (2026-11-27), like the image stamp: output px per
+  // point (a small crop is upscaled, so its own ratio), capped for tiny
+  // outputs, left off under WATERMARK_MIN_PX.
+  const pxPerPt = isCrop ? outW / target.rect!.width : target.displayScaleFactor
+  const logoAspect = logoImg ? logoImg.light.naturalWidth / logoImg.light.naturalHeight : 1
+  let logoH = Math.round(WATERMARK_PT * pxPerPt)
+  if (logoH * logoAspect > outW * WATERMARK_MAX_W) logoH = Math.floor(outW * WATERMARK_MAX_W / logoAspect)
+  if (logoH > outH * WATERMARK_MAX_H) logoH = Math.floor(outH * WATERMARK_MAX_H)
+  if (logoH < WATERMARK_MIN_PX) logoImg = null
+  const logoW = Math.round(logoH * logoAspect)
+  const logoMargin = Math.max(2, Math.round(WATERMARK_MARGIN_PT * pxPerPt))
   const logoX = logoMargin
   const logoY = outH - logoH - logoMargin
+  // The ink follows what's under the mark, checked every WATERMARK_INK_EVERY
+  // frames (a small getImageData of the drawn frame, before the stamp).
+  let ink: 'light' | 'dark' = 'light'
+  let framesSinceInk = WATERMARK_INK_EVERY
 
   const drawFrame = () => {
     // While paused, skip the composite entirely — the recorder discards these
@@ -479,23 +532,33 @@ function buildOutputStream(
     const vw = video.videoWidth
     const vh = video.videoHeight
     if (vw <= 0 || vh <= 0) return
+    // The recorded part of the stream, in stream px.
+    const sx = vw / target.displayDipSize.width
+    const sy = vh / target.displayDipSize.height
+    let srcX = 0, srcY = 0, srcW = vw, srcH = vh
     if (isCrop) {
       const rectDip = target.rect!
-      const sx = vw / target.displayDipSize.width
-      const sy = vh / target.displayDipSize.height
-      const srcX = Math.max(0, Math.min(vw - 1, Math.round(rectDip.x * sx)))
-      const srcY = Math.max(0, Math.min(vh - 1, Math.round(rectDip.y * sy)))
-      const srcW = Math.max(1, Math.min(vw - srcX, Math.round(rectDip.width  * sx)))
-      const srcH = Math.max(1, Math.min(vh - srcY, Math.round(rectDip.height * sy)))
-      ctx.drawImage(video, srcX, srcY, srcW, srcH, 0, 0, outW, outH)
-    } else {
-      ctx.drawImage(video, 0, 0, vw, vh, 0, 0, outW, outH)
+      srcX = Math.max(0, Math.min(vw - 1, Math.round(rectDip.x * sx)))
+      srcY = Math.max(0, Math.min(vh - 1, Math.round(rectDip.y * sy)))
+      srcW = Math.max(1, Math.min(vw - srcX, Math.round(rectDip.width  * sx)))
+      srcH = Math.max(1, Math.min(vh - srcY, Math.round(rectDip.height * sy)))
     }
+    ctx.drawImage(video, srcX, srcY, srcW, srcH, 0, 0, outW, outH)
     if (logoImg) {
+      if (++framesSinceInk >= WATERMARK_INK_EVERY) {
+        framesSinceInk = 0
+        try {
+          const d = ctx.getImageData(logoX, logoY, Math.max(1, logoW), Math.max(1, logoH)).data
+          let sum = 0, n = 0
+          for (let i = 0; i < d.length; i += 16) { sum += 0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2]; n++ }
+          ink = n && sum / n >= WATERMARK_INK_THRESHOLD ? 'dark' : 'light'
+        } catch { /* keep the last ink */ }
+      }
       ctx.globalAlpha = WATERMARK_OPACITY
-      ctx.drawImage(logoImg, logoX, logoY, logoW, logoH)
+      ctx.drawImage(logoImg[ink], logoX, logoY, logoW, logoH)
       ctx.globalAlpha = 1
     }
+    onFrame(canvas)
   }
 
   // Prefer requestVideoFrameCallback so we redraw exactly once per source
@@ -564,10 +627,10 @@ function extractThumbnail(blob: Blob): Promise<string> {
 
     const drawFrame = () => {
       try {
-        const w = Math.min(video.videoWidth || 640, 640)
+        const w = Math.min(video.videoWidth || THUMBNAIL_WIDTH, THUMBNAIL_WIDTH)
         const h = video.videoHeight
           ? Math.round(w * video.videoHeight / video.videoWidth)
-          : 360
+          : Math.round(w * 9 / 16)
         const canvas = document.createElement('canvas')
         canvas.width = w; canvas.height = h
         canvas.getContext('2d')!.drawImage(video, 0, 0, w, h)

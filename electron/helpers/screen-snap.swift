@@ -20,9 +20,15 @@
 //                                      forwards it directly on macOS); pxW/pxH
 //                                      is the desired output size in physical
 //                                      pixels.
+//     "window <windowID>"            — capture one window by its CGWindowID,
+//                                      on its own like macOS's window
+//                                      screenshot: its own pixels with alpha
+//                                      (transparent corners, nothing behind or
+//                                      over it), no shadow, at its backing
+//                                      scale, converted to sRGB.
 //   stdout, exactly one reply per request, in request order:
 //     prewarm → "ready\n"  (or "err <reason>\n")
-//     snap    → "ok <w> <h> <byteCount>\n" followed by exactly <byteCount>
+//     snap / window → "ok <w> <h> <byteCount>\n" followed by exactly <byteCount>
 //               bytes of raw tightly-packed BGRA pixels (w*h*4), or
 //               "err <reason>\n".
 //   Exits when stdin closes.
@@ -130,11 +136,45 @@ final class Snapper {
         return bgraBytes(img)
     }
 
+    // One window on its own (2026-11-24, window captures): ScreenCaptureKit
+    // renders just this window's surface, so its rounded corners come out
+    // transparent and windows over it or the desktop behind it never show.
+    func snapWindow(id: CGWindowID) -> (w: Int, h: Int, bgra: Data)? {
+        var win = content?.windows.first(where: { $0.windowID == id })
+        // Not in the cache (opened after the last fetch): refetch once.
+        if win == nil { win = fetchContent()?.windows.first(where: { $0.windowID == id }) }
+        guard let window = win else {
+            logErr("window \(id) not found")
+            return nil
+        }
+        let filter = SCContentFilter(desktopIndependentWindow: window)
+        let cfg = SCStreamConfiguration()
+        let scale = CGFloat(filter.pointPixelScale)
+        cfg.width = max(1, Int((filter.contentRect.width * scale).rounded()))
+        cfg.height = max(1, Int((filter.contentRect.height * scale).rounded()))
+        cfg.showsCursor = false
+        cfg.ignoreShadowsSingleWindow = true
+
+        let sem = DispatchSemaphore(value: 0)
+        var image: CGImage?
+        SCScreenshotManager.captureImage(contentFilter: filter, configuration: cfg) { img, err in
+            if let err = err { logErr("window capture: \(err.localizedDescription)") }
+            image = img
+            sem.signal()
+        }
+        sem.wait()
+        guard let img = image else { return nil }
+        // Drawn into sRGB (ColorSync converts from the display's space), so
+        // the Node side needs no ICC pass for it.
+        return bgraBytes(img, space: CGColorSpace(name: CGColorSpace.sRGB))
+    }
+
     // Tightly packed BGRA via a re-draw into our own context. The context uses
     // the image's own color space so CoreGraphics does no pixel conversion —
     // values stay in the display's native space, matching what desktopCapturer
     // produced before (the PNG ICC-tagging pipeline depends on that).
-    private func bgraBytes(_ img: CGImage) -> (w: Int, h: Int, bgra: Data)? {
+    // `space` (window captures) converts to that space instead.
+    private func bgraBytes(_ img: CGImage, space: CGColorSpace? = nil) -> (w: Int, h: Int, bgra: Data)? {
         let w = img.width, h = img.height
         guard w > 0, h > 0 else { return nil }
         let bytesPerRow = w * 4
@@ -144,7 +184,7 @@ final class Snapper {
             guard let ctx = CGContext(
                 data: base, width: w, height: h, bitsPerComponent: 8,
                 bytesPerRow: bytesPerRow,
-                space: img.colorSpace ?? CGColorSpaceCreateDeviceRGB(),
+                space: space ?? img.colorSpace ?? CGColorSpaceCreateDeviceRGB(),
                 bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
                           | CGBitmapInfo.byteOrder32Little.rawValue
             ) else { return false }
@@ -177,6 +217,17 @@ func handle(line: String) {
                 return
             }
             if let shot = Snapper.shared.snap(displayID: CGDirectDisplayID(id), pxW: w, pxH: h) {
+                writeLine("ok \(shot.w) \(shot.h) \(shot.bgra.count)")
+                out.write(shot.bgra)
+            } else {
+                writeLine("err capture")
+            }
+        case "window":
+            guard parts.count >= 2, let id = UInt32(parts[1]) else {
+                writeLine("err badargs")
+                return
+            }
+            if let shot = Snapper.shared.snapWindow(id: CGWindowID(id)) {
                 writeLine("ok \(shot.w) \(shot.h) \(shot.bgra.count)")
                 out.write(shot.bgra)
             } else {

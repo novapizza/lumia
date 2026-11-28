@@ -1,3 +1,5 @@
+/// <reference types="vite/client" />
+
 // Ambient types for the renderer's build-time env (Vite / electron-vite).
 // electron-vite exposes `RENDERER_VITE_*` (and `VITE_*`) vars to the renderer
 // via import.meta.env.

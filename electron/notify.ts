@@ -3,8 +3,26 @@ import { writeFileSync, unlinkSync } from 'fs'
 import { join } from 'path'
 import { randomUUID } from 'crypto'
 
+/** What the renderer's toast needs (src/lib/toast.ts). */
+export interface InAppToast {
+  message: string
+  kind?: 'success' | 'error' | 'warning' | 'info'
+  icon?: string
+  detail?: string
+}
+
 export interface NotifyOptions {
+  /** The text. A second line is the reason: in the app it goes on the
+   *  toast's second line. */
   body: string
+  /** The in-app toast's kind (default success). */
+  kind?: InAppToast['kind']
+  /** The in-app toast's icon (default by kind). */
+  icon?: string
+  /** The renderer already shows its own toast for this (an upload from the
+   *  Dashboard, a workflow run from the editor): while the app is visible
+   *  say nothing more; the system notification only when it's closed. */
+  onlyWhenClosed?: boolean
   /** Falls back to 'Lumia' when omitted. */
   title?: string
   /** Inline dataUrl (e.g. the captured image). */
@@ -73,8 +91,20 @@ export function consumePendingNotificationClick(): (() => void) | null {
   return cb
 }
 
+// The rule (2026-11-24): while the app is visible a message is an in-app
+// toast; a system notification only while it's closed to the menu bar /
+// tray. index.ts registers the route (it owns the window and knows whether
+// the user closed it); it returns false when the app is closed.
+let inAppRoute: ((t: InAppToast) => boolean) | null = null
+let appClosed: () => boolean = () => true
+export function setInAppToastRoute(route: (t: InAppToast) => boolean, isClosed: () => boolean): void {
+  inAppRoute = route
+  appClosed = isClosed
+}
+
 /**
- * Single entry point for all toast notifications.
+ * Single entry point for all toast notifications: in-app while the app is
+ * visible, a system notification while it's closed (see above).
  *
  * Windows: builds a custom `toastXml` with a hero image so the
  * screenshot renders above the text (the default `icon` option only
@@ -87,6 +117,12 @@ export function consumePendingNotificationClick(): (() => void) | null {
  * is all we can guarantee.
  */
 export function showNotification(opts: NotifyOptions): void {
+  if (!appClosed()) {
+    if (opts.onlyWhenClosed) return
+    const [message, ...rest] = opts.body.split('\n')
+    const delivered = inAppRoute?.({ message, kind: opts.kind, icon: opts.icon, detail: rest.join(' ') || undefined })
+    if (delivered) return
+  }
   if (!Notification.isSupported()) return
 
   const title = opts.title ?? DEFAULT_TITLE

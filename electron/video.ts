@@ -1,7 +1,12 @@
-import { app, BrowserWindow, clipboard, desktopCapturer, dialog, ipcMain, screen } from 'electron'
+import { captureBarTop } from '../shared/capture-bar'
+import { resolveCaptureSource, globalRect } from './capture-source'
+import type { CaptureSource } from './types'
+import { BrowserWindow, clipboard, desktopCapturer, dialog, ipcMain, screen } from 'electron'
 import { basename, dirname, extname, join, normalize, resolve as resolvePath } from 'path'
-import { homedir } from 'os'
-import type { WriteStream } from 'fs'
+import { createWriteStream, type WriteStream } from 'fs'
+import { copyFile, mkdir, stat, statfs, unlink } from 'fs/promises'
+import { execFile } from 'child_process'
+import { randomUUID } from 'crypto'
 import {
   getMainWindow,
   getHistoryStore,
@@ -9,28 +14,42 @@ import {
   createOverlayWindows,
   getOverlayDisplayId,
   restoreFromOverlayCancel,
-  waitForViewMounted,
+  prepareMainOnRoute,
   openHistoryItemInEditor,
-  isMainDismissed,
+  claimEditorAfterCapture,
+  returnFocusToPreviousApp,
+  activateForRecording,
+  useFullTheme,
 } from './index'
-import { ORIGINALS_DIR } from './capture'
+import { clearFrozenCache, HIDE_DELAY_MS } from './capture'
+import { captureFolder, isAllowedPath, OUTSIDE_FOLDERS } from './capture-folder'
 import { uploadFileToR2 } from './uploaders/r2'
 import { uploadFilePathToDrive } from './google-drive-service'
 import { resetOverlayMode, setOverlayMode } from './scroll-capture'
 import { showNotification } from './notify'
 import { getSettings, resolveSaveStartDir, rememberSaveDir } from './settings'
 import { localTimestamp } from './utils'
-import { writeThumbnailFromDataUrl, resolveThumbnailUrl } from './thumbnail'
+import { loadRoute } from './load-route'
+import { recordingFps } from '../shared/recording'
+import { writeThumbnailFromDataUrl, resolveThumbnailUrl, writeStripFromDataUrl } from './thumbnail'
 import { openAnnotation, closeAnnotation, destroyAnnotation, isAnnotationOpen, setupAnnotation } from './annotation'
-import { forceWindowsExcludeFromCapture } from './native-input'
+import { forceWindowsExcludeFromCapture, focusOwnWindowForeground } from './native-input'
 import { getSinglePickTarget } from './window-list'
-import { getWatermarkLogoDataUrl } from './watermark'
-import { remuxWebmInPlace, trimWebm, isTrimRunning } from './ffmpeg-remux'
+import { getWatermarkMarks } from './watermark'
+import { remuxWebmInPlace, trimWebm, isTrimRunning, probeWebmDurationMs } from './ffmpeg-remux'
+import { formatDuration } from '../src/utils/captureLabels'
 
-const HIDE_DELAY_MS = process.platform === 'darwin' ? 250 : 200
-const OVERLAY_GONE_DELAY_MS = 120
-
-const isDev = !app.isPackaged
+/** One `[record-trace]` line per recording start (2026-11-24): ms since the
+ *  pick in the overlay to each step, up to the toolbar (with its countdown)
+ *  showing. Like `[capture-trace]` for images. */
+let recT0 = 0
+let recMarks: string[] = []
+function recTraceBegin(kind: string) { recT0 = performance.now(); recMarks = [kind] }
+function recMark(name: string) {
+  if (!recT0) return
+  recMarks.push(`${name} ${Math.round(performance.now() - recT0)}`)
+  if (name === 'toolbar shown') { console.log(`[record-trace] ${recMarks.join(' · ')}`); recT0 = 0 }
+}
 
 // ── Target + window state ──────────────────────────────────────────────────
 
@@ -60,6 +79,12 @@ let recordingBorder: BrowserWindow | null = null
 // distinguish a Stop pressed during the countdown (→ cancel, nothing to save)
 // from a real stop, so the session can't wedge in 'stopping' forever.
 let recordingBegun = false
+/** The countdown runs while the recorder host acquires its stream
+ *  (2026-11-24: the toolbar waited ~1s empty for it). `hostReady`: the
+ *  stream is there; `beginWanted`: the countdown ended first, so recording
+ *  starts the moment the stream is ready. */
+let hostReady = false
+let beginWanted = false
 
 // Streamed save state: the finished webm is forwarded from the recorder host
 // to disk in bounded slices (save-begin → save-chunk* → save-end) rather than
@@ -69,8 +94,19 @@ let recordingWriteStream: WriteStream | null = null
 let recordingSaveFilePath: string | null = null
 let recordingSaveBytes = 0
 
-export function getRecordingTarget(): RecordingTarget | null {
-  return recordingTarget
+/** Drop a recording file that never became a recording (a save cancelled
+ *  or failed part-way, or one without data): close its stream, then delete
+ *  it. Left in the save folder it would be taken for a recording of its own
+ *  the next time the folder is read (folder-history.ts scanForNewFiles). */
+function discardPartialRecording(stream: WriteStream | null, filePath: string | null) {
+  const remove = () => { if (filePath) void unlink(filePath).catch(() => { /* never written, or already gone */ }) }
+  // After 'close': Windows can't delete a file that is still open.
+  if (stream && !stream.closed) {
+    stream.once('close', remove)
+    try { stream.destroy() } catch { remove() }
+  } else {
+    remove()
+  }
 }
 
 export function isRecordingActive(): boolean {
@@ -91,16 +127,14 @@ function hideMain(): Promise<void> {
   })
 }
 
+/** After a recording ends without a file (cancelled, failed to start,
+ *  crashed): the same as cancelling the capture overlay (2026-11-24). The
+ *  window comes back if it was open; closed to the menu bar it stays
+ *  there, with focus back on the previous app (it used to show either way). */
 function showMain() {
-  const win = getMainWindow()
-  if (!win || win.isDestroyed()) return
-  win.show()
-  win.focus()
+  restoreFromOverlayCancel()
 }
 
-function waitForOverlayGone(): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, OVERLAY_GONE_DELAY_MS))
-}
 
 /** Resolve the screen desktopCapturer source for a display. */
 async function resolveScreenSourceId(displayId: number): Promise<string> {
@@ -123,6 +157,32 @@ async function resolveScreenSourceId(displayId: number): Promise<string> {
     return sources[idx].id
   }
   return sources[0]?.id ?? ''
+}
+
+/** Screen source ids per display, fetched when a video pick opens so the
+ *  pick's confirm doesn't wait for desktopCapturer (2026-11-24: ~90ms after
+ *  a fixed 120ms wait, before the toolbar could even be created). Screen
+ *  ids don't change while the displays don't. */
+let screenSourceIds: Promise<Map<number, string>> | null = null
+let displayWatch = false
+function prefetchScreenSourceIds() {
+  // A display added or removed drops the ids (registered here, not at load:
+  // `screen` isn't usable before the app is ready).
+  if (!displayWatch) {
+    displayWatch = true
+    screen.on('display-added', () => { screenSourceIds = null })
+    screen.on('display-removed', () => { screenSourceIds = null })
+  }
+  const displays = screen.getAllDisplays()
+  screenSourceIds = Promise.all(displays.map(async d => [d.id, await resolveScreenSourceId(d.id)] as const))
+    .then(pairs => new Map(pairs))
+  screenSourceIds.catch(() => { screenSourceIds = null })
+}
+/** The display's screen source id: from the prefetch, else fetched now (a
+ *  pick switched from Image to Video had no prefetch). */
+async function screenSourceIdFor(displayId: number): Promise<string> {
+  const cached = await (screenSourceIds ?? Promise.resolve(null)).catch(() => null)
+  return cached?.get(displayId) || resolveScreenSourceId(displayId)
 }
 
 type Rect = { x: number; y: number; width: number; height: number }
@@ -148,12 +208,15 @@ function clampRectToDisplay(rect: Rect, display: Electron.Display): Rect | null 
  *  The constructor's x/y is not trusted on either platform:
  *   - Windows: interpreted in the primary display's DPI context, so a window
  *     on a mixed-DPI secondary monitor lands short of / offset from its spot.
- *   - macOS: AppKit constrains a NORMAL-level window's frame to the visible
- *     area of a screen at creation (keeps it below the menu bar, may shove it
- *     onto the screen it mostly overlaps) — the screen-saver level that lifts
- *     that constraint is only applied after construction.
- *  So bounds are re-applied once the level is set and again at first show,
- *  and a mismatch afterwards is logged for diagnosis. */
+ *   - macOS: AppKit constrains a window's frame to the visible area of a
+ *     screen when it comes on screen (keeps its top below the menu bar, may
+ *     shove it onto the screen it mostly overlaps). The window's level does
+ *     not lift that (2026-11-27, measured: a screen-saver-level window still
+ *     landed at the menu bar's bottom, and a second setBounds didn't move
+ *     it); `enableLargerThanScreen` on a frameless window does, so every
+ *     recording window is created with it.
+ *  Bounds are still re-applied once the level is set and again at first
+ *  show, and a mismatch afterwards is logged for diagnosis. */
 function pinBounds(win: BrowserWindow, bounds: Rect, label?: string) {
   if (win.isDestroyed()) return
   win.setBounds(bounds)
@@ -161,14 +224,6 @@ function pinBounds(win: BrowserWindow, bounds: Rect, label?: string) {
   const got = win.getBounds()
   if (got.x !== bounds.x || got.y !== bounds.y || got.width !== bounds.width || got.height !== bounds.height) {
     console.warn(`[video] ${label} bounds mismatch — wanted ${JSON.stringify(bounds)} got ${JSON.stringify(got)}`)
-  }
-}
-
-function loadRoute(win: BrowserWindow, route: string) {
-  if (isDev) {
-    win.loadURL(`http://localhost:5173/#${route}`)
-  } else {
-    win.loadFile(join(__dirname, '../renderer/index.html'), { hash: route })
   }
 }
 
@@ -188,36 +243,28 @@ function loadRoute(win: BrowserWindow, route: string) {
 const TOOLBAR_W = 920
 const TOOLBAR_H = 150
 
-function computeToolbarBounds(display: Electron.Display, rect?: { x: number; y: number; width: number; height: number }) {
-  const displayX = display.bounds.x
-  const displayY = display.bounds.y
-  const displayW = display.bounds.width
+/** The toolbar's bar sits 6px inside its window (pt-1.5 in
+ *  RecordingToolbar.tsx): the window's top is that much above the bar's. */
+const TOOLBAR_BAR_INSET = 6
 
-  if (rect) {
-    // Always top of the recording region. Preference order:
-    //   1. Just above the rect (outside) — keeps the region fully visible.
-    //   2. Inside top-center of the rect — falls back when the rect is at the
-    //      very top of the display. The toolbar is excluded from screen
-    //      capture via setContentProtection, so sitting inside the rect
-    //      doesn't contaminate the output.
-    const cx = displayX + rect.x + rect.width / 2
-    const x = Math.round(Math.max(displayX + 8, Math.min(displayX + displayW - TOOLBAR_W - 8, cx - TOOLBAR_W / 2)))
-    const above = displayY + rect.y - TOOLBAR_H - 12
-    const insideTop = displayY + rect.y + 12
-    const y = above >= displayY + 8 ? above : insideTop
-    return { x, y, width: TOOLBAR_W, height: TOOLBAR_H }
-  }
-  // Screen: center-top of the display
+function computeToolbarBounds(display: Electron.Display, _rect?: { x: number; y: number; width: number; height: number }) {
+  // Always where the capture overlay's bar was (2026-11-24): centred, at the
+  // same height under the top of the recorded display, whatever the area.
+  // That height is the overlay's own (captureBarTop: the menu bar's bottom
+  // edge on macOS, 2026-11-27; a fixed 32px before). It was placed above (or
+  // inside) the recorded area, so it showed up somewhere new each time.
+  // Content protection keeps it out of the recording either way.
   return {
-    x: Math.round(displayX + (displayW - TOOLBAR_W) / 2),
-    y: displayY + 24,
+    x: Math.round(display.bounds.x + (display.bounds.width - TOOLBAR_W) / 2),
+    y: display.bounds.y + captureBarTop(display, process.platform) - TOOLBAR_BAR_INSET,
     width: TOOLBAR_W,
     height: TOOLBAR_H,
   }
 }
 
-function computeBorderBounds(display: Electron.Display, rect: { x: number; y: number; width: number; height: number }, stroke = 3) {
-  // Inflate by `stroke` so the red outline sits just outside the recorded
+function computeBorderBounds(display: Electron.Display, rect: { x: number; y: number; width: number; height: number }, stroke = 2) {
+  // `stroke` = RECORDING_BORDER_WIDTH in RecordingBorder.tsx (2px since
+  // 2026-11-24). Inflate by it so the outline sits just outside the recorded
   // area, then clip to display bounds. For screen mode (rect == display
   // bounds) this collapses to the display rect, putting the border right
   // at the display edge.
@@ -264,8 +311,16 @@ function createRecorderHost() {
   return win
 }
 
-function createRecordingToolbar(display: Electron.Display, rect?: { x: number; y: number; width: number; height: number }) {
-  const bounds = computeToolbarBounds(display, rect)
+/** The toolbar window, loaded but not shown (2026-11-24): built while the
+ *  Video overlay is open, so the pick only has to place and show it and the
+ *  countdown is there at once (building it after the pick took ~200ms). */
+let prewarmedToolbar: { win: BrowserWindow; ready: boolean } | null = null
+/** Toolbars shown so far (webContents ids): a page that starts listening
+ *  after its show missed the countdown signal and asks (toolbar:is-shown). */
+const shownToolbars = new Set<number>()
+
+/** Create the toolbar window (hidden) and load its page. */
+function buildToolbarWindow(bounds: { x: number; y: number; width: number; height: number }): BrowserWindow {
   const win = new BrowserWindow({
     ...bounds,
     transparent: true,
@@ -276,8 +331,14 @@ function createRecordingToolbar(display: Electron.Display, rect?: { x: number; y
     alwaysOnTop: true,
     skipTaskbar: true,
     hasShadow: false,
-    // Defer show until first paint to avoid the white flash transparent
-    // windows have on Windows before the body becomes see-through.
+    // macOS keeps a window's top below the menu bar when it comes on screen
+    // unless a frameless window has this (2026-11-27: without it the toolbar
+    // landed at the menu bar's bottom, y 30 for the wanted 26, so its bar sat
+    // 4px lower than the overlay's; measured on both displays). The capture
+    // overlay, the border and the drawing layer have it too.
+    enableLargerThanScreen: true,
+    // Shown by showToolbar, after the first paint (transparent windows
+    // flash white on Windows before the body becomes see-through).
     show: false,
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
@@ -295,26 +356,6 @@ function createRecordingToolbar(display: Electron.Display, rect?: { x: number; y
   // the cursor against pill bounds and flip back to capture-mode via
   // 'toolbar:set-interactive' IPC.
   win.setIgnoreMouseEvents(true, { forward: true })
-  win.once('ready-to-show', () => {
-    if (win.isDestroyed()) return
-    pinBounds(win, bounds)
-    // Re-apply content protection right around the show. Calling
-    // setContentProtection from the constructor is unreliable for
-    // transparent + frame:false windows on Windows — WGC capture sessions
-    // bake the toolbar (including the "Starting in 3..2..1" countdown) into
-    // the recording. Re-applying after the HWND is fully realised, plus a
-    // direct SetWindowDisplayAffinity Win32 call as belt-and-braces, forces
-    // the OS to honour the exclusion. macOS has the same class of bug with
-    // NSWindowSharingNone via SCK, so we re-apply on every platform.
-    win.setContentProtection(true)
-    // showInactive so we don't yank focus away from whatever the user is
-    // recording the moment the toolbar materialises.
-    win.showInactive()
-    win.setContentProtection(true)
-    forceWindowsExcludeFromCapture(win)
-    // After show: AppKit may constrain the frame again on order-in.
-    pinBounds(win, bounds, 'toolbar')
-  })
   win.setMenu(null)
   // screen-saver is the highest Z level available — stays above fullscreen
   // apps, browser fullscreen video, games, etc. Together with the
@@ -323,17 +364,94 @@ function createRecordingToolbar(display: Electron.Display, rect?: { x: number; y
   // annotation overlay (which sits at plain screen-saver) on macOS without
   // a moveTop race — the OS enforces the ordering.
   win.setAlwaysOnTop(true, 'screen-saver', 1)
-  win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true })
+  // skipTransformProcessType (2026-11-24): without it Electron briefly
+  // switches the whole app's process type on macOS, which took activation
+  // from Lumia (the countdown lost focus) and confused the Dock state.
+  win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true, skipTransformProcessType: true })
+  // Not a window the user manages: keep it out of Mission Control / Exposé.
+  if (process.platform === 'darwin') win.setHiddenInMissionControl(true)
   // Level is raised now — re-pin (see pinBounds for why the constructor's
   // x/y can't be trusted on mixed-DPI Windows / multi-display macOS).
   pinBounds(win, bounds)
   // First call here so the protection bit is set before any paint reaches
-  // the screen — the ready-to-show callback re-applies it once the window
-  // is realised because that's the only point Windows reliably honours it.
+  // the screen — showToolbar re-applies it once the window is realised
+  // because that's the only point Windows reliably honours it.
   win.setContentProtection(true)
+  useFullTheme(win.webContents)
   loadRoute(win, '/recording-toolbar')
+  return win
+}
+
+/** Place the toolbar, show it and start its countdown. */
+function showToolbar(win: BrowserWindow, bounds: { x: number; y: number; width: number; height: number }) {
+  if (win.isDestroyed()) return
+  pinBounds(win, bounds)
+  // Re-apply content protection right around the show. Calling
+  // setContentProtection from the constructor is unreliable for
+  // transparent + frame:false windows on Windows — WGC capture sessions
+  // bake the toolbar (including the "Starting in 3..2..1" countdown) into
+  // the recording. Re-applying after the HWND is fully realised, plus a
+  // direct SetWindowDisplayAffinity Win32 call as belt-and-braces, forces
+  // the OS to honour the exclusion. macOS has the same class of bug with
+  // NSWindowSharingNone via SCK, so we re-apply on every platform.
+  win.setContentProtection(true)
+  // The page already shows "Starting in 3"; this starts the count.
+  const wcId = win.webContents.id
+  shownToolbars.add(wcId)
+  win.once('closed', () => shownToolbars.delete(wcId))
+  win.webContents.send('toolbar:state', { phase: 'countdown', countdown: getSettings().recordCountdown })
+  // Shown with focus for the countdown, so Esc cancels it (2026-11-24); the
+  // recorded app gets it back when the countdown ends (beginRecording).
+  win.showInactive()
+  activateForRecording()
+  win.focus()
+  // The page too: shown without focus first, the window can be key while its
+  // page still gets no keys.
+  win.webContents.focus()
+  if (process.platform === 'win32') focusOwnWindowForeground(win)
+  recMark('toolbar shown')
+  win.setContentProtection(true)
+  forceWindowsExcludeFromCapture(win)
+  // After show: AppKit may constrain the frame again on order-in.
+  pinBounds(win, bounds, 'toolbar')
+}
+
+/** Get a video pick ready while the user picks: the screen ids and the
+ *  toolbar. Also when the capture overlay switches from Image to Video. */
+export function prepareVideoPick() {
+  prefetchScreenSourceIds()
+  prewarmRecordingToolbar()
+}
+
+/** Build the toolbar ahead, on the display under the pointer (moved at the
+ *  pick if that's another one). Kept for the next pick if this one doesn't
+ *  record (an Image capture after switching). */
+export function prewarmRecordingToolbar() {
+  if (prewarmedToolbar && !prewarmedToolbar.win.isDestroyed()) return
+  const display = screen.getDisplayNearestPoint(screen.getCursorScreenPoint())
+  const win = buildToolbarWindow(computeToolbarBounds(display))
+  const entry = { win, ready: false }
+  win.once('ready-to-show', () => { entry.ready = true })
+  win.on('closed', () => { if (prewarmedToolbar?.win === win) prewarmedToolbar = null })
+  prewarmedToolbar = entry
+}
+
+function dropPrewarmedToolbar() {
+  const pre = prewarmedToolbar
+  prewarmedToolbar = null
+  if (pre && !pre.win.isDestroyed()) pre.win.destroy()
+}
+
+function createRecordingToolbar(display: Electron.Display, rect?: { x: number; y: number; width: number; height: number }) {
+  recMark('toolbar created')
+  const bounds = computeToolbarBounds(display, rect)
+  const pre = prewarmedToolbar && !prewarmedToolbar.win.isDestroyed() ? prewarmedToolbar : null
+  prewarmedToolbar = null
+  const win = pre ? pre.win : buildToolbarWindow(bounds)
   win.on('closed', () => { recordingToolbar = null })
   recordingToolbar = win
+  if (pre?.ready) showToolbar(win, bounds)
+  else win.once('ready-to-show', () => showToolbar(win, bounds))
   return win
 }
 
@@ -341,6 +459,9 @@ function createRecordingBorder(display: Electron.Display, rect: { x: number; y: 
   const bounds = computeBorderBounds(display, rect)
   const win = new BrowserWindow({
     ...bounds,
+    // macOS rounds a frameless window's corners by default, which masked
+    // the border's corner dashes away (2026-11-24).
+    roundedCorners: false,
     transparent: true,
     backgroundColor: '#00000000',
     frame: false,
@@ -374,23 +495,46 @@ function createRecordingBorder(display: Electron.Display, rect: { x: number; y: 
   win.setMenu(null)
   // relativeLevel:1 keeps the border above the annotation overlay on macOS.
   win.setAlwaysOnTop(true, 'screen-saver', 1)
-  win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true })
+  // skipTransformProcessType (2026-11-24): without it Electron briefly
+  // switches the whole app's process type on macOS, which took activation
+  // from Lumia (the countdown lost focus) and confused the Dock state.
+  win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true, skipTransformProcessType: true })
+  // Not a window the user manages: keep it out of Mission Control / Exposé.
+  if (process.platform === 'darwin') win.setHiddenInMissionControl(true)
   // Level is raised now — re-pin (a border flush with the top edge of an
   // external display is otherwise pushed below its menu bar on macOS).
   pinBounds(win, bounds)
   win.setIgnoreMouseEvents(true, { forward: false })
   win.setContentProtection(true)
+  useFullTheme(win.webContents)
   loadRoute(win, '/recording-border')
   win.on('closed', () => { recordingBorder = null })
   recordingBorder = win
   return win
 }
 
+/** The app + window under the recorded area (capture-source.ts), looked up
+ *  when the session opens and written to the history row when it's saved. */
+let recordingSource: Promise<CaptureSource | undefined> | null = null
+let recordingMode: 'region' | 'window' | 'screen' | null = null
+
 function openRecordingSession(target: RecordingTarget) {
+  // Lumia stays active through the countdown (Esc cancels it there); the
+  // recorded app gets focus back when the countdown ends (beginRecording).
   recordingTarget = target
   recordingBegun = false
+  hostReady = false
+  beginWanted = false
   const allDisplays = screen.getAllDisplays()
   const display = allDisplays.find(d => d.id === target.displayId) ?? screen.getPrimaryDisplay()
+  // A window recording records where it came from; region / screen
+  // recordings only when they show a single window (else just their kind).
+  recordingSource =
+    target.kind === 'window' && target.rect ? resolveCaptureSource({ rect: globalRect(target.rect, target.displayId) })
+    : target.kind === 'region' && target.rect ? resolveCaptureSource({ rect: globalRect(target.rect, target.displayId) }, { onlyIfSingle: true })
+    : target.kind === 'screen' ? resolveCaptureSource({ display }, { onlyIfSingle: true })
+    : null
+  recordingMode = target.kind
 
   // One line per session — enough to diagnose "recorded the wrong area /
   // wrong monitor" reports from a log without a repro.
@@ -412,13 +556,25 @@ function openRecordingSession(target: RecordingTarget) {
   createRecordingBorder(display, borderRect)
 }
 
+function beginRecording() {
+  beginWanted = false
+  recordingBegun = true
+  // Countdown over: focus back to the app being recorded.
+  returnFocusToPreviousApp()
+  if (process.platform !== 'darwin' && recordingToolbar && !recordingToolbar.isDestroyed()) recordingToolbar.blur()
+  sendToHost('recorder:begin')
+  sendToToolbar('toolbar:state', { phase: 'recording', elapsedMs: 0 })
+}
+
 export function closeRecordingSession() {
   recordingTarget = null
   recordingBegun = false
+  hostReady = false
+  beginWanted = false
   // Tear down any half-open save stream (e.g. cancel during finalize) so a
   // dangling fd / partial file doesn't leak into the next session.
   if (recordingWriteStream) {
-    try { recordingWriteStream.destroy() } catch { /* ignore */ }
+    discardPartialRecording(recordingWriteStream, recordingSaveFilePath)
     recordingWriteStream = null
     recordingSaveFilePath = null
     recordingSaveBytes = 0
@@ -457,6 +613,8 @@ async function recordHistoryAndNotify(
   filePath: string,
   thumbnailDataUrl: string,
   durationMs: number,
+  fps: number,
+  stripDataUrl?: string,
 ): Promise<{ filePath: string; historyId?: string }> {
   const filename = basename(filePath)
 
@@ -466,31 +624,51 @@ async function recordHistoryAndNotify(
   let historyId: string | undefined
   const historyStore = getHistoryStore()
   if (historyStore) {
-    const id: string = require('crypto').randomUUID()
+    const id: string = randomUUID()
+    // The file's own Duration header (written by the remux) is the real
+    // length; the recorder's clock is the fallback.
+    const fileMs = await probeWebmDurationMs(filePath)
     historyStore.add({
       id,
       timestamp: Date.now(),
       name: filename,
       filePath,
       thumbnailFile: writeThumbnailFromDataUrl(id, thumbnailDataUrl),
+      // The filmstrip the recorder collected (absent if it sent none: the
+      // editor then decodes one).
+      stripFile: writeStripFromDataUrl(id, stripDataUrl),
       type: 'recording',
+      source: recordingSource ? await recordingSource : undefined,
+      captureMode: recordingMode ?? undefined,
       uploads: [],
+      durationMs: fileMs ?? Math.round(durationMs),
+      fps,
     })
     historyId = id
   }
 
-  // Snapshot tray state at notification fire time so banner / Action
-  // Center clicks pin the same X-close-to-tray behavior regardless of
-  // what happens to the window between toast appearance and click.
-  const fromTray = isMainDismissed()
   showNotification({
-    body: `Recording saved · ${Math.round(durationMs / 1000)}s`,
+    body: `Video recorded (${formatDuration(durationMs)})`,
     thumbnailDataUrl,
-    onClick: historyId ? () => { void openHistoryItemInEditor(historyId!, fromTray) } : undefined,
+    onClick: historyId ? () => { void openHistoryItemInEditor(historyId!) } : undefined,
     launchId: historyId ?? undefined,
   })
 
   return { filePath, historyId }
+}
+
+/** A recording that couldn't start (no screen source, a window that
+ *  wouldn't open): end the session as a cancel would and say so
+ *  (2026-11-27; a rejected start left the main window hidden, nothing said). */
+function failRecordingStart(err: unknown) {
+  console.error('[video] could not start recording', err)
+  dropPrewarmedToolbar()
+  resetOverlayMode()
+  closeAllOverlays()
+  clearFrozenCache()
+  closeRecordingSession()
+  showMain()
+  showNotification({ body: `Couldn't start recording\n${err instanceof Error ? err.message : String(err)}`, kind: 'error' })
 }
 
 /** Start a window recording for a display-local DIP rect. Shared by the
@@ -510,25 +688,32 @@ export async function beginWindowRecording(
     return
   }
 
+  recTraceBegin('window')
   resetOverlayMode()
   closeAllOverlays()
-  await waitForOverlayGone()
+  clearFrozenCache()
+  try {
+    // No wait for the overlay to go: nothing is recorded before the
+    // countdown ends.
+    const sourceId = await screenSourceIdFor(display.id)
+    recMark('source')
+    if (!sourceId) throw new Error('No screen source')
 
-  const sourceId = await resolveScreenSourceId(display.id)
-  if (!sourceId) { showMain(); return }
-
-  openRecordingSession({
-    kind: 'window',
-    sourceId,
-    displayId: display.id,
-    rect,
-    displayDipSize: { width: display.size.width, height: display.size.height },
-    displayScaleFactor: sf,
-    outputSize: {
-      width:  Math.max(1, Math.round(rect.width  * sf)),
-      height: Math.max(1, Math.round(rect.height * sf)),
-    },
-  })
+    openRecordingSession({
+      kind: 'window',
+      sourceId,
+      displayId: display.id,
+      rect,
+      displayDipSize: { width: display.size.width, height: display.size.height },
+      displayScaleFactor: sf,
+      outputSize: {
+        width:  Math.max(1, Math.round(rect.width  * sf)),
+        height: Math.max(1, Math.round(rect.height * sf)),
+      },
+    })
+  } catch (err) {
+    failRecordingStart(err)
+  }
 }
 
 // ── Setup IPC ──────────────────────────────────────────────────────────────
@@ -556,25 +741,32 @@ export function setupVideo() {
       return
     }
 
+    recTraceBegin('region')
     resetOverlayMode()
     closeAllOverlays()
-    await waitForOverlayGone()
+    clearFrozenCache()
+    try {
+      // No wait for the overlay to go: nothing is recorded before the
+      // countdown ends.
+      const sourceId = await screenSourceIdFor(display.id)
+      recMark('source')
+      if (!sourceId) throw new Error('No screen source')
 
-    const sourceId = await resolveScreenSourceId(display.id)
-    if (!sourceId) { showMain(); return }
-
-    openRecordingSession({
-      kind: 'region',
-      sourceId,
-      displayId: display.id,
-      rect,
-      displayDipSize: { width: display.size.width, height: display.size.height },
-      displayScaleFactor: sf,
-      outputSize: {
-        width:  Math.max(1, Math.round(rect.width  * sf)),
-        height: Math.max(1, Math.round(rect.height * sf)),
-      },
-    })
+      openRecordingSession({
+        kind: 'region',
+        sourceId,
+        displayId: display.id,
+        rect,
+        displayDipSize: { width: display.size.width, height: display.size.height },
+        displayScaleFactor: sf,
+        outputSize: {
+          width:  Math.max(1, Math.round(rect.width  * sf)),
+          height: Math.max(1, Math.round(rect.height * sf)),
+        },
+      })
+    } catch (err) {
+      failRecordingStart(err)
+    }
   })
 
   // Window confirm: user clicked a window. For v1 we treat it like region:
@@ -590,26 +782,35 @@ export function setupVideo() {
     const allDisplays = screen.getAllDisplays()
     const display = allDisplays.find(d => d.id === displayId) ?? screen.getPrimaryDisplay()
 
+    recTraceBegin('screen')
     resetOverlayMode()
     closeAllOverlays()
-    await waitForOverlayGone()
+    clearFrozenCache()
+    try {
+      // No wait for the overlay to go: nothing is recorded before the
+      // countdown ends.
+      const sourceId = await screenSourceIdFor(display.id)
+      recMark('source')
+      if (!sourceId) throw new Error('No screen source')
 
-    const sourceId = await resolveScreenSourceId(display.id)
-    if (!sourceId) { showMain(); return }
-
-    openRecordingSession({
-      kind: 'screen',
-      sourceId,
-      displayId: display.id,
-      displayDipSize: { width: display.size.width, height: display.size.height },
-      displayScaleFactor: display.scaleFactor || 1,
-    })
+      openRecordingSession({
+        kind: 'screen',
+        sourceId,
+        displayId: display.id,
+        displayDipSize: { width: display.size.width, height: display.size.height },
+        displayScaleFactor: display.scaleFactor || 1,
+      })
+    } catch (err) {
+      failRecordingStart(err)
+    }
   })
 
   // Overlay ESC or bail-out
   ipcMain.handle('video:cancel', () => {
+    dropPrewarmedToolbar()
     resetOverlayMode()
     closeAllOverlays()
+    clearFrozenCache()
     restoreFromOverlayCancel()
   })
 
@@ -621,12 +822,12 @@ export function setupVideo() {
   // Logo dataURL for the watermark composited onto every recorded frame.
   // Shipped on demand (not bundled in the renderer) because the asset lives
   // under resources/ and is reachable only from the main process.
-  ipcMain.handle('recorder:get-watermark', () => getWatermarkLogoDataUrl())
+  ipcMain.handle('recorder:get-watermark', () => getWatermarkMarks())
 
   // RecorderHost reports readiness (stream acquired or error)
   ipcMain.handle('recorder:ready', (_e, ok: boolean, error?: string, micAvailable?: boolean) => {
     if (!ok) {
-      sendToToolbar('toolbar:state', { phase: 'error', error: error ?? 'Unable to start capture' })
+      sendToToolbar('toolbar:state', { phase: 'error', error: error ?? 'Unable to start recording' })
       // Stream acquisition failed (permission denied, source vanished). Nothing
       // recovers this session — auto-dismiss after a beat so the host/toolbar
       // windows don't wedge isRecordingActive() true forever, which would
@@ -634,17 +835,21 @@ export function setupVideo() {
       setTimeout(() => { closeRecordingSession(); showMain() }, 3000)
       return
     }
-    // Kick off countdown in toolbar. Forward whether a mic track was actually
-    // acquired so the toolbar can disable the mic toggle (otherwise it shows a
-    // "live" mic while no audio is being captured).
-    sendToToolbar('toolbar:state', { phase: 'countdown', countdown: 3, micAvailable: micAvailable ?? false })
+    // The toolbar started its countdown when it opened; tell it whether a
+    // mic track was actually acquired so it can disable the mic toggle
+    // (otherwise it shows a "live" mic while no audio is being captured).
+    hostReady = true
+    sendToToolbar('toolbar:state', { micAvailable: micAvailable ?? false })
+    if (beginWanted) beginRecording()
   })
 
-  // Toolbar countdown finished → tell host to begin MediaRecorder
+  // Toolbar countdown finished → tell host to begin MediaRecorder (or as
+  // soon as its stream is ready, if the countdown was quicker).
+  ipcMain.handle('toolbar:is-shown', (e) => shownToolbars.has(e.sender.id))
+
   ipcMain.handle('toolbar:begin', () => {
-    recordingBegun = true
-    sendToHost('recorder:begin')
-    sendToToolbar('toolbar:state', { phase: 'recording', elapsedMs: 0 })
+    if (!hostReady) { beginWanted = true; return }
+    beginRecording()
   })
 
   ipcMain.handle('toolbar:pause', () => {
@@ -729,16 +934,14 @@ export function setupVideo() {
   // ArrayBuffer in the renderer or structured-clone it across IPC.
 
   ipcMain.handle('recorder:save-begin', async () => {
-    const { createWriteStream } = await import('fs')
-    const { mkdir } = await import('fs/promises')
     // Originals (images + videos) live in a single fixed location. The user's
     // Save-As dialog path is a separate concern — it never touches this folder.
-    await mkdir(ORIGINALS_DIR, { recursive: true })
+    await mkdir(captureFolder(), { recursive: true })
     // Tear down any half-open stream from a previous aborted save.
-    if (recordingWriteStream) { try { recordingWriteStream.destroy() } catch { /* ignore */ } }
+    if (recordingWriteStream) discardPartialRecording(recordingWriteStream, recordingSaveFilePath)
     const ts = localTimestamp()
     const filename = `recording-${ts}.webm`
-    recordingSaveFilePath = join(ORIGINALS_DIR, filename)
+    recordingSaveFilePath = join(captureFolder(), filename)
     recordingSaveBytes = 0
     recordingWriteStream = createWriteStream(recordingSaveFilePath)
     return { ok: true }
@@ -756,13 +959,17 @@ export function setupVideo() {
     return { ok: true }
   })
 
-  ipcMain.handle('recorder:save-end', async (_e, thumbnailDataUrl: string, durationMs: number) => {
+  ipcMain.handle('recorder:save-end', async (_e, thumbnailDataUrl: string, durationMs: number, rawFps?: number, stripDataUrl?: string) => {
+    // The rate the recorder ran at, kept on the row for the editor's frame step.
+    const fps = recordingFps(rawFps)
     const stream = recordingWriteStream
     const filePath = recordingSaveFilePath
     const bytes = recordingSaveBytes
     recordingWriteStream = null
     recordingSaveFilePath = null
     recordingSaveBytes = 0
+    // The file holds a whole recording: from here on a failure keeps it.
+    let written = false
     try {
       if (!stream || !filePath) throw new Error('No active recording to finalize')
       await new Promise<void>((resolve, reject) => {
@@ -772,6 +979,7 @@ export function setupVideo() {
       if (bytes === 0) {
         throw new Error('Recording produced no data (stopped before any frames were captured?)')
       }
+      written = true
 
       // Make the recording seekable. MediaRecorder writes a streaming WebM with
       // no Cues/Duration, so the scrubber is dead in every player until we
@@ -781,7 +989,10 @@ export function setupVideo() {
       const seekable = await remuxWebmInPlace(filePath)
       if (!seekable) console.warn('[video] seekable remux skipped/failed — recording saved as-is')
 
-      const { historyId } = await recordHistoryAndNotify(filePath, thumbnailDataUrl, durationMs)
+      // Decided before the "Video recorded" message, so it's the in-app
+      // toast when the editor is about to open (claimEditorAfterCapture).
+      const openEditor = claimEditorAfterCapture('video')
+      const { historyId } = await recordHistoryAndNotify(filePath, thumbnailDataUrl, durationMs, fps, typeof stripDataUrl === 'string' ? stripDataUrl : undefined)
       sendToToolbar('toolbar:state', { phase: 'done' })
 
       // Open the freshly-saved recording in the video annotator (same pattern
@@ -789,31 +1000,39 @@ export function setupVideo() {
       // before the main window steals focus.
       //
       // Tray-only mode: user started the recording while the main window was
-      // dismissed to the tray. Skip the editor surface — the toast click
-      // still leads back here on demand via openHistoryItemInEditor.
+      // dismissed to the tray, and Open editor after every capture is off.
+      // Skip the editor surface — the toast click still leads back here on
+      // demand via openHistoryItemInEditor.
       setTimeout(async () => {
-        if (isMainDismissed()) {
+        if (!openEditor) {
           closeRecordingSession()
+          // No editor: the window stays away (closed before, or Never) and
+          // focus goes back to the app in front before.
+          restoreFromOverlayCancel()
           return
         }
         const main = getMainWindow()
         if (main && !main.isDestroyed()) {
-          // Send navigate then wait for the renderer to ack /editor mounted
-          // before showing — same reasoning as the screenshot path.
-          main.webContents.send('navigate', '/editor', {
+          // Navigate, and show once the editor is on screen — same as the
+          // capture path (prepareMainOnRoute: no Dashboard flash).
+          await prepareMainOnRoute('/editor', () => main.webContents.send('navigate', '/editor', {
             kind: 'video',
             filePath,
             name: basename(filePath),
             historyId,
-          })
-          await waitForViewMounted('/editor')
+            fps,
+          }))
           if (!main.isDestroyed()) { main.show(); main.focus() }
         }
         closeRecordingSession()
       }, 600)
       return { filePath }
     } catch (err: any) {
-      try { stream?.destroy() } catch { /* ignore */ }
+      // A file that never became a recording (the write failed, or no data)
+      // goes; a written one stays in the save folder even if a later step
+      // (the history row, the remux) failed.
+      if (written) { try { stream?.destroy() } catch { /* ignore */ } }
+      else discardPartialRecording(stream, filePath)
       sendToToolbar('toolbar:state', { phase: 'error', error: err?.message ?? String(err) })
       setTimeout(() => { closeRecordingSession(); showMain() }, 1500)
       throw err
@@ -843,8 +1062,7 @@ const DISK_HEADROOM_BYTES = 50 * 1024 * 1024
  *  retry once later instead of leaving it behind. Bounded to the home dir. */
 async function removeTrimmedFile(path: string, retry = true): Promise<void> {
   const target = resolvePath(normalize(path))
-  if (!target.startsWith(homedir())) return
-  const { unlink } = await import('fs/promises')
+  if (!isAllowedPath(target)) return
   try {
     await unlink(target)
   } catch (err: unknown) {
@@ -855,12 +1073,21 @@ async function removeTrimmedFile(path: string, retry = true): Promise<void> {
   }
 }
 
+/** A recording path from the renderer, checked like every other file path
+ *  it sends (capture-folder.ts isAllowedPath): the home directory and the
+ *  save folders. Throws for anything else. */
+function allowedVideoPath(filePath: unknown): string {
+  if (typeof filePath !== 'string' || !filePath) throw new Error('No video file path')
+  const target = resolvePath(normalize(filePath))
+  if (!isAllowedPath(target)) throw new Error(OUTSIDE_FOLDERS)
+  return target
+}
+
 export function setupVideoActions() {
   /** Save-As dialog, then copy the recording file to the chosen path. The
    *  original at ~/Pictures/Lumia/ is untouched — this creates a copy. */
-  ipcMain.handle('video:save-as', async (_e, filePath: string) => {
-    if (!filePath) throw new Error('No video file path')
-    const { copyFile } = await import('fs/promises')
+  ipcMain.handle('video:save-as', async (_e, rawPath: string) => {
+    const filePath = allowedVideoPath(rawPath)
     const startDir = await resolveSaveStartDir()
     const defaultPath = join(startDir, basename(filePath))
     const main = getMainWindow()
@@ -882,9 +1109,8 @@ export function setupVideoActions() {
   /** Copy video FILE to clipboard (not just the path text). Native shell
    *  commands handle the platform-specific clipboard formats so a subsequent
    *  Ctrl+V in Explorer / Finder / Slack / email pastes the actual file. */
-  ipcMain.handle('video:copy-file', async (_e, filePath: string) => {
-    if (!filePath) throw new Error('No video file path')
-    const { execFile } = await import('child_process')
+  ipcMain.handle('video:copy-file', async (_e, rawPath: string) => {
+    const filePath = allowedVideoPath(rawPath)
     const run = (cmd: string, args: string[]) => new Promise<void>((resolve, reject) => {
       execFile(cmd, args, (err) => err ? reject(err) : resolve())
     })
@@ -896,9 +1122,16 @@ export function setupVideoActions() {
         await run('powershell', ['-NoProfile', '-NonInteractive', '-Command', `Set-Clipboard -LiteralPath '${escaped}'`])
       } else if (process.platform === 'darwin') {
         // AppleScript writes the file reference onto NSPasteboard so Finder
-        // and chat clients recognise it as a file, not plain text.
-        const escaped = filePath.replace(/"/g, '\\"')
-        await run('osascript', ['-e', `tell application "Finder" to set the clipboard to (POSIX file "${escaped}")`])
+        // and chat clients recognise it as a file, not plain text. The path
+        // goes in as an argument, never into the script's text (a name with
+        // a quote or a backslash could end the string there).
+        await run('osascript', [
+          '-e', 'on run argv',
+          '-e', 'set f to POSIX file (item 1 of argv)',
+          '-e', 'tell application "Finder" to set the clipboard to f',
+          '-e', 'end run',
+          filePath,
+        ])
       } else {
         // Linux: no universal "copy file" clipboard convention. Fall back to
         // the file URL as text, which most file managers accept on paste.
@@ -932,9 +1165,8 @@ export function setupVideoActions() {
     if (!store || !item) return { ok: false, error: 'Recording not found' }
     if (item.type !== 'recording' || !item.filePath) return { ok: false, error: 'Not a recording' }
     const original = resolvePath(normalize(item.filePath))
-    if (!original.startsWith(homedir())) return { ok: false, error: 'Access denied' }
+    if (!isAllowedPath(original)) return { ok: false, error: OUTSIDE_FOLDERS }
 
-    const { stat, statfs } = await import('fs/promises')
     let originalSize: number
     try {
       originalSize = (await stat(original)).size
@@ -995,9 +1227,9 @@ export function setupVideoActions() {
 
   /** Upload the raw video file to R2. Content-addressable key keeps uploads
    *  idempotent (same bytes → same URL). */
-  ipcMain.handle('video:upload-r2', async (_e, filePath: string) => {
-    if (!filePath) throw new Error('No video file path')
+  ipcMain.handle('video:upload-r2', async (_e, rawPath: string) => {
     try {
+      const filePath = allowedVideoPath(rawPath)
       const ext = extname(filePath).replace(/^\./, '').toLowerCase() || 'webm'
       const contentType = ext === 'mp4' ? 'video/mp4' : 'video/webm'
       const res = await uploadFileToR2(
@@ -1020,9 +1252,9 @@ export function setupVideoActions() {
 
   /** Upload the raw video file to Google Drive via resumable upload. Same
    *  shape as the R2 handler so the editor can dispatch generically. */
-  ipcMain.handle('video:upload-google-drive', async (_e, filePath: string) => {
-    if (!filePath) throw new Error('No video file path')
+  ipcMain.handle('video:upload-google-drive', async (_e, rawPath: string) => {
     try {
+      const filePath = allowedVideoPath(rawPath)
       const ext = extname(filePath).replace(/^\./, '').toLowerCase() || 'webm'
       const contentType = ext === 'mp4' ? 'video/mp4' : 'video/webm'
       const filename = basename(filePath)
@@ -1035,10 +1267,6 @@ export function setupVideoActions() {
       return { destination: 'google-drive', success: false, error: err?.message ?? String(err) }
     }
   })
-
-  // `homedir` is re-exported from the module namespace for potential future
-  // use (fallback save dir, etc.). Silence unused-import lint until needed.
-  void homedir
 }
 
 // Exported so hotkeys / tray can launch mode selection directly
@@ -1048,18 +1276,29 @@ export async function startVideoCapture(mode: 'region' | 'window' | 'screen') {
     mode === 'region' ? 'video-region' :
     mode === 'window' ? 'video-window' : 'video-screen'
   setOverlayMode(overlayMode)
-  await hideMain()
+  try {
+    // The screen ids and the toolbar, while the user picks.
+    prepareVideoPick()
+    await hideMain()
 
-  // Exactly one app window showing → nothing to choose between; skip the
-  // picker and start recording it directly.
-  if (mode === 'window') {
-    const single = await getSinglePickTarget(getSettings().captureSelfWindow)
-    if (single) {
-      await beginWindowRecording(single.rect, single.displayId)
-      return
+    // Exactly one app window showing → nothing to choose between; skip the
+    // picker and start recording it directly.
+    if (mode === 'window') {
+      const single = await getSinglePickTarget(getSettings().captureSelfWindow)
+      if (single) {
+        await beginWindowRecording(single.rect, single.displayId)
+        return
+      }
     }
+
+    // A video pick shows the live screen: drop any snapshot an earlier image
+    // session left in the cache (2026-11-24: an image session switched to
+    // Video and then recorded or cancelled never cleared it, so the next video
+    // session got that old picture, and so did an Image confirm after
+    // switching back).
+    clearFrozenCache()
+    createOverlayWindows()
+  } catch (err) {
+    failRecordingStart(err)
   }
-
-  createOverlayWindows()
 }
-

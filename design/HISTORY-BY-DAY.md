@@ -231,9 +231,15 @@ Dropping (memory):
 Selection, missing files:
 
 - The Cmd+A select-all shortcut is removed (decided 2026-11-19). Esc still
-  leaves selection mode.
+  leaves selection mode. Back 2026-11-25: Cmd+A selects all of history
+  under the type filter by id (`history:allIds`), loaded or not; days aren't
+  pinned while that selection stands. Delete / Backspace deletes the
+  selection.
 - "N missing files" counts missing rows in loaded days; the trash button
-  removes those (`history:cleanupMissing(ids)`).
+  removes those (`history:cleanupMissing(ids)`). Changed 2026-11-21: the
+  count and the button cover all of history (`history:missingIds` scans
+  every day), since a loaded-days count vanished when those days were
+  scrolled out of memory.
 
 ## Editor
 
@@ -244,7 +250,7 @@ It moves to `history:recent(20, 'screenshot')`.
 
 - 1000-row cap removed; the retention setting stays as the only limit.
 - `WorkflowEngine` shares the main `HistoryStore`.
-- Missing-file count and cleanup cover loaded days only.
+- Missing-file count and cleanup cover loaded days only (reversed 2026-11-21: all of history, see above).
 - `history:changed` push replaces refetch-on-focus.
 - Day sections get per-day headers instead of today's
   Today / Yesterday / This Week / This Month / Earlier buckets, since the day

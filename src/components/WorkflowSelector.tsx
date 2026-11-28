@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import type { WorkflowTemplate } from '../types'
 
+import { Icon } from './Icon'
 interface WorkflowSelectorProps {
   templates: WorkflowTemplate[]
   selectedId: string
@@ -48,19 +49,19 @@ export function WorkflowSelector({ templates, selectedId, onSelect }: WorkflowSe
       <button
         ref={triggerRef}
         onClick={() => setOpen(o => !o)}
-        className="flex items-center gap-1.5 h-8 pl-2.5 pr-2 rounded-xl bg-white/[0.05] hover:bg-white/[0.09] border border-white/[0.08] text-white text-[12px] transition-all cursor-pointer flex-shrink-0"
+        className="flex items-center gap-1.5 h-8 pl-2.5 pr-2 rounded-xl bg-fill hover:bg-fill-hover border border-line text-fg text-[12px] transition-all flex-shrink-0"
       >
-        <span className="material-symbols-outlined text-[14px] text-secondary" style={{ fontVariationSettings: "'FILL' 1" }}>rocket_launch</span>
-        <span className="font-medium max-w-[110px] truncate" style={{ fontFamily: 'Manrope, sans-serif' }}>{selected?.name ?? 'Select workflow'}</span>
-        <span className="material-symbols-outlined text-[13px] text-slate-500">expand_more</span>
+        <Icon name="rocket_launch" className="text-[14px] text-accent-text" />
+        <span className="font-medium max-w-[110px] truncate">{selected?.name ?? 'Select workflow'}</span>
+        <Icon name="expand_more" className="text-[14px] text-fg-tertiary" />
       </button>
 
       {open && createPortal(
         <>
           <div className="fixed inset-0 z-[89]" onClick={() => setOpen(false)} />
           <div
-            className={`fixed z-[90] min-w-[200px] max-h-[280px] overflow-y-auto py-1.5 rounded-xl shadow-2xl
-              glass-refractive border border-white/10
+            className={`fixed z-[90] min-w-[200px] max-h-[280px] overflow-y-auto py-1.5 rounded-xl
+              glass-refractive border border-line
               transition-all duration-150 origin-top-left
               ${visible ? 'opacity-100 scale-100' : 'opacity-0 scale-95'}`}
             style={{ top: pos.top, left: pos.left, WebkitAppRegion: 'no-drag' } as React.CSSProperties}
@@ -69,14 +70,14 @@ export function WorkflowSelector({ templates, selectedId, onSelect }: WorkflowSe
               <button
                 key={t.id}
                 onClick={() => handleSelect(t.id)}
-                className={`w-full flex items-center gap-3 px-3 py-2 text-sm transition-colors cursor-pointer ${
-                  t.id === selectedId ? 'bg-white/10 text-white' : 'text-[var(--color-on-surface)] hover:bg-white/10'
+                className={`w-full flex items-center gap-3 px-3 py-2 text-sm transition-colors ${
+                  t.id === selectedId ? 'bg-fill-hover text-fg' : 'text-fg hover:bg-fill-hover'
                 }`}
               >
-                <span className="material-symbols-outlined text-[18px] text-[var(--color-on-surface-variant)]">{t.icon}</span>
+                <Icon name={t.icon} className="text-[20px] text-fg-secondary" />
                 <span className="flex-1 text-left text-xs">{t.name}</span>
                 {t.id === selectedId && (
-                  <span className="material-symbols-outlined text-sm text-secondary">check</span>
+                  <Icon name="check" className="text-[14px] text-accent-text" />
                 )}
               </button>
             ))}
